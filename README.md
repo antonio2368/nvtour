@@ -11,9 +11,10 @@ The agent explains a bug in chat. Your editor shows you where it is.
 ![Read-only](https://img.shields.io/badge/files-never%20modified-brightgreen)
 ![No plugin](https://img.shields.io/badge/nvim%20plugin-not%20needed-blue)
 
-[![Watch the trailer: an agent builds a three-step tour of a dangling iterator in Neovim](docs/trailer-poster.png)](docs/nvtour.mp4)
 
-**▶ [Watch the trailer](docs/nvtour.mp4)** (1 min)
+https://github.com/user-attachments/assets/da080c6d-a017-4022-bba3-0199f33ea8ad
+
+
 
 </div>
 
