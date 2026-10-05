@@ -11,7 +11,9 @@ The agent explains a bug in chat. Your editor shows you where it is.
 ![Read-only](https://img.shields.io/badge/files-never%20modified-brightgreen)
 ![No plugin](https://img.shields.io/badge/nvim%20plugin-not%20needed-blue)
 
-![A three-step tour of a dangling iterator: fault, flow, fix](docs/tour.gif)
+[![Watch the trailer: an agent builds a three-step tour of a dangling iterator in Neovim](docs/trailer-poster.png)](docs/nvtour.mp4)
+
+**▶ [Watch the trailer](docs/nvtour.mp4)** (1 min)
 
 </div>
 
@@ -386,6 +388,7 @@ Regenerate the images in `docs/`:
 ```sh
 python3 scripts/render_demo.py    # docs/tour.gif, docs/screenshot.png
 python3 scripts/render_roles.py   # docs/roles-dark.png, docs/roles-light.png
+python3 scripts/render_trailer.py # docs/nvtour.mp4, docs/trailer-poster.png (needs imageio-ffmpeg)
 ```
 
-They render a private headless nvim with Pillow; no display is needed.
+They render a private headless nvim with Pillow and run the real CLI against it; no display is needed.
