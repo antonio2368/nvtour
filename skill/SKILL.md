@@ -23,7 +23,7 @@ description: Give a visual, read-only walkthrough of code inside the user's runn
 
 - Get line numbers from `rg -n` or `sed -n 'A,Bp'` output, not from memory.
 - Each `step` prints the first highlighted line (`  412| ...`). Check it.
-- Add `--expect TEXT` (a substring of the range) to make a wrong range fail with exit 6 instead of highlighting the wrong code.
+- Add `--expect TEXT` (a substring of the range) to make a wrong range fail with exit 6 instead of highlighting the wrong code. The user sees `TEXT` underlined, so pick the exact expression the note is about (for example `it->second`).
 - `FILE:L:COL` (compiler and `rg --column` output) is accepted; the column is ignored.
 
 ## Fixing a tour
@@ -37,6 +37,8 @@ description: Give a visual, read-only walkthrough of code inside the user's runn
 - Note: at most 3 short sentences. Label: at most 6 words.
 - Roles: `fault` = wrong line(s); `flow` = how data or control gets there; `fix` = where or how it should change; `context` = background; `info` = neutral explanation (default).
 - Name identifiers in the note. The highlight already shows the location.
+- Put identifiers in backticks (`` `erase()` ``); `**bold**` also works. Other markdown is shown as typed.
+- Only the current step shows its full note; the others show the first line. Make the first sentence of a note stand alone.
 - Text that starts with `-`: write `--note=TEXT` or `--label=TEXT`.
 - Multi-line notes:
 

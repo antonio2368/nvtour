@@ -216,10 +216,13 @@ M.state = {
   keys = { [action] = lhs },  -- the keys that were installed
   tour_win = winid,           -- last window used for the tour
   added_bufs = { [bufnr] = true }, -- buffers nvtour added to the buffer list
+  ns_flash = nvim_create_namespace("nvtour_flash"),
+  flash = { buf = bufnr, seq = n },  -- the last flash; a newer one cancels its timer
+  winbars = { [winid] = the window's own local 'winbar' },  -- restored by clear
 }
 ```
 
-Each step: `{ n, file, buf, l1, l2, role, label, note, extmark_ids = {} }`.
+Each step: `{ n, file, buf, l1, l2, role, label, note, expect, extmark_ids = {} }`.
 
 ### Tour window
 
@@ -251,49 +254,77 @@ instead of a hit-enter prompt; the buffer is loaded anyway and nvtour continues 
 Roles and highlight groups (all defined with `default = true` so the user can override in
 `init.lua`):
 
-| role | line group | accent from |
-|---|---|---|
-| `fault` | `NvtourLineFault` | `DiagnosticError` |
-| `flow` | `NvtourLineFlow` | `DiagnosticInfo` |
-| `fix` | `NvtourLineFix` | `DiagnosticOk` |
-| `context` | `NvtourLineContext` | `Comment` |
-| `info` (default) | none | `DiagnosticHint` |
+| role | accent from |
+|---|---|
+| `fault` | `DiagnosticError` |
+| `flow` | `DiagnosticInfo` |
+| `fix` | `DiagnosticOk` |
+| `context` | `DiagnosticWarn` |
+| `info` (default) | `DiagnosticHint` |
 
-The line group is a background tint: the accent colour blended into the `Normal` background, so
-syntax highlighting stays visible (`Diff*` groups are not used: many colorschemes define them with
-`reverse`). `NvtourNumber<Role>`, `NvtourSign<Role>` and `NvtourLabel<Role>` use the accent as
-foreground. Also `NvtourNote`, `NvtourNoteBorder`, `NvtourDim` (focus `--dim`) and
-`NvtourPanelCurrent`, all blended from `Normal`. A `User NvtourHighlights` autocmd runs after they are
-defined.
+The range never gets a background colour, so syntax highlighting stays as it is (a background over
+many lines is heavy, and `Diff*` groups are defined with `reverse` in many colorschemes).
+`NvtourNumber<Role>`, `NvtourSign<Role>` and `NvtourLabel<Role>` use the accent as foreground and `NvtourMark<Role>` (bold, underlined in the accent; no `fg`, so the syntax colour
+stays) marks the `--expect` text. Also `NvtourNote`, `NvtourNoteCode` (fg of `@markup.raw` or
+`String`), `NvtourNoteBold`, `NvtourNoteCollapsed`, `NvtourNoteBorder`, `NvtourDim` (focus `--dim`),
+`NvtourFlash` and `NvtourPanelCurrent`, all blended from `Normal`, and `NvtourPanelFile` (→
+`Directory`), `NvtourPanelProgress` (→ `Comment`). A `User NvtourHighlights` autocmd runs after they
+are defined.
+
+Only the **current** step (`n == tour.current`) is drawn in full. The other steps keep the
+line-number highlight, the end-of-line marker and a one-line note; the bar, the full note and the
+`--expect` marks move with the current step. Every change of `tour.current` re-renders the old and the new
+current step.
 
 For a step at `l1..l2` in buffer `buf` (0-based rows internally):
 
-1. **Range highlight** — one extmark per line with `line_hl_group = NvtourLine<Role>` (skipped
-   for `info`). One per line is deliberate: `line_hl_group` only applies to the mark's own row.
-2. **Sign** — on `l1`: `sign_text = tostring(n)` (max 2 cells; `n ≥ 100` → `"++"`),
-   `sign_hl_group = NvtourSign<Role>`, `priority = 100`.
-3. **Note** — virtual lines **above** `l1` (`virt_lines_above = true`), one chunk per wrapped
-   line: `{ {prefix, "NvtourNoteBorder"}, {text, "NvtourNote"} }`. Prefix `╭ ` for the first
-   line, `│ ` for middle lines, `╰ ` for the last line; a single-line note uses `▸ `. Wrap width =
-   tour window width − `textoff` (from `vim.fn.getwininfo`) − 4, minimum 30; words wider than
-   that are split. Blank lines in the note are kept as `│`. Notes are wrapped again on `WinResized`.
-4. **Label** — on `l1`: `virt_text = { {"  ← " .. label, "NvtourLabel<Role>"} }`,
-   `virt_text_pos = "eol"`.
+1. **Range** — one extmark per line with `number_hl_group = NvtourNumber<Role>`; for the current
+   step also `sign_text = " ▎"`, `sign_hl_group = NvtourSign<Role>`, `priority = 100`: a bar in the
+   second cell of the sign column, next to the line numbers. The step number is not a sign: a
+   2-digit number would touch the line number (`10` + `348` reads `10348`).
+2. **Note** — virtual lines **above** `l1` (`virt_lines_above = true`). Current step: one virtual
+   line per wrapped line, `{ {prefix, "NvtourNoteBorder"}, text chunks }`. Prefix `╭ ` for the first
+   line, `│ ` for middle lines, `╰ ` for the last line; a single-line note uses `▸ `.
+   Text chunks: `` `code` `` → `NvtourNoteCode`, `**bold**` → `NvtourNoteBold` (markers removed; a
+   marker without a closing partner stays as text), the rest `NvtourNote`. Wrap width = tour window
+   width − `textoff` (from `vim.fn.getwininfo`) − 4, minimum 30; words wider than that are split.
+   Blank lines in the note are kept as `│`. Other steps: one virtual line `╶ <first line>`, in
+   `NvtourNoteCollapsed`, with ` …` when the note is longer. Notes are wrapped again on
+   `WinResized`.
+3. **Expect marks** (current step only) — every occurrence of `expect` in `l1..l2`:
+   `hl_group = NvtourMark<Role>`, `priority = 150`.
+4. **Marker** — on `l1`, for every step: `virt_text = { {"  ← ", NvtourLabel<Role>}, {n,
+   NvtourSign<Role>}, {" " .. label, NvtourLabel<Role>} }` (no label: `← n`), `virt_text_pos = "eol"`.
 5. **Jump** (first step of a tour, or `--jump`; never with `--no-jump`) — show the buffer in the
-   tour window, `nvim_win_set_cursor(win, {l1, 0})`, then `normal! zv` and `normal! zz` executed in
-   that window via `nvim_win_call`. Set `tour.current = n`.
-6. **Quickfix** — `vim.fn.setqflist({}, "r", { id = tour.qf_id, title = "nvtour: " .. title,
+   tour window, set `tour.current = n`, re-render the old and the new current step, set the winbar,
+   then scroll (in that window via `nvim_win_call`): cursor on `l1`, `normal! zv`, and
+   `winrestview({ topline, topfill })`. The block (the note and `l1..l2`, measured with
+   `nvim_win_text_height`, so virtual lines and wrapped lines count) is centred when it fits in the
+   window, else the note starts at the top line. `topfill` shows the virtual lines above the top
+   line, so a note on line 1 is visible (`zz` hides it). The view never goes past the end of the
+   file. Closed folds count as one row. Then the range flashes: one extmark in `nvtour_flash`
+   (`hl_group = NvtourFlash`, `hl_eol`, `priority = 250`) removed after `vim.g.nvtour_flash` ms
+   (default 300; `0` = off).
+6. **Winbar** — the tour window gets `setlocal winbar=%{%v:lua.nvtour.winbar()%}`, unless the window
+   already has a winbar (the user's or a plugin's) or `vim.g.nvtour_winbar == false`. Text:
+   ` nvtour 2/5 fault · <label>` and on the right `next ]w: <file>:<line> <label>` (only the line when
+   the next step is in the same file) or `last step · [W first`. The right side takes the longest form
+   that fits the window width (without the label, with the file name only, or nothing). `'winbar'`
+   is reset when the window shows another buffer, so it is set again on every jump. `clear`
+   restores the saved value; a `BufWinEnter` autocmd removes a tour winbar that a buffer brings back
+   into an untracked window.
+7. **Quickfix** — `vim.fn.setqflist({}, "r", { id = tour.qf_id, title = "nvtour: " .. title,
    items = <one item per step: filename, lnum, end_lnum, text = "[role] " .. (label or first note
    line)> })`. The index moves only when the step jumped. The list is created with
    `setqflist({}, " ", {...})` and its `id` read back with `getqflist({ id = 0 }).id`, so the
    user's other quickfix lists are untouched. The next tour reuses the list while it is the current
    one.
-7. **Panel** — re-render (§7); on the first step the panel is opened automatically (before the
+8. **Panel** — re-render (§7); on the first step the panel is opened automatically (before the
    note is rendered, so the note is wrapped to the final width) unless
    `vim.g.nvtour_auto_panel == false` or `panel.user_closed`.
-8. `vim.notify(("nvtour %d/%d: %s"):format(n, total, label or file:l1), vim.log.levels.INFO)`.
+9. `vim.notify(("nvtour %d/%d: %s"):format(n, total, label or file:l1), vim.log.levels.INFO)`.
 
-`goto/next/prev` perform (5), (7), (8) for an existing step and move the quickfix index with
+`goto/next/prev` perform (5), (6), (8), (9) for an existing step and move the quickfix index with
 `setqflist({}, "r", { id = qf_id, idx = n })`.
 
 Validation (exit 6 from Python after the Lua check): file must exist and be readable; `1 ≤ l1 ≤
@@ -305,25 +336,33 @@ A scratch buffer `nvtour://panel` (`buftype = nofile`, `bufhidden = hide`, `swap
 `filetype = markdown`, `modifiable = false` outside rendering) shown in a `botright vertical`
 split. Window options: width `clamp(floor(columns * 0.3), 40, 70)`, `winfixwidth`, `wrap`,
 `linebreak`, `nonumber`, `norelativenumber`, `signcolumn = no`, `foldcolumn = 0`,
-`cursorline`, `winhighlight = "Normal:NormalFloat"` optional.
+`cursorline`, `breakindent`, `conceallevel = 2`, `concealcursor = nc` (hides the markdown markers),
+`winhighlight = "Normal:NormalFloat"` optional.
 
 Rendered content:
 
 ```
-# <title or "Walkthrough">
+# <title or "Walkthrough">                    2/3      ← progress: virt_text, NvtourPanelProgress
 
-▶ 1. src/a.cpp:412-415  dangling iterator
-  2. src/b.cpp:88       erase on cleanup thread
-  3. src/a.cpp:430      the fix
+src/a.cpp                                               ← NvtourPanelFile
+▶ 1. ✗ 412-415  dangling iterator
+src/b.cpp
+  2. → 88       erase on cleanup thread
+src/a.cpp
+  3. ✓ 430      the fix
 
-
-]w next · [w prev · [W first · ]W last · <leader>wp panel · <leader>wc clear · <CR> jump · q close
+`]w` next · `[w` prev · `[W` first · `]W` last · `<leader>wp` panel · `<leader>wc` clear · `<CR>` jump · `q` close
 
 ---
 <free markdown text set via `nvtour panel`>
 ```
 
-The footer line lists only the keys that were installed. The panel opens in the tab of the tour
+Steps keep the tour order; a file name line starts each run of steps in the same file. `N. <mark>`
+is highlighted with `NvtourSign<Role>`; marks: `✗` fault, `→` flow, `✓` fix, `○` context, `•` info.
+A step without a label shows the first line of its note (markers removed, cut to 60 cells); the
+quickfix item text uses the same. Before the first jump the progress is `N step(s)`. The footer line
+lists only the keys that were installed; the keys are inline code so markdown does not read
+`[W first · ]W` as a link. `<CR>` on a file name line jumps to its first step. The panel opens in the tab of the tour
 window; a panel window left in another tab is closed first.
 
 Paths shown relative to `W` (passed from Python as `workspace`). The current step line gets an
@@ -403,8 +442,9 @@ current step.
 
 1. Never call `nvim_buf_set_lines`/`nvim_buf_set_text` on a buffer that is not an `nvtour://`
    scratch buffer. Never `:w`, `:edit!`, `:bd!`, `:qa`.
-2. Never change global options except `hidden = true`. Window-local fold options are set locally,
-   saved and restored per window. Highlight groups use `default = true`.
+2. Never change global options except `hidden = true`. Window-local fold options and the tour
+   `winbar` are set locally, saved and restored per window (the panel's own window options are not
+   restored: nvtour closes that window). Highlight groups use `default = true`.
 3a. Never replace a modified buffer that cannot be hidden (that would run `'autowrite'`).
 3. Never close windows/tabs we did not create (panel window, diff tabs only).
 4. Never touch an nvim instance the user did not select (no broadcasting).

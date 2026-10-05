@@ -44,11 +44,14 @@ def test_step_creates_marks_and_jumps(cli, nv, sandbox):
     assert buf is not None
     marks = ns_marks(nv, "nvtour_steps", buf.handle)
     details = [m[3] for m in marks]
-    assert sum(1 for d in details if d.get("line_hl_group") == "NvtourLineFault") == 3
-    sign = [d for d in details if d.get("sign_text")]
-    assert len(sign) == 1 and sign[0]["sign_text"].strip() == "1"
+    assert not any(d.get("line_hl_group") or d.get("hl_group") == "NvtourLineFault" for d in details)  # no tint
+    signs = sorted((m[1], m[3]["sign_text"]) for m in marks if m[3].get("sign_text"))
+    assert signs == [(4, " ▎"), (5, " ▎"), (6, " ▎")]  # a bar along the range
+    assert all(d["sign_hl_group"] == "NvtourSignFault" for d in details if d.get("sign_text"))
+    assert sum(1 for d in details if d.get("number_hl_group") == "NvtourNumberFault") == 3
     assert any(d.get("virt_lines") and d.get("virt_lines_above") for d in details)
-    assert any(d.get("virt_text") and d.get("virt_text_pos") == "eol" for d in details)
+    eol = [d["virt_text"] for d in details if d.get("virt_text_pos") == "eol"]
+    assert eol == [[["  ← ", "NvtourLabelFault"], ["1", "NvtourSignFault"], [" bad", "NvtourLabelFault"]]]
     assert nv.current.buffer.name.endswith("a.txt")
     assert nv.current.window.cursor[0] == 5
     assert nv.eval("maparg(']w', 'n')") != ""
@@ -97,11 +100,10 @@ def test_panel_content_and_mappings(cli, nv):
     ok(cli("panel", "free text here"))
     pb = find_buf(nv, "nvtour://panel")
     assert pb is not None
-    text = "\n".join(lines_of(nv, pb.handle))
-    assert "# Panel title" in text
-    assert "alpha step" in text and "beta step" in text and "a.txt:3-4" in text
+    lines = lines_of(nv, pb.handle)
+    assert lines[:6] == ["# Panel title", "", "a.txt", "▶ 1. • 3-4  alpha step", "b.txt", "  2. • 9    beta step"]
+    text = "\n".join(lines)
     assert "free text here" in text and "---" in text
-    assert "▶ 1." in text
     maps = nv.api.buf_get_keymap(pb.handle, "n")
     assert "<CR>" in [m["lhs"] for m in maps]
     assert "q" in [m["lhs"] for m in maps]
@@ -595,9 +597,9 @@ def test_insert_edit_remove_steps(cli, nv):
     assert ok(cli("step", "a.txt:6", "--label", "B", "--at", "2")).startswith("step 2/3: a.txt:6 [info] B")
     assert step_list(nv) == [[1, 3, "A"], [2, 6, "B"], [3, 9, "C"]]
     buf = find_buf(nv, "a.txt")
-    signs = sorted((m[1], m[3]["sign_text"].strip()) for m in ns_marks(nv, "nvtour_steps", buf.handle)
-                   if m[3].get("sign_text"))
-    assert signs == [(2, "1"), (5, "2"), (8, "3")]
+    numbers = sorted((m[1], m[3]["virt_text"][1][0]) for m in ns_marks(nv, "nvtour_steps", buf.handle)
+                     if m[3].get("virt_text"))
+    assert numbers == [(2, "1"), (5, "2"), (8, "3")]
     out = ok(cli("edit", "2", "a.txt:7-8", "--label", "B2", "--role", "fault", "--note", "moved"))
     assert out.splitlines() == ["step 2/3: a.txt:7-8 [fault] B2", "  7| line 7 of a"]
     assert cli("edit", "2", "--expect", "nope").returncode == 6
@@ -637,7 +639,8 @@ def test_panel_footer_and_skipped_key_warning(cli, nv):
         assert "last" not in json.loads(ok(cli("--json", "status")))["keys"] and r.returncode == 0
         pb = find_buf(nv, "nvtour://panel")
         footer = lines_of(nv, pb.handle)[-1]
-        assert footer.startswith("]w next · [w prev · [W first · <leader>wp panel") and footer.endswith("q close")
+        assert footer.startswith("`]w` next · `[w` prev · `[W` first · `<leader>wp` panel")
+        assert footer.endswith("`q` close")
     finally:
         ok(cli("clear"))
         nv.command("nunmap ]W")
@@ -666,3 +669,162 @@ def test_zz_safety_files_untouched(cli, nv, sandbox, pristine):
                 assert lines_of(nv, b.handle) == before[b.name]
     for path, data in pristine.items():
         assert path.read_bytes() == data
+
+
+def step_marks(nv, suffix):
+    buf = find_buf(nv, suffix)
+    return [m for m in ns_marks(nv, "nvtour_steps", buf.handle)]
+
+
+def test_only_the_current_step_is_expanded(cli, nv):
+    ok(cli("start", "Cur"))
+    ok(cli("step", "a.txt:3-4", "--role", "fault", "--note", "First note. It has two lines.\nSecond line."))
+    ok(cli("step", "a.txt:9-10", "--role", "flow", "--note", "Other note"))
+
+    def bar_rows():
+        return sorted(m[1] for m in step_marks(nv, "a.txt") if "▎" in m[3].get("sign_text", ""))
+
+    def notes():
+        return {m[1]: m[3]["virt_lines"] for m in step_marks(nv, "a.txt") if m[3].get("virt_lines")}
+
+    assert bar_rows() == [2, 3]
+    vl = notes()
+    assert len(vl[2]) == 2 and vl[2][0][0][0] == "╭ "
+    assert len(vl[8]) == 1 and vl[8][0][0][0] == "╶ " and vl[8][0][-1] == ["Other note", "NvtourNoteCollapsed"]
+    ok(cli("next"))
+    assert bar_rows() == [8, 9]
+    vl = notes()
+    assert vl[2][0][0][0] == "╶ " and vl[2][0][-1] == [" …", "NvtourNoteCollapsed"]
+    assert vl[8][0][0][0] == "▸ "
+    eol = sorted((m[1], m[3]["virt_text"][1][0]) for m in step_marks(nv, "a.txt") if m[3].get("virt_text"))
+    assert eol == [(2, "1"), (8, "2")]  # every step keeps its number
+
+
+def test_note_inline_markdown(cli, nv):
+    ok(cli("step", "a.txt:3", "--note", "Calls `erase()` on **it** and `a b`. Lone ` stays."))
+    vl = [m[3]["virt_lines"] for m in step_marks(nv, "a.txt") if m[3].get("virt_lines")][0]
+    chunks = [tuple(c) for line in vl for c in line[1:]]  # without the border prefixes
+    assert ("erase()", "NvtourNoteCode") in chunks and ("it", "NvtourNoteBold") in chunks
+    assert ("a b", "NvtourNoteCode") in chunks
+    text = " ".join(" ".join(c[0] for c in chunks).split())
+    assert "**" not in text and "`erase" not in text and "Lone ` stays." in text
+
+
+def test_expect_text_is_marked_in_the_current_step(cli, nv):
+    ok(cli("start", "Mark"))
+    ok(cli("step", "a.txt:5-6", "--role", "fault", "--expect", "of a"))
+    ok(cli("step", "a.txt:9", "--expect", "line"))
+    marks = [(m[1], m[2], m[3]["end_col"]) for m in step_marks(nv, "a.txt") if m[3].get("hl_group") == "NvtourMarkFault"]
+    assert marks == [(4, 7, 11), (5, 7, 11)]  # "line 5 of a": bytes 7-11
+    assert not [m for m in step_marks(nv, "a.txt") if m[3].get("hl_group") == "NvtourMarkInfo"]
+    ok(cli("edit", "1", "--expect", ""))
+    ok(cli("next"))
+    assert [m[1] for m in step_marks(nv, "a.txt") if m[3].get("hl_group") == "NvtourMarkInfo"] == [8]
+    assert not [m for m in step_marks(nv, "a.txt") if m[3].get("hl_group") == "NvtourMarkFault"]
+    data = json.loads(ok(cli("--json", "status")))
+    assert [s.get("expect") for s in data["steps"]] == [None, "line"]
+
+
+def view(nv):
+    return nv.call("winsaveview")
+
+
+def test_jump_keeps_note_and_range_in_view(cli, nv):
+    ok(cli("start", "View"))
+    ok(cli("step", "a.txt:1", "--note", "A note on the first line.\nSecond line."))
+    v = view(nv)
+    assert v["topline"] == 1 and v["topfill"] == 2  # virtual lines above line 1 are shown
+    ok(cli("step", "a.txt:20-55", "--note", "Long range.\nTwo lines.", "--jump"))
+    v = view(nv)
+    assert v["topline"] == 20 and v["topfill"] == 2 and nv.current.window.cursor[0] == 20
+    ok(cli("step", "a.txt:40", "--note", "Short.", "--jump"))
+    top, bottom = nv.eval("line('w0')"), nv.eval("line('w$')")
+    assert top < 40 < bottom and abs((40 - top) - (bottom - 40)) <= 2  # centred
+    ok(cli("step", "a.txt:58", "--jump"))
+    assert nv.eval("line('w$')") == 60 and nv.eval("winline()") > nv.eval("winheight(0)") // 2  # not past the end
+
+
+def eval_winbar(nv, win):
+    return nv.api.eval_statusline("%{%v:lua.nvtour.winbar()%}",
+                                  {"winid": win.handle, "use_winbar": True, "maxwidth": 200})["str"]
+
+
+def test_winbar_shows_position_and_next_step(cli, nv):
+    ok(cli("start", "Bar"))
+    ok(cli("step", "a.txt:3", "--role", "fault", "--label", "100% bad"))
+    ok(cli("step", "b.txt:9", "--label", "the fix"))
+    win = [w for w in nv.windows if w.buffer.name.endswith("a.txt")][0]
+    assert nv.api.get_option_value("winbar", {"win": win.handle, "scope": "local"}) == "%{%v:lua.nvtour.winbar()%}"
+    assert eval_winbar(nv, win).rstrip() == " nvtour 1/2 fault · 100% bad"  # narrow window: no room for "next"
+    ok(cli("panel", "--toggle"))
+    text = eval_winbar(nv, win)
+    assert text.startswith(" nvtour 1/2 fault · 100% bad") and text.endswith("next ]w: b.txt:9 the fix ")
+    ok(cli("edit", "2", "--label", "x" * 40))
+    assert eval_winbar(nv, win).endswith("next ]w: b.txt:9 ")  # a next label that does not fit is dropped
+    ok(cli("edit", "1", "--label", "y" * 100))
+    text = eval_winbar(nv, win)
+    assert text.startswith(" nvtour 1/2 fault · yyy") and "…" in text and "next" not in text  # cut at its end
+    assert nv.call("strdisplaywidth", text.rstrip()) <= win.width
+    ok(cli("edit", "1", "--label", "100% bad"))
+    ok(cli("edit", "2", "--label", "the fix"))
+    ok(cli("next"))
+    assert eval_winbar(nv, win).rstrip().endswith("last step · [W first")
+    ok(cli("clear"))
+    assert nv.api.get_option_value("winbar", {"win": win.handle, "scope": "local"}) == ""
+    nv.command("buffer a.txt")  # a remembered winbar from the tour is removed
+    assert nv.api.get_option_value("winbar", {"win": nv.current.window.handle, "scope": "local"}) == ""
+
+
+def test_user_winbar_is_kept(cli, nv):
+    nv.command("set winbar=mine")
+    try:
+        ok(cli("step", "a.txt:3"))
+        assert nv.eval("&l:winbar") == "" and nv.eval("&winbar") == "mine"
+        nv.command("let g:nvtour_winbar = v:false")
+        nv.command("set winbar=")
+        ok(cli("step", "b.txt:4", "--jump"))
+        assert nv.eval("&l:winbar") == ""
+    finally:
+        nv.command("set winbar= | unlet! g:nvtour_winbar")
+
+
+def flash_marks(nv, suffix):
+    return ns_marks(nv, "nvtour_flash", find_buf(nv, suffix).handle)
+
+
+def test_jump_flashes_the_range(cli, nv):
+    ok(cli("start", "Flash"))
+    ok(cli("step", "a.txt:3-5"))
+    ok(cli("step", "b.txt:30", "--jump"))  # last line of b.txt
+    marks = flash_marks(nv, "b.txt")
+    assert len(marks) == 1 and marks[0][1] == 29 and marks[0][3]["hl_group"] == "NvtourFlash"
+    assert flash_marks(nv, "a.txt") == []  # the previous flash is removed at once
+    nv.exec_lua("vim.wait(600, function() return false end)")
+    assert flash_marks(nv, "b.txt") == []
+    nv.command("let g:nvtour_flash = 0")
+    try:
+        ok(cli("goto", "1"))
+        assert flash_marks(nv, "a.txt") == []
+    finally:
+        nv.command("unlet g:nvtour_flash")
+
+
+def test_panel_groups_files_and_colours_roles(cli, nv):
+    ok(cli("start", "Groups"))
+    ok(cli("step", "a.txt:3", "--role", "fault", "--label", "one"))
+    ok(cli("step", "a.txt:10-12", "--role", "flow", "--note", "`x` is set here.\nMore."))
+    ok(cli("step", "b.txt:9", "--role", "fix"))
+    pb = find_buf(nv, "nvtour://panel")
+    assert lines_of(nv, pb.handle)[2:7] == [
+        "a.txt", "▶ 1. ✗ 3      one", "  2. → 10-12  x is set here.", "b.txt", "  3. ✓ 9"]
+    marks = ns_marks(nv, "nvtour_panel", pb.handle)
+    groups = {(m[1], m[3].get("hl_group")) for m in marks if m[3].get("hl_group")}
+    assert {(2, "NvtourPanelFile"), (3, "NvtourSignFault"), (4, "NvtourSignFlow"), (6, "NvtourSignFix")} <= groups
+    progress = [m[3]["virt_text"] for m in marks if m[1] == 0 and m[3].get("virt_text")]
+    assert progress == [[["  1/3", "NvtourPanelProgress"]]]
+    win = [w for w in nv.windows if w.buffer.handle == pb.handle][0]
+    nv.current.window = win
+    win.cursor = (6, 0)  # the b.txt file line
+    nv.input("<CR>")
+    nv.command("sleep 50m")
+    assert current(nv) == 3

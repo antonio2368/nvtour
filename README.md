@@ -5,6 +5,17 @@ your already-running Neovim. The agent explains a bug or a concept in chat and d
 parallel: jump to a range, highlight it, attach a note as virtual text, fold away irrelevant code, show a
 read-only diff, and keep a side panel with the step list. You step through with keys.
 
+![A three-step tour of a dangling iterator: fault, flow, fix](docs/tour.gif)
+
+The code is never given a background colour. The current step has a bar in the sign column along its range,
+its full note (with `code` and **bold**) and the `--expect` text underlined. Every step has coloured line
+numbers and an end-of-line marker `← N label`; the other steps also keep a one-line note. The winbar shows
+the position and where `]w` goes next; the panel lists the steps by file.
+
+All roles at 1, 3 and 12 lines: [dark](docs/roles-dark.png), [light](docs/roles-light.png). Regenerate the
+images with `python3 scripts/render_demo.py` and `python3 scripts/render_roles.py` (they render a private
+headless nvim with Pillow; no display needed).
+
 It never writes to a file buffer or to a file you edit. The only files it writes are its own pin cache
 (`$XDG_RUNTIME_DIR/nvtour/`) and, with `instances --prune`, it removes stale nvim sockets. Plugins that react
 to window or buffer switches (auto-save, session savers) are outside this promise. See `DESIGN.md` for the full
@@ -39,7 +50,12 @@ EOF
 
 Only the first step jumps; the others are added without moving the view, so the finished tour is at step 1.
 `step --jump` forces a jump, `--no-jump` suppresses it for the first step too. Each step prints the first
-highlighted line, and `--expect TEXT` fails with exit 6 when `TEXT` is not in the range.
+highlighted line, and `--expect TEXT` fails with exit 6 when `TEXT` is not in the range. In the current step,
+each occurrence of `TEXT` in the range is underlined in the role colour.
+
+Notes are wrapped to the window width. Two inline markdown forms are shown: `` `code` `` and `**bold**`
+(the markers are hidden). A jump scrolls so the note and the range are in view: centred when they fit,
+else the note at the top, and never past the end of the file. The range flashes briefly after a jump.
 
 Commands:
 
@@ -75,8 +91,9 @@ Default keys (set only if free; otherwise a warning is shown once and the key is
 | `<leader>wp` | toggle panel |
 | `<leader>wc` | clear everything |
 
-The panel shows the installed keys in a footer line. In the panel: `<CR>` jumps to the step under the cursor,
-`q` closes the panel. Commands: `:NvtourNext`, `:NvtourPrev`, `:NvtourFirst`, `:NvtourLast`, `:NvtourGoto N`,
+The panel shows the step count, the steps in tour order under the name of their file, a role marker
+(`✗` fault, `→` flow, `✓` fix, `○` context, `•` info) and the installed keys in a footer line. In the panel:
+`<CR>` jumps to the step under the cursor (on a file name: its first step), `q` closes the panel. Commands: `:NvtourNext`, `:NvtourPrev`, `:NvtourFirst`, `:NvtourLast`, `:NvtourGoto N`,
 `:NvtourPanel`, `:NvtourClear`. The quickfix list (`nvtour: <title>`) works too (`:cnext`, `:cprev`), but it
 only moves the cursor; it does not change the current step of the tour.
 
@@ -86,25 +103,31 @@ Options for `init.lua` (set before the first step):
 vim.g.nvtour_keys = { next = "]w", prev = "[w", first = "[W", last = "]W", panel = "<leader>wp", clear = "<leader>wc" }
 vim.g.nvtour_auto_panel = false -- do not open the panel on the first step
 vim.g.nvtour_steal_focus = "unless_terminal" -- "always" | "never"; default keeps the focus in a terminal window
+vim.g.nvtour_winbar = false -- do not show the tour position in the winbar of the tour window
+vim.g.nvtour_flash = 0 -- ms the range flashes after a jump (default 300; 0 = off)
 ```
+
+The winbar is set only in a window that has no winbar of its own (from you or a plugin), and `clear` removes
+it. When the window is narrow, the "next" part is shortened or left out.
 
 Files are shown in a normal file window, never in a terminal, quickfix, help or other special window. When you
 type in a terminal window (for example a Claude Code split), the tour moves the file window but the terminal
 keeps the focus.
 
 Highlight groups. Each role takes its accent colour from the colorscheme's `DiagnosticError` (fault),
-`DiagnosticInfo` (flow), `DiagnosticOk` (fix), `Comment` (context) or `DiagnosticHint` (info) and tints
-the line background by blending that accent into the `Normal` background, so syntax highlighting stays
-intact. Groups: `NvtourLine{Fault,Flow,Fix,Context}` (line tint), `NvtourNumber{...}` (line numbers of
-the range), `NvtourSign{...}` (step number in the sign column), `NvtourLabel{...}` (end-of-line label),
-`NvtourNote`, `NvtourNoteBorder`, `NvtourDim`, `NvtourPanelCurrent`. They are defined with
-`default = true`, so a plain `vim.api.nvim_set_hl(0, "NvtourLineFault", {...})` in `init.lua` wins on
+`DiagnosticInfo` (flow), `DiagnosticOk` (fix), `DiagnosticWarn` (context) or `DiagnosticHint` (info). The range
+has no background, so syntax highlighting stays intact. Groups (`{...}` = `Fault`, `Flow`, `Fix`, `Context`,
+`Info`): `NvtourNumber{...}` (line numbers of the range), `NvtourSign{...}` (the bar, the step number in the
+end-of-line marker, the panel and the winbar), `NvtourLabel{...}` (end-of-line label), `NvtourMark{...}` (the `--expect` text), `NvtourNote`,
+`NvtourNoteCode`, `NvtourNoteBold`, `NvtourNoteCollapsed` (one-line note of the other steps),
+`NvtourNoteBorder`, `NvtourDim`, `NvtourFlash`, `NvtourPanelCurrent`, `NvtourPanelFile`, `NvtourPanelProgress`. They are defined with
+`default = true`, so a plain `vim.api.nvim_set_hl(0, "NvtourSignFault", {...})` in `init.lua` wins on
 first load. To survive colorscheme changes and runtime upgrades, set overrides in an autocmd:
 
 ```lua
 vim.api.nvim_create_autocmd("User", {
   pattern = "NvtourHighlights",
-  callback = function() vim.api.nvim_set_hl(0, "NvtourLineFault", { bg = "#3c1f1e" }) end,
+  callback = function() vim.api.nvim_set_hl(0, "NvtourSignFault", { fg = "#ff5555", bold = true }) end,
 })
 ```
 
@@ -168,6 +191,12 @@ of that nvim.
 - A modified buffer that cannot be hidden (`'bufhidden'` is `unload`, `delete` or `wipe`, or `'hidden'` is
   off) is never replaced in its window: nvtour opens a split instead and warns, so `'autowrite'` cannot write it.
 - A file that has a swap file (open in another nvim) is shown anyway, with a warning.
+- The range never gets a background colour (no line tint): a background over many lines is heavy, and
+  colorschemes that define `Diff*` with `reverse` paint it in one solid colour. The bar and the line numbers
+  show the range. The step number is not in the sign column: `10` would run into the line number (`10348`).
+- Only the current step is drawn in full. With many steps in one file, every note at full size is noise.
+- The winbar and the flash use window-local state that nvtour removes: the winbar is set with `:setlocal`
+  and restored by `clear`; a remembered tour winbar that comes back with a buffer is removed on `BufWinEnter`.
 - A single-line step prints as `file:L`, a range as `file:L1-L2`. `focus` prints the context-expanded merged ranges.
 - Lua errors carry an exit code (`code` in the JSON result) so range errors found in nvim map to exit 6.
 - `where` reports the user's file window: when the current window is a terminal, the panel or another special

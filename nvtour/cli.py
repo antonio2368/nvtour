@@ -95,7 +95,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--note", metavar="TEXT", help="note text, or - to read stdin")
     p.add_argument("--label")
     p.add_argument("--role", choices=ROLES, default="info")
-    p.add_argument("--expect", metavar="TEXT", help="fail (exit 6) unless TEXT occurs in the range")
+    p.add_argument("--expect", metavar="TEXT", help="fail (exit 6) unless TEXT occurs in the range; TEXT is underlined in the current step")
     p.add_argument("--at", type=int, metavar="N", help="insert as step N instead of appending")
     g = p.add_mutually_exclusive_group()
     g.add_argument("--jump", action="store_true", help="jump to this step even if it is not the first")
@@ -107,7 +107,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--note", metavar="TEXT", help="new note, - to read stdin, '' to remove")
     p.add_argument("--label", help="new label, '' to remove")
     p.add_argument("--role", choices=ROLES)
-    p.add_argument("--expect", metavar="TEXT", help="fail (exit 6) unless TEXT occurs in the range")
+    p.add_argument("--expect", metavar="TEXT", help="fail (exit 6) unless TEXT occurs in the range; TEXT is underlined in the current step ('' removes it)")
     p.add_argument("--jump", action="store_true", help="jump to the step")
 
     p = cmd("remove", "remove step N")

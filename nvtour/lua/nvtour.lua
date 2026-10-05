@@ -21,6 +21,9 @@ local function new_state()
     ns_steps = api.nvim_create_namespace("nvtour_steps"),
     ns_focus = api.nvim_create_namespace("nvtour_focus"),
     ns_panel = api.nvim_create_namespace("nvtour_panel"),
+    ns_flash = api.nvim_create_namespace("nvtour_flash"),
+    flash = { buf = nil, seq = 0 },
+    winbars = {}, -- [winid] = the window's own local 'winbar', restored by clear
     panel = { buf = nil, win = nil, text = {}, user_closed = false, line_map = {} },
     focus = {},
     diff_tabs = {},
@@ -51,15 +54,14 @@ local DEFAULT_KEYS =
 ---------------------------------------------------------------------------
 
 -- Each role takes its accent colour from a Diagnostic* group of the active colorscheme (with a
--- fallback) and tints the line background by blending that accent into the Normal background.
--- Diff* groups are deliberately not used: many colorschemes (gruvbox) define them with `reverse`,
--- which paints the whole range in one solid colour and destroys syntax highlighting.
+-- fallback). The range is never given a background: the accent colours the bar in the sign column,
+-- the line numbers, the label and the note number, so the code keeps its syntax colours.
 local ROLES = {
-  fault = { accent = "DiagnosticError", fallback = 0xfb4934, tint = 0.18 },
-  flow = { accent = "DiagnosticInfo", fallback = 0x83a598, tint = 0.16 },
-  fix = { accent = "DiagnosticOk", fallback = 0xb8bb26, tint = 0.16 },
-  context = { accent = "Comment", fallback = 0x928374, tint = 0.10 },
-  info = { accent = "DiagnosticHint", fallback = 0x8ec07c, tint = nil },
+  fault = { accent = "DiagnosticError", fallback = 0xfb4934 },
+  flow = { accent = "DiagnosticInfo", fallback = 0x83a598 },
+  fix = { accent = "DiagnosticOk", fallback = 0xb8bb26 },
+  context = { accent = "DiagnosticWarn", fallback = 0xfabd2f },
+  info = { accent = "DiagnosticHint", fallback = 0x8ec07c },
 }
 
 local function cap(s)
@@ -97,17 +99,23 @@ local function define_highlights(force)
   for role, g in pairs(ROLES) do
     local R = cap(role)
     local accent = hl_attr(g.accent, "fg") or g.fallback
-    if g.tint then
-      set("NvtourLine" .. R, { bg = blend(accent, bg, g.tint) })
-    end
     set("NvtourNumber" .. R, { fg = accent, bold = true })
     set("NvtourSign" .. R, { fg = accent, bold = true })
     set("NvtourLabel" .. R, { fg = accent, bold = true, italic = true })
+    -- No fg, so the syntax colour of the --expect text stays.
+    set("NvtourMark" .. R, { bold = true, underline = true, sp = accent })
   end
+  local code = hl_attr("@markup.raw", "fg") or hl_attr("String", "fg") or fg
   set("NvtourNote", { fg = blend(fg, bg, 0.80), italic = true })
+  set("NvtourNoteCode", { fg = code, bg = blend(fg, bg, 0.08) })
+  set("NvtourNoteBold", { fg = fg, bold = true, italic = true })
+  set("NvtourNoteCollapsed", { fg = blend(fg, bg, 0.50), italic = true })
   set("NvtourNoteBorder", { fg = blend(fg, bg, 0.40) })
   set("NvtourDim", { fg = blend(fg, bg, 0.35) })
+  set("NvtourFlash", { bg = blend(fg, bg, 0.25) })
   set("NvtourPanelCurrent", { bg = blend(fg, bg, 0.12), bold = true })
+  set("NvtourPanelFile", { link = "Directory" })
+  set("NvtourPanelProgress", { link = "Comment" })
   -- Lets init.lua re-apply overrides after a reload or colorscheme change:
   --   vim.api.nvim_create_autocmd("User", { pattern = "NvtourHighlights", callback = function() ... end })
   pcall(api.nvim_exec_autocmds, "User", { pattern = "NvtourHighlights", modeline = false })
@@ -254,6 +262,45 @@ local function split_lines(text)
     out[#out + 1] = line
   end
   return out
+end
+
+--- Split `s` into { text, kind } segments (kind nil, "code" or "bold"), without the markers.
+--- A marker without a closing partner is plain text.
+local function parse_inline(s)
+  local segs, plain, i = {}, {}, 1
+  local function flush()
+    if #plain > 0 then
+      segs[#segs + 1] = { table.concat(plain) }
+      plain = {}
+    end
+  end
+  while i <= #s do
+    local close, kind, len
+    if s:sub(i, i) == "`" then
+      close, kind, len = s:find("`", i + 1, true), "code", 1
+    elseif s:sub(i, i + 1) == "**" then
+      close, kind, len = s:find("**", i + 2, true), "bold", 2
+    end
+    if close and close > i + len then
+      flush()
+      segs[#segs + 1] = { s:sub(i + len, close - 1), kind }
+      i = close + len
+    else
+      plain[#plain + 1] = s:sub(i, i)
+      i = i + 1
+    end
+  end
+  flush()
+  return segs
+end
+
+--- Plain text of `s` without the inline markers.
+local function strip_inline(s)
+  local out = {}
+  for _, seg in ipairs(parse_inline(s)) do
+    out[#out + 1] = seg[1]
+  end
+  return table.concat(out)
 end
 
 local function relpath(path)
@@ -479,10 +526,29 @@ local function keys_line()
   local parts = {}
   for _, name in ipairs(KEY_ORDER) do
     if S.keys[name] then
-      parts[#parts + 1] = S.keys[name] .. " " .. name
+      parts[#parts + 1] = "`" .. S.keys[name] .. "` " .. name
     end
   end
   return table.concat(parts, " · ")
+end
+
+local ROLE_MARK = { fault = "✗", flow = "→", fix = "✓", context = "○", info = "•" }
+
+local function fmt_range(s)
+  return s.l1 == s.l2 and tostring(s.l1) or (s.l1 .. "-" .. s.l2)
+end
+
+--- Label of a step for lists: the label, else the first line of the note (cut to 60 cells).
+local function step_title(s)
+  if s.label and s.label ~= "" then
+    return s.label
+  end
+  local first = strip_inline((s.note or ""):match("[^\n]*%S[^\n]*") or "")
+  first = vim.trim(first)
+  if vim.fn.strdisplaywidth(first) > 60 then
+    first = vim.fn.strcharpart(first, 0, 59) .. "…"
+  end
+  return first
 end
 
 local function render_panel()
@@ -490,26 +556,42 @@ local function render_panel()
     return
   end
   local buf = S.panel.buf
+  local steps = S.tour.steps
   local lines = { "# " .. ((S.tour.title ~= "" and S.tour.title) or "Walkthrough"), "" }
-  local map = {}
+  local map, hls = {}, {} -- hls: { line, start byte, end byte (-1 = eol), group }
   local cur_line
-  for _, s in ipairs(S.tour.steps) do
-    local range = s.l1 == s.l2 and tostring(s.l1) or (s.l1 .. "-" .. s.l2)
+  local rw = 0
+  for _, s in ipairs(steps) do
+    rw = math.max(rw, #fmt_range(s))
+  end
+  -- Steps keep the tour order; a file name line starts each run of steps in the same file.
+  local prev_file
+  for _, s in ipairs(steps) do
+    if s.file ~= prev_file then
+      lines[#lines + 1] = relpath(s.file)
+      map[#lines] = s.n -- <CR> on the file name jumps to its first step
+      hls[#hls + 1] = { #lines, 0, -1, "NvtourPanelFile" }
+      prev_file = s.file
+    end
     local mark = (s.n == S.tour.current) and "▶ " or "  "
-    local line = ("%s%d. %s:%s"):format(mark, s.n, relpath(s.file), range)
-    if s.label and s.label ~= "" then
-      line = line .. "  " .. s.label
+    local head = ("%d. %s"):format(s.n, ROLE_MARK[s.role] or "•")
+    local range = fmt_range(s)
+    local line = mark .. head .. " " .. range
+    local title = step_title(s)
+    if title ~= "" then
+      line = line .. (" "):rep(rw - #range + 2) .. title
     end
     lines[#lines + 1] = line
     map[#lines] = s.n
+    hls[#hls + 1] = { #lines, #mark, #mark + #head, "NvtourSign" .. cap(s.role) }
     if s.n == S.tour.current then
       cur_line = #lines
     end
   end
-  if #S.tour.steps > 0 then
+  if #steps > 0 then
     local keys = keys_line()
     lines[#lines + 1] = ""
-    lines[#lines + 1] = (keys ~= "" and (keys .. " · ") or "") .. "<CR> jump · q close"
+    lines[#lines + 1] = (keys ~= "" and (keys .. " · ") or "") .. "`<CR>` jump · `q` close"
   end
   if #S.panel.text > 0 then
     lines[#lines + 1] = ""
@@ -523,6 +605,17 @@ local function render_panel()
   api.nvim_buf_set_lines(buf, 0, -1, false, lines)
   vim.bo[buf].modifiable = false
   api.nvim_buf_clear_namespace(buf, S.ns_panel, 0, -1)
+  for _, h in ipairs(hls) do
+    local e = h[3] >= 0 and h[3] or #lines[h[1]]
+    api.nvim_buf_set_extmark(buf, S.ns_panel, h[1] - 1, h[2], { end_col = e, hl_group = h[4], priority = 150 })
+  end
+  if #steps > 0 then
+    local progress = S.tour.current > 0 and ("%d/%d"):format(S.tour.current, #steps) or (#steps .. " step(s)")
+    api.nvim_buf_set_extmark(buf, S.ns_panel, 0, 0, {
+      virt_text = { { "  " .. progress, "NvtourPanelProgress" } },
+      virt_text_pos = "eol",
+    })
+  end
   if cur_line then
     api.nvim_buf_set_extmark(buf, S.ns_panel, cur_line - 1, 0, { line_hl_group = "NvtourPanelCurrent" })
     if panel_shown() then
@@ -572,6 +665,9 @@ local function panel_open()
   wo.winfixwidth = true
   wo.wrap = true
   wo.linebreak = true
+  wo.breakindent = true
+  wo.conceallevel = 2 -- hides the markdown markers (`code`, **bold**) of the summary and the footer
+  wo.concealcursor = "nc"
   wo.number = false
   wo.relativenumber = false
   wo.signcolumn = "no"
@@ -587,62 +683,121 @@ end
 -- Step rendering
 ---------------------------------------------------------------------------
 
---- Split a word that is wider than `width` display cells.
-local function split_word(word, width)
-  local parts, cur = {}, ""
-  for i = 0, vim.fn.strchars(word) - 1 do
-    local ch = vim.fn.strcharpart(word, i, 1)
-    if cur ~= "" and vim.fn.strdisplaywidth(cur .. ch) > width then
-      parts[#parts + 1] = cur
-      cur = ch
-    else
-      cur = cur .. ch
+-- Notes support two inline markdown forms: `code` and **bold**. The markers are not shown.
+local INLINE_HL = { code = "NvtourNoteCode", bold = "NvtourNoteBold" }
+
+--- Words of `s`. A word is a list of { text, kind } pieces (`erase`() is one word of two
+--- pieces); `sep` is the kind of the space before it.
+local function inline_words(s)
+  local words, cur, gap, gap_kind = {}, nil, true, nil
+  for _, seg in ipairs(parse_inline(s)) do
+    for space, word in seg[1]:gmatch("(%s*)(%S*)") do
+      if space ~= "" then
+        gap, gap_kind = true, seg[2]
+      end
+      if word ~= "" then
+        if gap then
+          cur = { sep = gap_kind }
+          words[#words + 1] = cur
+          gap = false
+        end
+        cur[#cur + 1] = { word, seg[2] }
+      end
+    end
+  end
+  return words
+end
+
+local function word_width(w)
+  local n = 0
+  for _, p in ipairs(w) do
+    n = n + vim.fn.strdisplaywidth(p[1])
+  end
+  return n
+end
+
+--- Append text to a list of chunks; merges with the last chunk of the same kind.
+local function add_chunk(line, text, kind)
+  local last = line[#line]
+  if last and last[2] == kind then
+    last[1] = last[1] .. text
+  else
+    line[#line + 1] = { text, kind }
+  end
+end
+
+--- Split a word that is wider than `width` display cells. The parts start new lines.
+local function split_word(w, width)
+  local parts, cur, cw = {}, { sep = w.sep }, 0
+  for _, p in ipairs(w) do
+    for i = 0, vim.fn.strchars(p[1]) - 1 do
+      local ch = vim.fn.strcharpart(p[1], i, 1)
+      local chw = vim.fn.strdisplaywidth(ch)
+      if cw > 0 and cw + chw > width then
+        parts[#parts + 1] = cur
+        cur, cw = { newline = true }, 0
+      end
+      add_chunk(cur, ch, p[2])
+      cw = cw + chw
     end
   end
   parts[#parts + 1] = cur
+  parts[1].newline = true
   return parts
 end
 
+--- Wrap one paragraph to `width` display cells. Each line is a list of { text, kind } chunks;
+--- an empty paragraph gives one empty line.
 local function wrap_text(s, width)
-  local out, cur = {}, ""
-  for word in s:gmatch("%S+") do
-    if vim.fn.strdisplaywidth(word) > width then
-      if cur ~= "" then
+  local out, cur, cw = {}, nil, 0
+  local function push(w, ww)
+    if cur and not w.newline and cw + 1 + ww <= width then
+      add_chunk(cur, " ", w.sep)
+      cw = cw + 1 + ww
+    else
+      if cur then
         out[#out + 1] = cur
       end
-      local parts = split_word(word, width)
-      for i = 1, #parts - 1 do
-        out[#out + 1] = parts[i]
-      end
-      cur = parts[#parts]
-    elseif cur == "" then
-      cur = word
-    elseif vim.fn.strdisplaywidth(cur .. " " .. word) <= width then
-      cur = cur .. " " .. word
-    else
-      out[#out + 1] = cur
-      cur = word
+      cur, cw = {}, ww
+    end
+    for _, p in ipairs(w) do
+      add_chunk(cur, p[1], p[2])
     end
   end
-  if cur ~= "" or #out == 0 then
-    out[#out + 1] = cur
+  for _, w in ipairs(inline_words(s)) do
+    local ww = word_width(w)
+    if ww > width then
+      for _, part in ipairs(split_word(w, width)) do
+        push(part, word_width(part))
+      end
+    else
+      push(w, ww)
+    end
   end
+  out[#out + 1] = cur or {}
   return out
 end
 
-local function note_chunks(note, width, n, R)
-  local texts = {}
+--- Lines of `note` wrapped to `width`, without leading and trailing blank lines.
+local function note_lines(note, width)
+  local lines = {}
   for _, para in ipairs(split_lines((note or ""):gsub("\t", "  "))) do
     for _, l in ipairs(wrap_text(para, width)) do
-      texts[#texts + 1] = l
+      lines[#lines + 1] = l
     end
   end
-  while #texts > 0 and texts[1] == "" do
-    table.remove(texts, 1)
+  while #lines > 0 and #lines[1] == 0 do
+    table.remove(lines, 1)
   end
-  while #texts > 0 and texts[#texts] == "" do
-    table.remove(texts)
+  while #lines > 0 and #lines[#lines] == 0 do
+    table.remove(lines)
   end
+  return lines
+end
+
+--- virt_lines for the note of the current step: a bordered block.
+local function note_chunks(note, width)
+  local texts = note_lines(note, width)
   local lines = {}
   for i, t in ipairs(texts) do
     local prefix
@@ -655,41 +810,62 @@ local function note_chunks(note, width, n, R)
     else
       prefix = "│ "
     end
-    if t == "" then
+    if #t == 0 then
       lines[#lines + 1] = { { "│", "NvtourNoteBorder" } }
-    elseif i == 1 and n then
-      lines[#lines + 1] = { { prefix, "NvtourNoteBorder" }, { tostring(n) .. " ", "NvtourSign" .. R }, { t, "NvtourNote" } }
     else
-      lines[#lines + 1] = { { prefix, "NvtourNoteBorder" }, { t, "NvtourNote" } }
+      local line = { { prefix, "NvtourNoteBorder" } }
+      for _, c in ipairs(t) do
+        line[#line + 1] = { c[1], INLINE_HL[c[2]] or "NvtourNote" }
+      end
+      lines[#lines + 1] = line
     end
   end
   return lines
 end
 
+--- One virt_line for the note of a step that is not current: the first line, cut with "…".
+local function collapsed_chunks(note, width)
+  local texts = note_lines(note, width - 2)
+  if #texts == 0 then
+    return {}
+  end
+  local line = { { "╶ ", "NvtourNoteBorder" } }
+  for _, c in ipairs(texts[1]) do
+    line[#line + 1] = { c[1], "NvtourNoteCollapsed" }
+  end
+  if #texts > 1 then
+    line[#line + 1] = { " …", "NvtourNoteCollapsed" }
+  end
+  return { line }
+end
+
+-- The bar of the current step, in the second cell of the sign column (next to the line numbers).
+-- The step number is not put in the sign column: "10" would run into the line number ("10348").
+local BAR_SIGN = " ▎"
+
+--- Draw step marks. Only the current step gets the bar, the full note and the --expect marks; the
+--- other steps keep the line numbers, the "← N label" marker and a one-line note.
 local function render_step(step, win)
   local buf = step.buf
   local ns = S.ns_steps
   local R = cap(step.role)
+  local current = step.n == S.tour.current
   for _, id in ipairs(step.extmark_ids or {}) do
     pcall(api.nvim_buf_del_extmark, buf, ns, id)
   end
   step.extmark_ids = {}
   local ids = step.extmark_ids
-  local function add(row, opts)
-    ids[#ids + 1] = api.nvim_buf_set_extmark(buf, ns, row, 0, opts)
+  local function add(row, opts, col)
+    ids[#ids + 1] = api.nvim_buf_set_extmark(buf, ns, row, col or 0, opts)
   end
   for l = step.l1, step.l2 do
-    local opts = { number_hl_group = "NvtourNumber" .. R, priority = 50 }
-    if ROLES[step.role].tint then
-      opts.line_hl_group = "NvtourLine" .. R
-    end
-    add(l - 1, opts)
+    add(l - 1, {
+      number_hl_group = "NvtourNumber" .. R,
+      sign_text = current and BAR_SIGN or nil,
+      sign_hl_group = "NvtourSign" .. R,
+      priority = 100,
+    })
   end
-  add(step.l1 - 1, {
-    sign_text = step.n >= 100 and "++" or tostring(step.n),
-    sign_hl_group = "NvtourSign" .. R,
-    priority = 100,
-  })
   if step.note and step.note ~= "" then
     local width = 80
     if valid_win(win) then
@@ -697,14 +873,30 @@ local function render_step(step, win)
       width = info.width - info.textoff
     end
     width = math.max(30, width - 4)
-    local vl = note_chunks(step.note, width, step.n, R)
+    local vl = current and note_chunks(step.note, width) or collapsed_chunks(step.note, width)
     if #vl > 0 then
       add(step.l1 - 1, { virt_lines = vl, virt_lines_above = true })
     end
   end
-  if step.label and step.label ~= "" then
-    add(step.l1 - 1, { virt_text = { { "  ← " .. step.label, "NvtourLabel" .. R } }, virt_text_pos = "eol" })
+  if current and step.expect and step.expect ~= "" then
+    local lines = api.nvim_buf_get_lines(buf, step.l1 - 1, step.l2, false)
+    for i, line in ipairs(lines) do
+      local from = 1
+      while true do
+        local s, e = line:find(step.expect, from, true)
+        if not s then
+          break
+        end
+        add(step.l1 + i - 2, { end_col = e, hl_group = "NvtourMark" .. R, priority = 150 }, s - 1)
+        from = e + 1
+      end
+    end
   end
+  local label = (step.label and step.label ~= "") and (" " .. step.label) or ""
+  add(step.l1 - 1, {
+    virt_text = { { "  ← ", "NvtourLabel" .. R }, { tostring(step.n), "NvtourSign" .. R }, { label, "NvtourLabel" .. R } },
+    virt_text_pos = "eol",
+  })
 end
 
 ---------------------------------------------------------------------------
@@ -730,9 +922,9 @@ local function update_qf(idx)
   end
   local items = {}
   for _, s in ipairs(S.tour.steps) do
-    local text = s.label
-    if not text or text == "" then
-      text = (s.note or ""):match("[^\n]+") or (relpath(s.file) .. ":" .. s.l1)
+    local text = step_title(s)
+    if text == "" then
+      text = relpath(s.file) .. ":" .. s.l1
     end
     items[#items + 1] = { filename = s.file, lnum = s.l1, end_lnum = s.l2, text = ("[%s] %s"):format(s.role, text) }
   end
@@ -741,6 +933,180 @@ local function update_qf(idx)
     what.idx = idx
   end
   vim.fn.setqflist({}, "r", what)
+end
+
+---------------------------------------------------------------------------
+-- Winbar, flash, scrolling
+---------------------------------------------------------------------------
+
+-- The tour window shows the position in its winbar. The expression is evaluated on redraw, so
+-- it is set once per window and buffer ('winbar' is reset when the window shows another buffer).
+local WINBAR = "%{%v:lua.nvtour.winbar()%}"
+
+local function sl_escape(s)
+  return (s:gsub("%%", "%%%%"))
+end
+
+--- Winbar text: "nvtour 2/5 fault · label" and, on the right, where the next key goes.
+function M.winbar()
+  local steps, n = S.tour.steps, S.tour.current
+  local step = steps[n]
+  if not step then
+    return #steps > 0 and (" nvtour · %d step(s)"):format(#steps) or ""
+  end
+  local pos = ("%d/%d %s"):format(n, #steps, step.role)
+  local label = (step.label and step.label ~= "") and (" · " .. step.label) or ""
+  -- In a %{} item the window of the bar is the current window (g:statusline_winid is not set).
+  local width = api.nvim_win_get_width(api.nvim_get_current_win())
+  local max_label = width - vim.fn.strdisplaywidth(" nvtour " .. pos) - 1
+  if vim.fn.strdisplaywidth(label) > max_label then
+    label = max_label > 4 and (vim.fn.strcharpart(label, 0, max_label - 1) .. "…") or ""
+  end
+  -- Right side, longest first: the first one that fits is shown.
+  local nxt = steps[n + 1]
+  local rights
+  if nxt then
+    local key = "next" .. (S.keys.next and (" " .. S.keys.next) or "") .. ": "
+    local loc = nxt.file == step.file and ("line " .. nxt.l1) or (relpath(nxt.file) .. ":" .. nxt.l1)
+    local short = nxt.file == step.file and loc or (vim.fn.fnamemodify(nxt.file, ":t") .. ":" .. nxt.l1)
+    rights = { key .. loc, key .. short, "" }
+    if nxt.label and nxt.label ~= "" then
+      table.insert(rights, 1, key .. short .. " " .. nxt.label)
+      table.insert(rights, 1, key .. loc .. " " .. nxt.label)
+    end
+  else
+    rights = { "last step" .. (S.keys.first and (" · " .. S.keys.first .. " first") or ""), "last step", "" }
+  end
+  local room = width - vim.fn.strdisplaywidth(" nvtour " .. pos .. label) - 3
+  local right = ""
+  for _, r in ipairs(rights) do
+    if vim.fn.strdisplaywidth(r) <= room then
+      right = r
+      break
+    end
+  end
+  local out = (" nvtour %%#NvtourSign%s#%s%%*%s"):format(cap(step.role), pos, sl_escape(label))
+  return out .. "%=" .. sl_escape(right) .. (right ~= "" and " " or "")
+end
+
+--- Show the tour winbar in `win`, unless it has a winbar of its own (from the user or a plugin)
+--- or vim.g.nvtour_winbar is false.
+local function set_winbar(win)
+  if vim.g.nvtour_winbar == false or not valid_win(win) then
+    return
+  end
+  local own = api.nvim_get_option_value("winbar", { win = win })
+  if own ~= "" and own ~= WINBAR then
+    return
+  end
+  if S.winbars[win] == nil then
+    local loc = api.nvim_get_option_value("winbar", { scope = "local", win = win })
+    S.winbars[win] = loc == WINBAR and "" or loc
+  end
+  api.nvim_set_option_value("winbar", WINBAR, { scope = "local", win = win })
+end
+
+local function clear_winbars()
+  for win, saved in pairs(S.winbars) do
+    if valid_win(win) and api.nvim_get_option_value("winbar", { scope = "local", win = win }) == WINBAR then
+      api.nvim_set_option_value("winbar", saved, { scope = "local", win = win })
+    end
+  end
+  S.winbars = {}
+end
+
+-- A buffer that comes back into a window gets the window options it had there, so a stale tour
+-- winbar can return after clear (or in a window that shows no tour any more).
+api.nvim_create_autocmd("BufWinEnter", {
+  group = aug,
+  callback = function()
+    local win = api.nvim_get_current_win()
+    if S.winbars[win] == nil and api.nvim_get_option_value("winbar", { scope = "local", win = win }) == WINBAR then
+      api.nvim_set_option_value("winbar", "", { scope = "local", win = win })
+    end
+  end,
+})
+
+--- Highlight the range of `step` for vim.g.nvtour_flash ms (default 300, 0 = off), so the eye
+--- finds it after a jump.
+local function flash(step)
+  local ms = tonumber(vim.g.nvtour_flash) or 300
+  if valid_buf(S.flash.buf) then
+    api.nvim_buf_clear_namespace(S.flash.buf, S.ns_flash, 0, -1)
+  end
+  if ms <= 0 then
+    return
+  end
+  local buf = step.buf
+  local last = api.nvim_buf_get_lines(buf, step.l2 - 1, step.l2, false)[1] or ""
+  api.nvim_buf_set_extmark(buf, S.ns_flash, step.l1 - 1, 0, {
+    end_row = step.l2 - 1,
+    end_col = #last,
+    hl_group = "NvtourFlash",
+    hl_eol = true,
+    priority = 250,
+  })
+  S.flash.seq = S.flash.seq + 1
+  S.flash.buf = buf
+  local seq = S.flash.seq
+  vim.defer_fn(function()
+    if S.flash.seq == seq and valid_buf(buf) then
+      api.nvim_buf_clear_namespace(buf, S.ns_flash, 0, -1)
+    end
+  end, ms)
+end
+
+--- Screen rows of buffer row `row` (0-based) with the virtual lines above it.
+local function rows_of(win, row)
+  local ok, h = pcall(api.nvim_win_text_height, win, { start_row = row, end_row = row })
+  if ok then
+    return h.all, h.fill
+  end
+  return 1, 0
+end
+
+--- Put the cursor on l1 and scroll so the note and the range are in view: the block is centred
+--- when it fits in the window, else the note starts at the top. Unlike `zz`, this keeps the note
+--- of a step on line 1 (virtual lines above the top line need 'topfill') and the end of a long range
+--- in view.
+local function scroll_to(step, win)
+  api.nvim_win_call(win, function()
+    api.nvim_win_set_cursor(win, { step.l1, 0 })
+    vim.cmd("normal! zv")
+    local height = vim.fn.getwininfo(win)[1].height
+    local ok, th = pcall(api.nvim_win_text_height, win, { start_row = step.l1 - 1, end_row = step.l2 - 1 })
+    local block = ok and th.all or (step.l2 - step.l1 + 1)
+    local top, used = step.l1, 0
+    local want = block < height and math.floor((height - block) / 2) or 0
+    while top > 1 do
+      local prev, h = top - 1, nil
+      local fold = vim.fn.foldclosed(prev)
+      if fold ~= -1 then
+        prev, h = fold, 1
+      else
+        h = rows_of(win, prev - 1)
+      end
+      if used + h > want then
+        break
+      end
+      top, used = prev, used + h
+    end
+    -- Do not scroll past the end of the file: the last line stays at the bottom of the window.
+    local count = api.nvim_buf_line_count(step.buf)
+    local ok2, rest = pcall(api.nvim_win_text_height, win, { start_row = top - 1, end_row = count - 1 })
+    local below = ok2 and rest.all or height
+    while top > 1 and below < height do
+      local prev = top - 1
+      local fold = vim.fn.foldclosed(prev)
+      local h = fold ~= -1 and 1 or rows_of(win, prev - 1)
+      if below + h > height then
+        break
+      end
+      top, below = fold ~= -1 and fold or prev, below + h
+    end
+    local _, fill = rows_of(win, top - 1)
+    vim.fn.winrestview({ topline = top, topfill = fill })
+  end)
 end
 
 ---------------------------------------------------------------------------
@@ -829,6 +1195,7 @@ local function clear_step_marks()
     if valid_buf(b) then
       api.nvim_buf_clear_namespace(b, S.ns_steps, 0, -1)
       api.nvim_buf_clear_namespace(b, S.ns_focus, 0, -1)
+      api.nvim_buf_clear_namespace(b, S.ns_flash, 0, -1)
     end
   end
 end
@@ -861,6 +1228,7 @@ local function reset(keep_panel)
   end
   S.focus = {}
   clear_step_marks()
+  clear_winbars()
   diff_close()
   remove_keymaps()
   local qf_id = S.tour.qf_id
@@ -944,17 +1312,19 @@ end
 local function jump(step)
   if not valid_buf(step.buf) or not api.nvim_buf_is_loaded(step.buf) then
     step.buf = load_buf(step.file)
-    render_step(step, tour_win(step.buf))
   end
   local win = show_buf(tour_win(step.buf, true), step.buf)
   S.tour_win = win
   enter_win(win)
-  api.nvim_win_set_cursor(win, { step.l1, 0 })
-  api.nvim_win_call(win, function()
-    vim.cmd("normal! zv")
-    vim.cmd("normal! zz")
-  end)
+  local old = S.tour.steps[S.tour.current]
   S.tour.current = step.n
+  if old and old ~= step and valid_buf(old.buf) and api.nvim_buf_is_loaded(old.buf) then
+    render_step(old, tour_win(old.buf))
+  end
+  set_winbar(win) -- before the note is wrapped and the view is computed: it takes a row
+  render_step(step, win)
+  scroll_to(step, win)
+  flash(step)
 end
 
 local function announce(step)
@@ -1060,6 +1430,7 @@ H.step = function(a)
     role = role,
     label = a.label,
     note = a.note,
+    expect = (a.expect ~= "" and a.expect) or nil,
     extmark_ids = {},
   }
   -- The step is added only after it rendered (and jumped); a failure leaves no half step behind.
@@ -1075,6 +1446,7 @@ H.step = function(a)
       pcall(api.nvim_buf_del_extmark, step.buf, S.ns_steps, id)
     end
     S.tour.current = prev_current
+    pcall(rerender_all) -- the jump may have drawn the previous current step as not current
     error(err, 0)
   end
   table.insert(steps, at, step)
@@ -1125,6 +1497,9 @@ H.edit = function(a)
   end
   if a.note ~= nil then
     step.note = a.note ~= "" and a.note or nil
+  end
+  if a.expect ~= nil then
+    step.expect = a.expect ~= "" and a.expect or nil
   end
   rerender_all()
   if a.jump then
@@ -1350,7 +1725,8 @@ end
 H.status = function()
   local steps = {}
   for _, s in ipairs(S.tour.steps) do
-    steps[#steps + 1] = { n = s.n, file = s.file, l1 = s.l1, l2 = s.l2, role = s.role, label = s.label, note = s.note }
+    steps[#steps + 1] =
+      { n = s.n, file = s.file, l1 = s.l1, l2 = s.l2, role = s.role, label = s.label, note = s.note, expect = s.expect }
   end
   local focus = {}
   for _, f in pairs(S.focus) do
@@ -1567,6 +1943,8 @@ if PREV_VERSION ~= nil and PREV_VERSION ~= M.VERSION then
   if valid_buf(S.panel.buf) then
     map_panel_keys(S.panel.buf)
   end
+  pcall(rerender_all) -- marks drawn by the old version may differ (for example the old line tint)
+  pcall(render_panel)
 end
 
 _G.nvtour = M
