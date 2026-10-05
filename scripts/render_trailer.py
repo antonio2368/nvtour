@@ -44,7 +44,7 @@ FLAGC = (150, 165, 190)
 STRC = (226, 200, 150)
 FX = (255, 196, 87)  # effects layer: command glow, flying dot, change outlines, callouts
 INK = (24, 20, 12)
-DIM_LEVEL = 0.55  # how much the pane that does not act is dimmed
+DIM_LEVEL = 0.4  # how much the pane that does not act is dimmed (more makes small text break up in the video)
 
 SOLO_RECT = (310, 80, 1300, 820)  # x, y, w, h
 CHAT_RECT = (36, 64, 540, 864)
@@ -265,12 +265,32 @@ def save_poster(frame: Image.Image, path: Path) -> None:
     img.resize((1280, 720), Image.Resampling.LANCZOS).save(path, optimize=True)
 
 
+def heavier(paths: dict[str, Path]) -> dict[str, Path]:
+    """Medium and ExtraBold instead of Regular and Bold when they exist: thin strokes break up when the
+    browser scales the video down."""
+    names = {"regular": ("Regular", "Medium"), "bold": ("Bold", "ExtraBold"), "italic": ("Italic", "MediumItalic"),
+             "bold_italic": ("BoldItalic", "ExtraBoldItalic")}
+    out = dict(paths)
+    for style, (old, new) in names.items():
+        p = paths[style]
+        q = p.with_name(p.name.replace(f"-{old}.", f"-{new}."))
+        if q != p and q.exists():
+            out[style] = q
+    return out
+
+
 class Video:
-    def __init__(self, path: str, fps: int, stills: Path | None, poster: Path | None = None):
+    def __init__(self, path: str, fps: int, stills: Path | None, poster: Path | None = None,
+                 size: tuple[int, int] = (W, H)):
         self.fps, self.stills, self.poster, self.frames = fps, stills, poster, 0
+        # Frames are drawn at W x H; ffmpeg scales them to `size` with lanczos. A browser scales video with
+        # a simple filter, which drops pixels of small text when it shrinks by more than about 2x, so a
+        # smaller video looks cleaner in a README.
+        scale = [] if size == (W, H) else ["-vf", f"scale={size[0]}:{size[1]}:flags=lanczos"]
         self.gen = imageio_ffmpeg.write_frames(
             path, (W, H), fps=fps, codec="libx264", quality=None, macro_block_size=8,  # type: ignore[arg-type]
-            output_params=["-crf", "22", "-preset", "slow", "-movflags", "+faststart"])
+            output_params=[*scale, "-crf", "16", "-preset", "slow", "-tune", "animation",
+                           "-movflags", "+faststart"])
         self.gen.send(None)
         self.last = Image.new("RGB", (W, H), (0, 0, 0))
 
@@ -686,12 +706,14 @@ def main() -> None:
     p.add_argument("--colorscheme", help="load this colorscheme from your nvim plugins (default: built-in)")
     p.add_argument("--poster", type=Path, default=rd.REPO / "docs/trailer-poster.png",
                    help="README image: a frame with a play button")
+    p.add_argument("--size", default="1280x720", help="size of the video, WIDTHxHEIGHT (frames are drawn at "
+                   f"{W}x{H})")
     a = p.parse_args()
-    fonts = Fonts(rd.find_fonts(a.font_dir or rd.FONT_DIRS))
+    fonts = Fonts(heavier(rd.find_fonts(a.font_dir or rd.FONT_DIRS)))
     if a.stills:
         a.stills.mkdir(parents=True, exist_ok=True)
 
-    v = Video(a.out, a.fps, a.stills, a.poster)
+    v = Video(a.out, a.fps, a.stills, a.poster, tuple(int(x) for x in a.size.split("x")))  # type: ignore[arg-type]
     s = Stage(v, fonts)
     t = Trailer(s, fonts, colorscheme_lua(a.colorscheme) if a.colorscheme else "")
     try:
