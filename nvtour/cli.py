@@ -131,7 +131,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--toggle", action="store_true")
     p.add_argument("--clear", action="store_true")
 
-    cmd("clear", "remove everything nvtour created")
+    p = cmd("clear", "remove everything nvtour created")
+    p.add_argument("--keep-buffers", action="store_true", help="keep toured files in the buffer list")
     cmd("doctor", "check the installation")
     return parser
 
@@ -157,6 +158,9 @@ def pick_socket(args: argparse.Namespace, workspace: str, env: Mapping[str, str]
     if chosen:
         return chosen
     inst = discover.select(discover.inspect_all(workspace, env), workspace)
+    if inst.kind == "only instance":
+        print(f"nvtour: using the only running nvim (pid {inst.pid}, cwd {inst.cwd}); "
+              f"it does not match {workspace}. Undo with: nvtour attach --clear", file=sys.stderr)
     if save_pin:
         discover.write_pin(workspace, inst.socket, env, inst.pid)
     return inst.socket, "discovery"
@@ -201,7 +205,9 @@ def build_request(args: argparse.Namespace, workspace: str) -> tuple[str, dict[s
                         "label": args.label, "role": args.role, "jump": args.jump or None, "no_jump": args.no_jump or None}
     if c == "goto":
         return "goto", {"n": args.n}
-    if c in ("next", "prev", "first", "last", "clear", "where", "diff-close"):
+    if c == "clear":
+        return c, {"keep_buffers": args.keep_buffers or None}
+    if c in ("next", "prev", "first", "last", "where", "diff-close"):
         return c, {}
     if c == "focus":
         path, l1, l2 = ranges.parse_file_range(args.spec)
@@ -308,6 +314,7 @@ def run_remote(args: argparse.Namespace, workspace: str, env: Mapping[str, str])
     sock, _source = pick_socket(args, workspace, env)
     client = Client(sock, args.timeout).connect()
     try:
+        client.check_not_blocked()
         client.ensure_lua_loaded()
         res = client.call(cmd, payload)
     finally:
@@ -323,23 +330,24 @@ def run_remote(args: argparse.Namespace, workspace: str, env: Mapping[str, str])
 
 def run_instances(args: argparse.Namespace, workspace: str, env: Mapping[str, str]) -> int:
     insts = discover.inspect_all(workspace, env)
-    pruned = 0
+    pruned = skipped = 0
     if args.prune:
         for i in insts:
             if i.state == "stale":
-                try:
-                    os.unlink(i.socket)
+                if discover.unlink_stale_socket(i.socket):
                     pruned += 1
-                except OSError:
-                    pass
+                else:
+                    skipped += 1
     if args.json:
-        print(json.dumps({"workspace": workspace, "instances": [i.to_dict() for i in insts], "pruned": pruned}))
+        print(json.dumps({"workspace": workspace, "instances": [i.to_dict() for i in insts], "pruned": pruned,
+                          "skipped": skipped}))
     else:
         text = discover.format_instances(insts)
         if text:
             print(text)
         if args.prune:
-            print(f"pruned {pruned} stale socket(s)")
+            extra = f"; skipped {skipped} (not a socket owned by you)" if skipped else ""
+            print(f"pruned {pruned} stale socket(s){extra}")
     return 0
 
 

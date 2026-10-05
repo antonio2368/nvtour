@@ -30,6 +30,7 @@ local function new_state()
     warned = {},
     tour_win = nil,
     pending_folds = {},
+    added_bufs = {},
   }
 end
 
@@ -269,8 +270,15 @@ local function load_buf(path)
     fail("file not found: " .. path, 6)
   end
   local buf = vim.fn.bufadd(path)
+  if not vim.bo[buf].buflisted then
+    S.added_bufs[buf] = true -- unlisted again by clear
+  end
+  -- bufload() shows no swap-file dialog; inside pcall its ATTENTION message (E325) becomes an
+  -- error instead of a hit-enter prompt, and the buffer is loaded anyway.
   local ok, err = pcall(vim.fn.bufload, buf)
-  if not ok then
+  if not ok and tostring(err):match("E325") and api.nvim_buf_is_loaded(buf) then
+    warn(path .. " has a swap file (open in another nvim?); showing the file anyway")
+  elseif not ok then
     fail("cannot read " .. path .. ": " .. tostring(err), 6)
   end
   vim.bo[buf].buflisted = true
@@ -560,10 +568,35 @@ end
 -- Step rendering
 ---------------------------------------------------------------------------
 
+--- Split a word that is wider than `width` display cells.
+local function split_word(word, width)
+  local parts, cur = {}, ""
+  for i = 0, vim.fn.strchars(word) - 1 do
+    local ch = vim.fn.strcharpart(word, i, 1)
+    if cur ~= "" and vim.fn.strdisplaywidth(cur .. ch) > width then
+      parts[#parts + 1] = cur
+      cur = ch
+    else
+      cur = cur .. ch
+    end
+  end
+  parts[#parts + 1] = cur
+  return parts
+end
+
 local function wrap_text(s, width)
   local out, cur = {}, ""
   for word in s:gmatch("%S+") do
-    if cur == "" then
+    if vim.fn.strdisplaywidth(word) > width then
+      if cur ~= "" then
+        out[#out + 1] = cur
+      end
+      local parts = split_word(word, width)
+      for i = 1, #parts - 1 do
+        out[#out + 1] = parts[i]
+      end
+      cur = parts[#parts]
+    elseif cur == "" then
       cur = word
     elseif vim.fn.strdisplaywidth(cur .. " " .. word) <= width then
       cur = cur .. " " .. word
@@ -663,13 +696,17 @@ local function qf_title()
   return "nvtour: " .. ((S.tour.title ~= "" and S.tour.title) or "Walkthrough")
 end
 
+local function qf_valid()
+  return S.tour.qf_id ~= nil and vim.fn.getqflist({ id = S.tour.qf_id }).id ~= 0
+end
+
 local function new_qf()
   vim.fn.setqflist({}, " ", { title = qf_title(), items = {} })
   S.tour.qf_id = vim.fn.getqflist({ id = 0 }).id
 end
 
 local function update_qf(idx)
-  if not S.tour.qf_id or vim.fn.getqflist({ id = S.tour.qf_id }).id == 0 then
+  if not qf_valid() then
     new_qf()
   end
   local items = {}
@@ -678,8 +715,7 @@ local function update_qf(idx)
     if not text or text == "" then
       text = (s.note or ""):match("[^\n]+") or (relpath(s.file) .. ":" .. s.l1)
     end
-    items[#items + 1] =
-      { filename = s.file, lnum = s.l1, end_lnum = s.l2, text = text, type = s.role:sub(1, 1) }
+    items[#items + 1] = { filename = s.file, lnum = s.l1, end_lnum = s.l2, text = ("[%s] %s"):format(s.role, text) }
   end
   local what = { id = S.tour.qf_id, title = qf_title(), items = items }
   if idx then
@@ -806,10 +842,18 @@ local function reset(keep_panel)
   clear_step_marks()
   diff_close()
   remove_keymaps()
-  if S.tour.qf_id and vim.fn.getqflist({ id = S.tour.qf_id }).id ~= 0 then
-    vim.fn.setqflist({}, "r", { id = S.tour.qf_id, title = "nvtour (cleared)", items = {} })
+  local qf_id = S.tour.qf_id
+  if qf_valid() then
+    vim.fn.setqflist({}, "r", { id = qf_id, title = "nvtour (cleared)", items = {} })
+    -- clear: when our list is the current one, make the user's previous list current again.
+    if not keep_panel and vim.fn.getqflist({ id = 0 }).id == qf_id and vim.fn.getqflist({ nr = 0 }).nr > 1 then
+      pcall(vim.cmd, "silent colder")
+    end
+  else
+    qf_id = nil
   end
-  S.tour = { title = "", steps = {}, current = 0, qf_id = nil }
+  -- The list is reused by the next tour, so the 10-deep quickfix stack does not fill up.
+  S.tour = { title = "", steps = {}, current = 0, qf_id = qf_id }
   S.panel.text = {}
   if keep_panel then
     render_panel()
@@ -831,8 +875,11 @@ local function reset(keep_panel)
 end
 
 local function ensure_started()
-  if not S.tour.qf_id then
+  -- Reuse our list only while it is the current one; a list the user made since then stays on top.
+  if not qf_valid() or vim.fn.getqflist({ id = 0 }).id ~= S.tour.qf_id then
     new_qf()
+  elseif vim.fn.getqflist({ id = S.tour.qf_id, title = 0 }).title ~= qf_title() then
+    update_qf()
   end
   install_keymaps()
 end
@@ -1168,9 +1215,17 @@ H.panel = function(a)
   return { ok = true, status = status }
 end
 
-H.clear = function()
+H.clear = function(a)
   reset(false)
-  return { ok = true }
+  local unlisted = 0
+  for buf in pairs(S.added_bufs) do
+    if not a.keep_buffers and valid_buf(buf) and not vim.bo[buf].modified and #vim.fn.win_findbuf(buf) == 0 then
+      vim.bo[buf].buflisted = false
+      unlisted = unlisted + 1
+    end
+  end
+  S.added_bufs = {}
+  return { ok = true, unlisted = unlisted }
 end
 
 local MAX_SEL_LINES, MAX_SEL_BYTES = 200, 65536
@@ -1281,6 +1336,28 @@ dispatch = function(cmd, args)
   return res
 end
 M.dispatch = dispatch
+
+-- Notes are wrapped to the window width: re-wrap them when a window that shows them is resized.
+api.nvim_create_autocmd("WinResized", {
+  group = aug,
+  callback = function()
+    if #S.tour.steps == 0 then
+      return
+    end
+    local shown = {}
+    for _, w in ipairs(vim.v.event.windows or {}) do
+      if valid_win(w) then
+        shown[api.nvim_win_get_buf(w)] = w
+      end
+    end
+    for _, s in ipairs(S.tour.steps) do
+      local w = shown[s.buf]
+      if w and s.note and s.note ~= "" and valid_buf(s.buf) then
+        pcall(render_step, s, w)
+      end
+    end
+  end,
+})
 
 ---------------------------------------------------------------------------
 -- User commands

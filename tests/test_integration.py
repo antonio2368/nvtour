@@ -4,8 +4,13 @@ from __future__ import annotations
 
 import json
 import os
+import socket
+import subprocess
+import time
 
 import pytest
+
+from conftest import clean_env, wait_for_socket
 
 
 def ns_marks(nv, name, buf=0):
@@ -76,9 +81,9 @@ def test_nav_and_quickfix(cli, nv):
     assert "already at last step" in ok(cli("next"))
     qf = nv.call("getqflist", {"title": 0, "items": 0, "idx": 0})
     assert qf["title"] == "nvtour: Nav"
-    assert [(i["lnum"], i["end_lnum"], i["text"], i["type"]) for i in qf["items"]] == [
-        (3, 4, "first", "f"),
-        (9, 9, "fix note", "f"),
+    assert [(i["lnum"], i["end_lnum"], i["text"]) for i in qf["items"]] == [
+        (3, 4, "[fault] first"),
+        (9, 9, "[fix] fix note"),
     ]
     assert qf["idx"] == 2
     bad = cli("goto", "9")
@@ -416,14 +421,18 @@ def test_json_output_has_socket_and_pid(cli, nvim_proc):
 
 def test_discovery_live_and_stale(cli, sandbox, nvim_proc):
     fake = sandbox.runtime / "nvim.999999.0"
-    if os.path.exists("/proc/999999"):
-        pytest.skip("pid 999999 exists")
-    fake.write_text("")
+    regular = sandbox.runtime / "nvim.999998.0"
+    if os.path.exists("/proc/999999") or os.path.exists("/proc/999998"):
+        pytest.skip("pid 999999 or 999998 exists")
+    s = socket.socket(socket.AF_UNIX)
+    s.bind(str(fake))  # a real socket file left behind by a dead nvim
+    s.close()
+    regular.write_text("")  # same name pattern, but not a socket: --prune must not delete it
     try:
         r = cli("--workspace", str(sandbox.ws), "--json", "instances", socket=False)
         data = json.loads(ok(r))
         states = sorted(i["state"] for i in data["instances"])
-        assert states == ["live", "stale"]
+        assert states == ["live", "stale", "stale"]
         live = [i for i in data["instances"] if i["state"] == "live"][0]
         assert live["pid"] == nvim_proc.pid and live["score"] == 100
         text = ok(cli("--workspace", str(sandbox.ws), "instances", socket=False))
@@ -431,16 +440,40 @@ def test_discovery_live_and_stale(cli, sandbox, nvim_proc):
         r = cli("--workspace", str(sandbox.ws), "attach", socket=False)
         assert f"pid {nvim_proc.pid}" in ok(r) and "exact match" in r.stdout
         r = cli("--workspace", str(sandbox.ws), "instances", "--prune", socket=False)
-        assert not fake.exists()
+        assert "pruned 1 stale socket(s); skipped 1" in ok(r)
+        assert not fake.exists() and regular.exists()
         # auto-selection (pin) works without --socket
         r = cli("--workspace", str(sandbox.ws), "where", socket=False)
         ok(r)
         ok(cli("--workspace", str(sandbox.ws), "attach", "--clear", socket=False))
     finally:
         fake.unlink(missing_ok=True)
+        regular.unlink(missing_ok=True)
 
 
-def test_no_match_exit_codes(cli, sandbox, tmp_path):
+@pytest.fixture()
+def second_nvim(sandbox, tmp_path):
+    """Another private headless nvim (same runtime dir) whose cwd is outside the workspace."""
+    cwd = tmp_path / "second"
+    cwd.mkdir()
+    proc = subprocess.Popen(["nvim", "--headless", "--clean"], cwd=cwd, env=clean_env(sandbox.runtime),
+                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        yield wait_for_socket(sandbox.runtime, proc.pid)
+    finally:
+        proc.kill()
+        proc.wait(timeout=10)
+
+
+def test_only_instance_is_selected_with_a_note(cli, sandbox, tmp_path):
+    other = tmp_path / "elsewhere"
+    other.mkdir()
+    r = cli("--workspace", str(other), "where", socket=False)
+    assert r.returncode == 0 and "using the only running nvim" in r.stderr
+    ok(cli("--workspace", str(other), "attach", "--clear", socket=False))
+
+
+def test_no_match_exit_codes(cli, sandbox, tmp_path, second_nvim):
     other = tmp_path / "elsewhere"
     other.mkdir()
     r = cli("--workspace", str(other), "where", socket=False)
@@ -449,6 +482,97 @@ def test_no_match_exit_codes(cli, sandbox, tmp_path):
     empty.mkdir()
     r = cli("where", socket=False, env_extra={"XDG_RUNTIME_DIR": str(empty)})
     assert r.returncode == 4 and "no running nvim found" in r.stderr
+
+
+def test_blocked_nvim_fails_fast_and_runs_nothing(cli, nv, sandbox, nvim_proc):
+    import pynvim
+
+    ok(cli("start", "B"))
+    ui = pynvim.attach("socket", path=nvim_proc.socket)
+    ui.ui_attach(80, 24, rgb=True)  # prompts only wait for the user when a UI is attached
+    nv.input(':echo "a\\nb\\nc\\nd"<CR>')  # hit-enter prompt: nvim queues requests until <CR>
+    deadline = time.time() + 5
+    while not nv.api.get_mode()["blocking"] and time.time() < deadline:
+        time.sleep(0.05)
+    assert nv.api.get_mode()["blocking"] is True
+    try:
+        t0 = time.monotonic()
+        r = cli("step", "a.txt:3")
+        assert r.returncode == 5 and "waiting for input" in r.stderr and "not run" in r.stderr
+        assert time.monotonic() - t0 < 4
+        data = json.loads(ok(cli("--workspace", str(sandbox.ws), "--json", "instances", socket=False)))
+        assert [i["state"] for i in data["instances"] if i["pid"] == nvim_proc.pid] == ["blocked"]
+    finally:
+        nv.input("<CR>")
+        ui.ui_detach()
+        ui.close()
+    assert nv.exec_lua("return #_G.nvtour.state.tour.steps") == 0
+
+
+def test_quickfix_list_is_reused_and_user_list_restored(cli, nv):
+    nv.call("setqflist", [], " ", {"title": "user list", "items": [{"filename": "b.txt", "lnum": 1}]})
+    ok(cli("start", "Q1"))
+    ok(cli("step", "a.txt:3"))
+    qid = nv.call("getqflist", {"id": 0})["id"]
+    assert nv.call("getqflist", {"title": 0})["title"] == "nvtour: Q1"
+    ok(cli("start", "Q2"))
+    assert nv.call("getqflist", {"id": 0})["id"] == qid
+    assert nv.call("getqflist", {"title": 0})["title"] == "nvtour: Q2"
+    ok(cli("clear"))
+    assert nv.call("getqflist", {"title": 0})["title"] == "user list"
+    assert nv.call("getqflist", {"id": qid, "title": 0})["title"] == "nvtour (cleared)"
+
+
+def test_clear_unlists_buffers_nvtour_added(cli, nv):
+    ok(cli("start", "L"))
+    ok(cli("step", "a.txt:3"))
+    ok(cli("step", "b.txt:4"))
+    b = find_buf(nv, "b.txt")
+    assert nv.api.get_option_value("buflisted", {"buf": b.handle}) is True
+    ok(cli("clear"))
+    assert nv.api.get_option_value("buflisted", {"buf": b.handle}) is False
+    assert nv.api.get_option_value("buflisted", {"buf": find_buf(nv, "a.txt").handle}) is True  # shown
+    nv.command("silent! %bwipeout!")
+    ok(cli("step", "b.txt:4", "--no-jump"))
+    ok(cli("clear", "--keep-buffers"))
+    assert nv.api.get_option_value("buflisted", {"buf": find_buf(nv, "b.txt").handle}) is True
+
+
+def test_long_words_are_split_to_the_note_width(cli, nv):
+    ok(cli("step", "a.txt:2", "--note", "x" * 300))
+    buf = find_buf(nv, "a.txt")
+    vl = [m[3]["virt_lines"] for m in ns_marks(nv, "nvtour_steps", buf.handle) if m[3].get("virt_lines")][0]
+    widths = [sum(len(chunk[0]) for chunk in line[1:]) for line in vl]
+    assert len(vl) > 3 and max(widths) <= nv.eval("winwidth(0)")
+
+
+def test_swap_file_does_not_prompt(cli, nv, sandbox, tmp_path):
+    swapdir = tmp_path / "swap"
+    swapdir.mkdir()
+    f = sandbox.ws / "swapped.txt"
+    f.write_text("one\ntwo\n")
+    other_sock = tmp_path / "other.sock"
+    other = subprocess.Popen(
+        ["nvim", "--headless", "--clean", "--listen", str(other_sock), "--cmd", f"set directory={swapdir}//", str(f)],
+        cwd=sandbox.ws, env=clean_env(tmp_path), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL)
+    old_dir = nv.eval("&directory")
+    try:
+        deadline = time.time() + 10
+        while not any(swapdir.iterdir()) and time.time() < deadline:
+            time.sleep(0.05)
+        assert any(swapdir.iterdir()), "the other nvim did not create a swap file"
+        nv.command(f"set directory={swapdir}//")
+        r = cli("step", "swapped.txt:1")
+        ok(r)
+        assert "has a swap file" in r.stderr
+        assert nv.api.get_mode()["blocking"] is False
+        assert lines_of(nv, find_buf(nv, "swapped.txt").handle) == ["one", "two"]
+    finally:
+        nv.command("set directory=" + old_dir.replace(" ", "\\ ").replace(",", "\\,"))
+        other.kill()
+        other.wait(timeout=10)
+        f.unlink()
 
 
 def test_doctor(cli, sandbox):

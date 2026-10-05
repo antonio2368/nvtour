@@ -8,6 +8,8 @@ import hashlib
 import json
 import os
 import re
+import stat
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
@@ -20,7 +22,7 @@ local bufs = {}
 for _, b in ipairs(vim.api.nvim_list_bufs()) do
   if vim.bo[b].buflisted then
     local n = vim.api.nvim_buf_get_name(b)
-    if n ~= "" and n:sub(1, 1) == "/" and #bufs < 200 then bufs[#bufs + 1] = n end
+    if n ~= "" and n:sub(1, 1) == "/" and #bufs < 200 then bufs[#bufs + 1] = (vim.uv or vim.loop).fs_realpath(n) or n end
   end
 end
 local v = vim.version()
@@ -37,7 +39,7 @@ class Instance:
 
     socket: str
     pid: int | None
-    state: str  # live | stale | unresponsive
+    state: str  # live | stale | unresponsive | blocked
     cwd: str = ""
     buffers: list[str] = field(default_factory=list)
     tabpages: int = 0
@@ -83,12 +85,25 @@ def pid_alive(pid: int | None) -> bool:
     return pid is not None and os.path.exists(f"/proc/{pid}")
 
 
+def pid_is_nvim(pid: int | None) -> bool:
+    """True if the process exists and is an nvim (a reused pid of another program is not)."""
+    if not pid_alive(pid):
+        return False
+    try:
+        with open(f"/proc/{pid}/comm", encoding="utf-8") as fh:
+            return fh.read().strip().startswith("nvim")
+    except OSError:
+        return True
+
+
 def _under(path: str, root: str) -> bool:
     return Path(path).is_relative_to(root)
 
 
 def score_instance(cwd: str, workspace: str, buffers: list[str]) -> tuple[int, str]:
     """Score an instance against workspace ``W`` (see DESIGN.md section 3)."""
+    if not cwd:
+        return 0, ""
     cwd_r = os.path.realpath(cwd)
     if cwd_r == workspace:
         return 100, "exact match"
@@ -106,7 +121,10 @@ def probe(path: str, timeout: float = 2.0) -> dict[str, Any] | None:
     client = Client(path, timeout)
     try:
         client.connect()
-        info = client.exec_lua(PROBE_LUA)
+        mode = client.mode()
+        if mode.get("blocking"):
+            return {"blocked": True, "mode": mode.get("mode", "")}
+        info = client.exec_lua(PROBE_LUA, phase="probe")
     except NvtourError:
         return None
     finally:
@@ -119,16 +137,23 @@ def probe(path: str, timeout: float = 2.0) -> dict[str, Any] | None:
 
 
 def inspect_all(workspace: str, env: Mapping[str, str], timeout: float = 2.0) -> list[Instance]:
-    """Enumerate and probe every socket, scoring live instances against ``workspace``."""
+    """Enumerate and probe every socket (concurrently), scoring live instances against ``workspace``."""
+    paths = scan_socket_paths(env)
+    alive = [p for p in paths if pid_is_nvim(pid_of(p))]
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        infos = dict(zip(alive, pool.map(lambda p: probe(p, timeout), alive)))
     out: list[Instance] = []
-    for path in scan_socket_paths(env):
+    for path in paths:
         pid = pid_of(path)
-        if not pid_alive(pid):
+        if path not in infos:
             out.append(Instance(path, pid, "stale"))
             continue
-        info = probe(path, timeout)
+        info = infos[path]
         if info is None:
             out.append(Instance(path, pid, "unresponsive"))
+            continue
+        if info.get("blocked"):
+            out.append(Instance(path, pid, "blocked", kind=f"waiting for input (mode {info.get('mode', '')})"))
             continue
         cwd = str(info.get("cwd", ""))
         bufs = [str(b) for b in info.get("buffers", [])]
@@ -145,11 +170,25 @@ def inspect_socket(path: str, workspace: str, timeout: float = 2.0) -> Instance:
     info = probe(path, timeout)
     if info is None:
         raise NvtourError(EXIT_RPC, f"cannot connect to {path}; {HINT}")
+    if info.get("blocked"):
+        raise NvtourError(EXIT_RPC, f"nvim at {path} is waiting for input; ask the user to press <Esc> or <Enter>")
     cwd = str(info.get("cwd", ""))
     bufs = [str(b) for b in info.get("buffers", [])]
     score, kind = score_instance(cwd, workspace, bufs)
     ver = ".".join(str(x) for x in info.get("version", []))
     return Instance(path, int(info.get("pid", 0)), "live", cwd, bufs, int(info.get("tabpages", 0)), ver, score, kind or "manual")
+
+
+def unlink_stale_socket(path: str) -> bool:
+    """Remove ``path`` only if it is a Unix socket owned by this user."""
+    try:
+        st = os.lstat(path)
+        if not stat.S_ISSOCK(st.st_mode) or st.st_uid != os.getuid():
+            return False
+        os.unlink(path)
+        return True
+    except OSError:
+        return False
 
 
 def format_instances(instances: list[Instance]) -> str:
@@ -165,7 +204,14 @@ def select(instances: list[Instance], workspace: str) -> Instance:
     """Pick the unique best live instance or raise exit 3 / 4."""
     live = [i for i in instances if i.state == "live"]
     if not live:
+        blocked = [i for i in instances if i.state == "blocked"]
+        if blocked:
+            pids = ", ".join(str(i.pid) for i in blocked)
+            raise NvtourError(EXIT_RPC, f"nvim (pid {pids}) is waiting for input; ask the user to press <Esc> or <Enter>")
         raise NvtourError(EXIT_NO_NVIM, f"no running nvim found; open nvim in {workspace} and retry")
+    if len(live) == 1 and live[0].score == 0:
+        live[0].kind = "only instance"
+        return live[0]
     top = max(i.score for i in live)
     best = [i for i in live if i.score == top]
     if top > 0 and len(best) == 1:
