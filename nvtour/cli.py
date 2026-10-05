@@ -92,6 +92,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = cmd("step", "add a step (only the first step of a tour jumps to it)")
     p.add_argument("spec", metavar="FILE:L1[-L2]")
+    p.add_argument("--ref", metavar="GITREF", help="show FILE as it is at GITREF (read-only), not the working tree")
     p.add_argument("--note", metavar="TEXT", help="note text, or - to read stdin")
     p.add_argument("--label")
     p.add_argument("--role", choices=ROLES, default="info")
@@ -103,7 +104,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = cmd("edit", "change step N (location, note, label or role)")
     p.add_argument("n", type=int)
-    p.add_argument("spec", nargs="?", metavar="FILE:L1[-L2]", help="new location")
+    p.add_argument("spec", nargs="?", metavar="FILE:L1[-L2]", help="new location (on the working tree unless --ref)")
+    p.add_argument("--ref", metavar="GITREF", help="the new location is FILE at GITREF (needs FILE:L1[-L2])")
     p.add_argument("--note", metavar="TEXT", help="new note, - to read stdin, '' to remove")
     p.add_argument("--label", help="new label, '' to remove")
     p.add_argument("--role", choices=ROLES)
@@ -191,6 +193,12 @@ def fmt_range(l1: int, l2: int) -> str:
     return str(l1) if l1 == l2 else f"{l1}-{l2}"
 
 
+def fmt_loc(s: Mapping[str, Any], workspace: str) -> str:
+    """``path:L1-L2``, with `` @REF`` for a step at a git ref."""
+    loc = f"{display_path(s['file'], workspace)}:{fmt_range(s['l1'], s['l2'])}"
+    return f"{loc} @{s['ref']}" if s.get("ref") else loc
+
+
 # ---------------------------------------------------------------------------
 # Command implementations: each returns (result dict, text)
 # ---------------------------------------------------------------------------
@@ -201,6 +209,26 @@ def read_stdin(what: str) -> str:
     if sys.stdin is None or sys.stdin.isatty():
         raise NvtourError(EXIT_USAGE, f"{what} reads stdin, but stdin is a terminal; pipe the text or use a heredoc")
     return sys.stdin.read()
+
+
+def text_lines(text: str) -> list[str]:
+    """Lines of ``text``; a final newline does not add an empty line."""
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    return lines
+
+
+def location(spec: str, ref: str | None) -> dict[str, Any]:
+    """Lua args for a step location: ``FILE:L1[-L2]`` on the working tree, or at ``ref``."""
+    path, l1, l2 = ranges.parse_file_range(spec)
+    loc: dict[str, Any] = {"file": path, "l1": l1, "l2": l2}
+    if ref is None:
+        ranges.require_file(path)
+    else:
+        blob = gitutil.blob_at(path, ref)
+        loc.update(ref=ref, sha=blob.sha, rel=blob.rel, lines=text_lines(blob.text))
+    return loc
 
 
 def read_text_arg(value: str | None, what: str) -> str | None:
@@ -215,18 +243,16 @@ def build_request(args: argparse.Namespace, workspace: str) -> tuple[str, dict[s
     if c == "start":
         return "start", {**base, "title": args.title or None}
     if c == "step":
-        path, l1, l2 = ranges.parse_file_range(args.spec)
-        ranges.require_file(path)
-        return "step", {**base, "file": path, "l1": l1, "l2": l2, "note": read_text_arg(args.note, "--note -"),
+        return "step", {**base, **location(args.spec, args.ref), "note": read_text_arg(args.note, "--note -"),
                         "label": args.label, "role": args.role, "expect": args.expect, "at": args.at,
                         "jump": args.jump or None, "no_jump": args.no_jump or None}
     if c == "edit":
         req: dict[str, Any] = {**base, "n": args.n, "note": read_text_arg(args.note, "--note -"), "label": args.label,
                                "role": args.role, "expect": args.expect, "jump": args.jump or None}
         if args.spec:
-            path, l1, l2 = ranges.parse_file_range(args.spec)
-            ranges.require_file(path)
-            req.update(file=path, l1=l1, l2=l2)
+            req.update(location(args.spec, args.ref))
+        elif args.ref is not None:
+            raise NvtourError(EXIT_USAGE, "edit: --ref needs a location FILE:L1[-L2]")
         return "edit", req
     if c == "remove":
         return "remove", {"n": args.n}
@@ -255,10 +281,7 @@ def build_request(args: argparse.Namespace, workspace: str) -> tuple[str, dict[s
                 text, title = fh.read(), os.path.basename(other)
         else:
             text, title = read_stdin("diff --stdin"), "stdin"
-        lines = text.split("\n")
-        if lines and lines[-1] == "":
-            lines.pop()
-        return "diff", {"file": path, "lines": lines, "title": args.title or title}
+        return "diff", {"file": path, "lines": text_lines(text), "title": args.title or title}
     if c == "panel":
         text = args.text
         if args.text_file:
@@ -279,8 +302,7 @@ def format_result(args: argparse.Namespace, res: dict[str, Any], workspace: str)
         if res.get("message"):
             return str(res["message"])
         label = f" {res['label']}" if res.get("label") else ""
-        loc = f"{display_path(res['file'], workspace)}:{fmt_range(res['l1'], res['l2'])}"
-        out = f"step {res['n']}/{res['total']}: {loc} [{res['role']}]{label}"
+        out = f"step {res['n']}/{res['total']}: {fmt_loc(res, workspace)} [{res['role']}]{label}"
         if res.get("text") is not None:
             out += f"\n  {res['l1']}| {res['text']}"  # lets the agent see what it highlighted
         return out
@@ -321,7 +343,7 @@ def format_status(res: dict[str, Any], workspace: str) -> str:
     for s in res.get("steps") or []:
         mark = "▶" if s["n"] == res["current"] else " "
         label = f" {s['label']}" if s.get("label") else ""
-        out.append(f"  {mark} {s['n']}. {display_path(s['file'], workspace)}:{fmt_range(s['l1'], s['l2'])} [{s['role']}]{label}")
+        out.append(f"  {mark} {s['n']}. {fmt_loc(s, workspace)} [{s['role']}]{label}")
     for f in res.get("focus") or []:
         rs = " ".join(fmt_range(a, b) for a, b in f["ranges"])
         out.append(f"focus: {display_path(f['file'], workspace)} {rs} ({f['mode']})")
@@ -337,12 +359,15 @@ def format_where(res: dict[str, Any], workspace: str) -> str:
     flags = []
     if res.get("modified"):
         flags.append("modified (differs from disk)")
-    if res.get("buftype"):
+    if res.get("ref"):
+        flags.append(f"at git ref {res['ref']} ({res['sha'][:12]}), read-only")
+    elif res.get("buftype"):
         flags.append(f"buftype={res['buftype']}")
     if res.get("current_window") is False:
         flags.append("not the current window")
     extra = f"  [{', '.join(flags)}]" if flags else ""
-    out = [f"{f}:{res['line']}:{res['col']}  mode={res['mode']}  visible={res['top']}-{res['bottom']}  cwd={res['cwd']}{extra}"]
+    at = f" @{res['ref']}" if res.get("ref") else ""
+    out = [f"{f}:{res['line']}:{res['col']}{at}  mode={res['mode']}  visible={res['top']}-{res['bottom']}  cwd={res['cwd']}{extra}"]
     sel = res.get("selection")
     if sel:
         text = sel.get("text") or []

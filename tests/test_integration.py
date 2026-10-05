@@ -655,6 +655,7 @@ def test_zz_safety_files_untouched(cli, nv, sandbox, pristine):
     """Run a full session, then verify no buffer was modified and no file changed on disk."""
     ok(cli("start", "Safety"))
     ok(cli("step", "a.txt:5-9", "--role", "fault", "--note", "x"))
+    ok(cli("step", "a.txt:5-9", "--ref", "v1", "--note", "old", "--jump"))
     before = {b.name: lines_of(nv, b.handle) for b in nv.buffers if b.name.endswith(".txt")}
     assert before, "a.txt buffer should be loaded"
     ok(cli("focus", "a.txt:5-9"))
@@ -828,3 +829,122 @@ def test_panel_groups_files_and_colours_roles(cli, nv):
     nv.input("<CR>")
     nv.command("sleep 50m")
     assert current(nv) == 3
+
+
+def ref_buf(nv, ref, rel):
+    return find_buf(nv, f"nvtour://{ref}/{rel}")
+
+
+def test_ref_step_shows_the_old_version(cli, nv, sandbox):
+    ok(cli("start", "Ref"))
+    out = ok(cli("step", "a.txt:3-4", "--ref", "v1", "--role", "fault", "--label", "old", "--expect", "old line 3"))
+    assert out.splitlines() == ["step 1/1: a.txt:3-4 @v1 [fault] old", "  3| old line 3 of a"]
+    buf = nv.current.buffer
+    assert buf.name == "nvtour://v1/a.txt" and nv.current.window.cursor[0] == 3
+    assert lines_of(nv, buf.handle)[0] == "old line 1 of a" and len(buf) == 40
+    opts = {o: nv.api.get_option_value(o, {"buf": buf.handle}) for o in
+            ("buftype", "bufhidden", "modifiable", "readonly", "modified", "swapfile", "buflisted")}
+    assert opts == {"buftype": "nofile", "bufhidden": "hide", "modifiable": False, "readonly": True,
+                    "modified": False, "swapfile": False, "buflisted": True}
+    info = nv.api.buf_get_var(buf.handle, "nvtour_ref")
+    assert info["ref"] == "v1" and len(info["sha"]) == 40 and info["file"] == str(sandbox.ws / "a.txt")
+    signs = sorted(m[1] for m in ns_marks(nv, "nvtour_steps", buf.handle) if m[3].get("sign_text"))
+    assert signs == [2, 3]
+    assert not any(b.name == str(sandbox.ws / "a.txt") for b in nv.buffers)  # the real file is not loaded
+    data = json.loads(ok(cli("--json", "status")))
+    assert data["steps"][0]["ref"] == "v1" and data["steps"][0]["sha"] == info["sha"]
+    assert "▶ 1. a.txt:3-4 @v1 [fault] old" in ok(cli("status"))
+    ok(cli("clear"))
+    assert ref_buf(nv, "v1", "a.txt") is None
+    assert nv.exec_lua("return vim.tbl_count(_G.nvtour.state.refs)") == 0
+
+
+def test_ref_step_next_to_the_working_tree(cli, nv, sandbox):
+    ok(cli("start", "Before/after"))
+    ok(cli("step", "a.txt:3", "--ref", "v1", "--label", "old"))
+    ok(cli("step", "a.txt:3", "--label", "new"))
+    ok(cli("step", "a.txt:9", "--ref", "v1", "--label", "old again"))
+    pb = find_buf(nv, "nvtour://panel")
+    assert lines_of(nv, pb.handle)[2:8] == [
+        "a.txt @v1", "▶ 1. • 3  old", "a.txt", "  2. • 3  new", "a.txt @v1", "  3. • 9  old again"]
+    win = nv.current.window
+    nwins = len(nv.windows)
+    ok(cli("panel", "--toggle"))  # room for the right side of the winbar
+    assert eval_winbar(nv, win).startswith(" nvtour 1/3 info @v1 · old")
+    assert eval_winbar(nv, win).endswith("next ]w: a.txt:3 new ")  # the same file, another version
+    qf = nv.call("getqflist", {"items": 0})["items"]
+    ref = ref_buf(nv, "v1", "a.txt").handle
+    assert [i["bufnr"] for i in qf][0] == ref and qf[0]["lnum"] == 3
+    assert nv.call("bufname", qf[1]["bufnr"]) == str(sandbox.ws / "a.txt")
+    ok(cli("next"))
+    assert nv.current.window == win and nv.current.buffer.name == str(sandbox.ws / "a.txt")
+    assert eval_winbar(nv, win).endswith("next ]w: a.txt:9 @v1 old again ")
+    ok(cli("next"))
+    assert nv.current.window == win and nv.current.buffer.handle == ref  # the ref buffer is a tour window
+    assert len(nv.windows) == nwins - 1  # only the panel closed; no split was opened
+
+
+def test_ref_step_on_deleted_files(cli, nv):
+    ok(cli("start", "Deleted"))
+    assert ok(cli("step", "olddir/x.cpp:3", "--ref", "v1")).splitlines() == [
+        "step 1/1: olddir/x.cpp:3 @v1 [info]", "  3|     return 1;"]
+    buf = ref_buf(nv, "v1", "olddir/x.cpp")
+    assert nv.api.get_option_value("filetype", {"buf": buf.handle}) == "cpp"
+    ok(cli("step", "gone.txt:2", "--ref", "v1"))
+    assert lines_of(nv, ref_buf(nv, "v1", "gone.txt").handle)[1] == "gone line 2"
+
+
+def test_ref_step_errors(cli, nv, tmp_path):
+    ok(cli("start", "Errors"))
+    r = cli("step", "a.txt:3", "--ref", "no-such-ref")
+    assert r.returncode == 6 and "unknown git ref: no-such-ref" in r.stderr
+    r = cli("step", "gone.txt:2", "--ref", "HEAD")
+    assert r.returncode == 6 and "gone.txt is not a file at HEAD" in r.stderr
+    r = cli("step", "olddir:1", "--ref", "v1")
+    assert r.returncode == 6  # a directory is not a file
+    r = cli("step", "a.txt:50", "--ref", "v1")
+    assert r.returncode == 6 and "beyond end of file (40 lines): a.txt @v1" in r.stderr
+    r = cli("step", "a.txt:3", "--ref", "v1", "--expect", "nope")
+    assert r.returncode == 6 and "a.txt:3 @v1" in r.stderr
+    outside = tmp_path / "outside.txt"
+    outside.write_text("x\n")
+    assert cli("step", f"{outside}:1", "--ref", "v1").returncode == 6
+    r = cli("edit", "1", "--ref", "v1")
+    assert r.returncode == 2 and "--ref needs a location" in r.stderr
+    assert json.loads(ok(cli("--json", "status")))["total"] == 0
+
+
+def test_edit_moves_a_step_between_versions(cli, nv, sandbox):
+    ok(cli("start", "Move"))
+    ok(cli("step", "a.txt:3", "--label", "s"))
+    assert ok(cli("edit", "1", "a.txt:5", "--ref", "v1")).splitlines() == [
+        "step 1/1: a.txt:5 @v1 [info] s", "  5| old line 5 of a"]
+    assert ns_marks(nv, "nvtour_steps", find_buf(nv, "/ws/a.txt").handle) == []
+    assert ok(cli("edit", "1", "--label", "t")).startswith("step 1/1: a.txt:5 @v1 [info] t")  # stays on v1
+    assert ok(cli("edit", "1", "a.txt:6")).startswith("step 1/1: a.txt:6 [info] t")  # back on the working tree
+    assert ns_marks(nv, "nvtour_steps", ref_buf(nv, "v1", "a.txt").handle) == []
+
+
+def test_ref_buffer_is_made_again_after_wipe_or_unload(cli, nv):
+    ok(cli("start", "Wipe"))
+    ok(cli("step", "a.txt:3", "--ref", "v1", "--note", "Old code."))
+    ok(cli("step", "a.txt:7", "--ref", "v1", "--label", "same buffer"))
+    ok(cli("step", "b.txt:4", "--jump"))
+    for how in ("bwipeout!", "bdelete!"):
+        nv.command(f"{how} {ref_buf(nv, 'v1', 'a.txt').handle}")
+        ok(cli("goto", "1"))
+        buf = nv.current.buffer
+        assert buf.name == "nvtour://v1/a.txt" and lines_of(nv, buf.handle)[2] == "old line 3 of a"
+        marks = ns_marks(nv, "nvtour_steps", buf.handle)
+        assert sorted({m[1] for m in marks if m[3].get("virt_text")}) == [2, 6]  # both steps drawn again
+        assert nv.exec_lua("return _G.nvtour.state.tour.steps[2].buf") == buf.handle
+        ok(cli("goto", "3"))
+
+
+def test_where_in_a_ref_buffer(cli, nv, sandbox):
+    ok(cli("start", "Where"))
+    ok(cli("step", "a.txt:3", "--ref", "v1"))
+    text = ok(cli("where"))
+    assert text.startswith("a.txt:3:1 @v1  mode=n") and "at git ref v1 (" in text and "buftype" not in text
+    data = json.loads(ok(cli("--json", "where")))
+    assert data["file"] == str(sandbox.ws / "a.txt") and data["ref"] == "v1" and len(data["sha"]) == 40

@@ -28,7 +28,7 @@ agent (Bash) ──► nvtour CLI (Python, pynvim) ──msgpack-RPC over unix s
 ```
 
 - **Python CLI** (`nvtour/`): argument parsing, instance discovery and selection, path
-  resolution, git access for diffs, printing. Stateless except a small per-workspace pin cache.
+  resolution, git access for diffs and ref steps, printing. Stateless except a small per-workspace pin cache.
 - **Lua runtime** (`nvtour/lua/nvtour.lua`, shipped as package data): all editor state and all
   rendering. Every CLI command is **one** `nvim_exec_lua` round trip calling
   `_G.nvtour.dispatch(cmd, args)` so each operation is atomic from nvim's point of view.
@@ -138,9 +138,10 @@ nvtour instances [--prune]
 nvtour attach [PID|SOCKET] [--clear]
 nvtour where
 nvtour start [TITLE]
-nvtour step FILE:L1[-L2] [--note TEXT | --note -] [--label TEXT] [--role ROLE] [--expect TEXT]
-            [--at N] [--jump | --no-jump]
-nvtour edit N [FILE:L1[-L2]] [--note TEXT | --note -] [--label TEXT] [--role ROLE] [--expect TEXT] [--jump]
+nvtour step FILE:L1[-L2] [--ref GITREF] [--note TEXT | --note -] [--label TEXT] [--role ROLE]
+            [--expect TEXT] [--at N] [--jump | --no-jump]
+nvtour edit N [FILE:L1[-L2] [--ref GITREF]] [--note TEXT | --note -] [--label TEXT] [--role ROLE]
+            [--expect TEXT] [--jump]
 nvtour remove N
 nvtour goto N | nvtour next | nvtour prev | nvtour first | nvtour last
 nvtour status
@@ -165,7 +166,8 @@ more ranges; extra bare `L3-L4` arguments apply to the same file.
   `attached: pid P  socket S  cwd C  (exact match|subdir|parent|buffers)`.
 - **where** — context for "point and ask", read from the user's file window (the current window,
   or the previous one when the current window is a terminal, the panel or another special window):
-  `file:line:col`, mode, buffer flags (`modified`, `buftype`, `changedtick`), visible range
+  `file:line:col` (with ` @REF` when the window shows a ref step buffer; `file` is then the real path
+  and `ref`/`sha` are set), mode, buffer flags (`modified`, `buftype`, `changedtick`), visible range
   `top-bottom`, window cwd, and the selection `{live, kind = char|line|block, l1, c1, l2, c2, text,
   truncated}`: live in visual mode, else the previous `'<`/`'>` selection. Char and block selections
   give the exact text (`getregion()`); at most 200 lines and 64 KiB.
@@ -177,8 +179,12 @@ more ranges; extra bare `L3-L4` arguments apply to the same file.
   first step. Prints `step N/N: file:L1-L2 [role] label` and the first highlighted line
   (`  L1| text`). `--expect TEXT` fails with exit 6 unless `TEXT` occurs in the range. `--note -`
   reads the note from stdin (lets agents pass multi-line text with a heredoc). A step is added only
-  after it rendered (and jumped); on an error nothing of it remains.
-- **edit / remove** — change or delete step N; all steps are renumbered and rendered again.
+  after it rendered (and jumped); on an error nothing of it remains. `--ref GITREF` puts the step on
+  the file as it is at that git ref, not on the working tree (§6, "Steps at a git ref"); the output
+  then shows the location as `file:L1-L2 @GITREF`.
+- **edit / remove** — change or delete step N; all steps are renumbered and rendered again. A new
+  location replaces the old one completely: `FILE:L1[-L2]` alone puts the step on the working tree,
+  `FILE:L1[-L2] --ref GITREF` on that ref. `--ref` without a location is a usage error (exit 2).
 - **goto / next / prev / first / last** — move the current step (wraps at ends is **not** desired;
   clamp and say `already at last step`). `prev` before any jump goes to step 1. Prints the same
   lines as `step`.
@@ -219,16 +225,18 @@ M.state = {
   ns_flash = nvim_create_namespace("nvtour_flash"),
   flash = { buf = bufnr, seq = n },  -- the last flash; a newer one cancels its timer
   winbars = { [winid] = the window's own local 'winbar' },  -- restored by clear
+  refs = { [sha .. ":" .. file] = { buf, file, rel, ref, sha, lines } },  -- ref step buffers
 }
 ```
 
-Each step: `{ n, file, buf, l1, l2, role, label, note, expect, extmark_ids = {} }`.
+Each step: `{ n, file, buf, l1, l2, role, label, note, expect, ref, sha, extmark_ids = {} }`. `ref` and
+`sha` are nil for a step on the working tree.
 
 ### Tour window
 
 The window where files are shown. A window is usable when it is a normal (non-floating) window
-that is not the panel, shows a buffer with `buftype == ""` (never a terminal, quickfix, help or
-plugin window), and is not in an nvtour diff tab. Order: (1) a usable window of the current tab that
+that is not the panel, shows a buffer with `buftype == ""` or an nvtour ref step buffer (never a
+terminal, quickfix, help or plugin window), and is not in an nvtour diff tab. Order: (1) a usable window of the current tab that
 already shows the step's buffer, (2) the current window, (3) the previous window (`wincmd p`
 target), (4) the last tour window, (5) the first usable window of the current tab, then of the other
 tabs, (6) a new split next to the first normal window of the current tab.
@@ -327,8 +335,58 @@ For a step at `l1..l2` in buffer `buf` (0-based rows internally):
 `goto/next/prev` perform (5), (6), (8), (9) for an existing step and move the quickfix index with
 `setqflist({}, "r", { id = qf_id, idx = n })`.
 
-Validation (exit 6 from Python after the Lua check): file must exist and be readable; `1 ≤ l1 ≤
-l2 ≤ line count`.
+Validation (exit 6 from Python after the Lua check): file must exist and be readable (for `--ref`:
+must exist at that ref); `1 ≤ l1 ≤ l2 ≤ line count`.
+
+### Steps at a git ref
+
+`step FILE:L1[-L2] --ref GITREF` shows code as it is at a git ref: code that a change removed or
+moved, or the old version of a range next to a step on the new version. The step behaves like any
+other step (notes, roles, `--expect`, panel, quickfix, keys); only its buffer is different.
+
+**Python.** `FILE` does not have to exist in the working tree (a deleted file is fine).
+1. The git toplevel is found from the nearest existing directory of `FILE`; `FILE` must be inside it
+   (else exit 6). `rel` = `FILE` relative to the toplevel.
+2. `git rev-parse --verify --quiet --end-of-options GITREF^{commit}` gives the commit `sha` (else
+   exit 6, `unknown git ref`). The step is bound to this commit: a ref that moves later (`HEAD`
+   after a commit, a fetched branch) does not change a step that exists.
+3. `git cat-file blob <sha>:<rel>` gives the content (else exit 6 with git's message; a directory
+   is not a blob). Decoded as UTF-8 with replacement, split into lines (a final newline does not
+   add a line).
+4. Sent to Lua: `file` (realpath'd), `rel`, `ref` (as typed, for display), `sha`, `lines`.
+
+**Lua: the ref buffer.** One scratch buffer per (`sha`, `file`), kept in `state.refs` and reused by
+all steps on it:
+- created with `nvim_create_buf(true, true)` (listed, so buffer lists show it), named
+  `nvtour://<ref>/<rel>` (`#2`, `#3`, ... appended if the name exists, for example `HEAD` at two
+  commits);
+- `buftype = nofile`, `bufhidden = hide` (the extmarks of its steps must survive when it is not
+  shown; `wipe` as in the diff tab would remove them), `swapfile = false`, lines set once, then
+  `modifiable = false`, `readonly = true`, `modified = false`;
+- `filetype` from `vim.filetype.match({ filename = file, contents = lines })`, so syntax and
+  treesitter highlighting work as in the real file;
+- `vim.b.nvtour_ref = { ref, sha, file }` marks it.
+
+The lines stay in `state.refs`. If the user wipes or unloads the buffer (a `nofile` buffer loses its
+lines when unloaded), the next use (jump, quickfix) creates it again from these lines and points
+all steps of that key to the new buffer.
+
+**Display.** The range, the note, the marker and the `--expect` marks are drawn exactly as on a
+real file.
+- Winbar: ` nvtour 2/5 fault @origin/master · <label>`; the right side names the next step as
+  `file:line @ref` when it is in another document (the same file at another ref counts as another
+  document).
+- Panel: a ref step starts a file name line `path @ref`; steps on the same file and commit share it.
+- Quickfix: the item uses `bufnr` of the ref buffer, not `filename`.
+- `step`, `goto`, ... and `status` print the location as `path:L1-L2 @ref`; `--json` adds `ref` and
+  `sha`. The `vim.notify` message uses `path:l1 @ref` when the step has no label.
+
+**Lifetime.** `clear` and `start` delete the ref buffers (they delete every `nvtour://` buffer) and
+empty `state.refs`. A ref buffer that no step uses after `edit`/`remove` stays until then.
+
+**Not supported for refs:** `focus` (it takes a working tree file) and `diff` (it compares the
+working tree buffer). Language servers: most configurations do not attach to `nofile` buffers; one
+that does can show diagnostics for the old code.
 
 ## 7. Panel
 
@@ -357,7 +415,8 @@ src/a.cpp
 <free markdown text set via `nvtour panel`>
 ```
 
-Steps keep the tour order; a file name line starts each run of steps in the same file. `N. <mark>`
+Steps keep the tour order; a file name line starts each run of steps in the same file (for a ref
+step: in the same file at the same commit, shown as `path @ref`). `N. <mark>`
 is highlighted with `NvtourSign<Role>`; marks: `✗` fault, `→` flow, `✓` fix, `○` context, `•` info.
 A step without a label shows the first line of its note (markers removed, cut to 60 cells); the
 quickfix item text uses the same. Before the first jump the progress is `N step(s)`. The footer line

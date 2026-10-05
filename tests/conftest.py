@@ -43,11 +43,23 @@ def sandbox(tmp_path_factory: pytest.TempPathFactory):
     runtime.mkdir()
     ws.mkdir()
     ws = ws.resolve()
-    (ws / "a.txt").write_text("".join(f"line {i} of a\n" for i in range(1, 61)))
-    (ws / "b.txt").write_text("".join(f"line {i} of b\n" for i in range(1, 31)))
     git = ["git", "-C", str(ws), "-c", "user.name=t", "-c", "user.email=t@example.com"]
     subprocess.run(git + ["init", "-q"], check=True)
+    # History for steps at a git ref: tag v1 has an older a.txt (40 lines), and a file and a
+    # directory that were deleted later.
+    (ws / "a.txt").write_text("".join(f"old line {i} of a\n" for i in range(1, 41)))
+    (ws / "gone.txt").write_text("".join(f"gone line {i}\n" for i in range(1, 11)))
+    (ws / "olddir").mkdir()
+    (ws / "olddir" / "x.cpp").write_text("int f()\n{\n    return 1;\n}\n")
     subprocess.run(git + ["add", "."], check=True)
+    subprocess.run(git + ["commit", "-qm", "v1"], check=True)
+    subprocess.run(git + ["tag", "v1"], check=True)
+    (ws / "gone.txt").unlink()
+    (ws / "olddir" / "x.cpp").unlink()
+    (ws / "olddir").rmdir()
+    (ws / "a.txt").write_text("".join(f"line {i} of a\n" for i in range(1, 61)))
+    (ws / "b.txt").write_text("".join(f"line {i} of b\n" for i in range(1, 31)))
+    subprocess.run(git + ["add", "-A", "."], check=True)
     subprocess.run(git + ["commit", "-qm", "init"], check=True)
     return SimpleNamespace(root=root, runtime=runtime.resolve(), ws=ws)
 

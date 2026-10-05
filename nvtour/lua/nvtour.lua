@@ -35,6 +35,7 @@ local function new_state()
     tour_win = nil,
     pending_folds = {},
     added_bufs = {},
+    refs = {}, -- [sha .. ":" .. file] = { buf, file, rel, ref, sha, lines }: buffers of steps at a git ref
   }
 end
 
@@ -177,9 +178,19 @@ local function is_normal_win(w)
   return valid_win(w) and api.nvim_win_get_config(w).relative == ""
 end
 
---- A normal window that shows a file buffer (not a terminal, quickfix, help, or the panel).
+--- True for the read-only buffer of a step at a git ref.
+local function is_ref_buf(b)
+  return vim.b[b].nvtour_ref ~= nil
+end
+
+--- A normal window that shows a file buffer (not a terminal, quickfix, help, or the panel). The
+--- buffer of a step at a git ref counts as a file buffer.
 local function file_win(w)
-  return is_normal_win(w) and w ~= S.panel.win and vim.bo[api.nvim_win_get_buf(w)].buftype == ""
+  if not is_normal_win(w) or w == S.panel.win then
+    return false
+  end
+  local b = api.nvim_win_get_buf(w)
+  return vim.bo[b].buftype == "" or is_ref_buf(b)
 end
 
 local function usable_tour_win(w)
@@ -331,6 +342,93 @@ local function load_buf(path)
   end
   vim.bo[buf].buflisted = true
   return buf
+end
+
+--- Name a scratch buffer `base`, or `base#2`, `base#3`, ... when that name exists.
+local function unique_name(base, buf)
+  local name = base
+  for i = 2, 1000 do
+    if vim.fn.bufexists(name) == 0 then
+      api.nvim_buf_set_name(buf, name)
+      return name
+    end
+    name = base .. "#" .. i
+  end
+  fail("too many nvtour buffers named " .. base, 5)
+end
+
+--- "path" for a step on the working tree, "path @ref" for a step at a git ref.
+local function doc_name(s)
+  return relpath(s.file) .. (s.ref and (" @" .. s.ref) or "")
+end
+
+--- True when two steps are in the same buffer: the same file, at the same commit (or both on the
+--- working tree).
+local function same_doc(a, b)
+  return a.file == b.file and a.sha == b.sha
+end
+
+local render_step -- forward declaration
+
+--- The read-only buffer with the lines of `r` (an entry of S.refs), created when it does not exist.
+--- A nofile buffer loses its lines when it is unloaded, so an unloaded one is made again; all steps
+--- on it then point to the new buffer and are drawn again.
+local function ensure_ref_buf(r)
+  if valid_buf(r.buf) and api.nvim_buf_is_loaded(r.buf) then
+    return r.buf
+  end
+  if valid_buf(r.buf) then
+    pcall(api.nvim_buf_delete, r.buf, { force = true })
+  end
+  local buf = api.nvim_create_buf(true, true)
+  unique_name(("nvtour://%s/%s"):format(r.ref, r.rel), buf)
+  local bo = vim.bo[buf]
+  bo.buftype = "nofile"
+  bo.bufhidden = "hide" -- the extmarks of its steps must stay when it is not shown
+  bo.swapfile = false
+  api.nvim_buf_set_lines(buf, 0, -1, false, r.lines)
+  -- Set before the filetype, so FileType autocmds (for example an LSP setup) can see it.
+  vim.b[buf].nvtour_ref = { ref = r.ref, sha = r.sha, file = r.file }
+  local ft = vim.filetype.match({ filename = r.file, contents = r.lines })
+  if ft then
+    bo.filetype = ft
+  end
+  bo.modifiable = false
+  bo.readonly = true
+  bo.modified = false
+  r.buf = buf
+  for _, s in ipairs(S.tour.steps) do
+    if s.sha == r.sha and s.file == r.file and s.buf ~= buf then
+      s.buf = buf
+      s.extmark_ids = {}
+      render_step(s, tour_win(buf))
+    end
+  end
+  return buf
+end
+
+--- Buffer for a location `a` ({ file, ref, sha, rel, lines }): the file, or its version at a commit.
+local function loc_buf(a)
+  if not a.sha then
+    return load_buf(a.file)
+  end
+  local key = a.sha .. ":" .. a.file
+  local r = S.refs[key]
+  if not r then
+    r = { file = a.file, rel = a.rel or relpath(a.file), ref = a.ref or a.sha:sub(1, 12), sha = a.sha, lines = a.lines or {} }
+    S.refs[key] = r
+  end
+  return ensure_ref_buf(r)
+end
+
+--- The buffer of `step`, loaded (and made again if the user wiped it).
+local function step_buf(step)
+  if step.sha then
+    step.buf = loc_buf(step)
+  elseif not valid_buf(step.buf) or not api.nvim_buf_is_loaded(step.buf) then
+    step.buf = load_buf(step.file)
+  end
+  return step.buf
 end
 
 ---------------------------------------------------------------------------
@@ -564,15 +662,16 @@ local function render_panel()
   for _, s in ipairs(steps) do
     rw = math.max(rw, #fmt_range(s))
   end
-  -- Steps keep the tour order; a file name line starts each run of steps in the same file.
-  local prev_file
+  -- Steps keep the tour order; a file name line starts each run of steps in the same file (for a
+  -- step at a git ref: the same file at the same commit, "path @ref").
+  local prev
   for _, s in ipairs(steps) do
-    if s.file ~= prev_file then
-      lines[#lines + 1] = relpath(s.file)
+    if not (prev and same_doc(s, prev)) then
+      lines[#lines + 1] = doc_name(s)
       map[#lines] = s.n -- <CR> on the file name jumps to its first step
       hls[#hls + 1] = { #lines, 0, -1, "NvtourPanelFile" }
-      prev_file = s.file
     end
+    prev = s
     local mark = (s.n == S.tour.current) and "▶ " or "  "
     local head = ("%d. %s"):format(s.n, ROLE_MARK[s.role] or "•")
     local range = fmt_range(s)
@@ -845,7 +944,7 @@ local BAR_SIGN = " ▎"
 
 --- Draw step marks. Only the current step gets the bar, the full note and the --expect marks; the
 --- other steps keep the line numbers, the "← N label" marker and a one-line note.
-local function render_step(step, win)
+render_step = function(step, win)
   local buf = step.buf
   local ns = S.ns_steps
   local R = cap(step.role)
@@ -926,7 +1025,13 @@ local function update_qf(idx)
     if text == "" then
       text = relpath(s.file) .. ":" .. s.l1
     end
-    items[#items + 1] = { filename = s.file, lnum = s.l1, end_lnum = s.l2, text = ("[%s] %s"):format(s.role, text) }
+    local item = { lnum = s.l1, end_lnum = s.l2, text = ("[%s] %s"):format(s.role, text) }
+    if s.sha then
+      item.bufnr = step_buf(s) -- the read-only version, not the file on disk
+    else
+      item.filename = s.file
+    end
+    items[#items + 1] = item
   end
   local what = { id = S.tour.qf_id, title = qf_title(), items = items }
   if idx then
@@ -955,10 +1060,11 @@ function M.winbar()
     return #steps > 0 and (" nvtour · %d step(s)"):format(#steps) or ""
   end
   local pos = ("%d/%d %s"):format(n, #steps, step.role)
+  local at = step.ref and (" @" .. step.ref) or ""
   local label = (step.label and step.label ~= "") and (" · " .. step.label) or ""
   -- In a %{} item the window of the bar is the current window (g:statusline_winid is not set).
   local width = api.nvim_win_get_width(api.nvim_get_current_win())
-  local max_label = width - vim.fn.strdisplaywidth(" nvtour " .. pos) - 1
+  local max_label = width - vim.fn.strdisplaywidth(" nvtour " .. pos .. at) - 1
   if vim.fn.strdisplaywidth(label) > max_label then
     label = max_label > 4 and (vim.fn.strcharpart(label, 0, max_label - 1) .. "…") or ""
   end
@@ -967,8 +1073,10 @@ function M.winbar()
   local rights
   if nxt then
     local key = "next" .. (S.keys.next and (" " .. S.keys.next) or "") .. ": "
-    local loc = nxt.file == step.file and ("line " .. nxt.l1) or (relpath(nxt.file) .. ":" .. nxt.l1)
-    local short = nxt.file == step.file and loc or (vim.fn.fnamemodify(nxt.file, ":t") .. ":" .. nxt.l1)
+    local nat = nxt.ref and (" @" .. nxt.ref) or ""
+    local same = same_doc(nxt, step)
+    local loc = same and ("line " .. nxt.l1) or (relpath(nxt.file) .. ":" .. nxt.l1 .. nat)
+    local short = same and loc or (vim.fn.fnamemodify(nxt.file, ":t") .. ":" .. nxt.l1 .. nat)
     rights = { key .. loc, key .. short, "" }
     if nxt.label and nxt.label ~= "" then
       table.insert(rights, 1, key .. short .. " " .. nxt.label)
@@ -977,7 +1085,7 @@ function M.winbar()
   else
     rights = { "last step" .. (S.keys.first and (" · " .. S.keys.first .. " first") or ""), "last step", "" }
   end
-  local room = width - vim.fn.strdisplaywidth(" nvtour " .. pos .. label) - 3
+  local room = width - vim.fn.strdisplaywidth(" nvtour " .. pos .. at .. label) - 3
   local right = ""
   for _, r in ipairs(rights) do
     if vim.fn.strdisplaywidth(r) <= room then
@@ -985,7 +1093,7 @@ function M.winbar()
       break
     end
   end
-  local out = (" nvtour %%#NvtourSign%s#%s%%*%s"):format(cap(step.role), pos, sl_escape(label))
+  local out = (" nvtour %%#NvtourSign%s#%s%%*%s%s"):format(cap(step.role), pos, sl_escape(at), sl_escape(label))
   return out .. "%=" .. sl_escape(right) .. (right ~= "" and " " or "")
 end
 
@@ -1243,6 +1351,7 @@ local function reset(keep_panel)
   end
   -- The list is reused by the next tour, so the 10-deep quickfix stack does not fill up.
   S.tour = { title = "", steps = {}, current = 0, qf_id = qf_id }
+  S.refs = {} -- their buffers are deleted below with the other nvtour:// buffers
   S.panel.text = {}
   if keep_panel then
     render_panel()
@@ -1300,6 +1409,8 @@ local function step_result(step, extra)
     l2 = step.l2,
     role = step.role,
     label = step.label,
+    ref = step.ref,
+    sha = step.sha,
     text = step_text(step),
     keys = installed_keys(),
   }
@@ -1310,9 +1421,7 @@ local function step_result(step, extra)
 end
 
 local function jump(step)
-  if not valid_buf(step.buf) or not api.nvim_buf_is_loaded(step.buf) then
-    step.buf = load_buf(step.file)
-  end
+  step_buf(step)
   local win = show_buf(tour_win(step.buf, true), step.buf)
   S.tour_win = win
   enter_win(win)
@@ -1329,7 +1438,8 @@ end
 
 local function announce(step)
   local total = #S.tour.steps
-  notify(("nvtour %d/%d: %s"):format(step.n, total, step.label or (relpath(step.file) .. ":" .. step.l1)))
+  local at = step.ref and (" @" .. step.ref) or ""
+  notify(("nvtour %d/%d: %s"):format(step.n, total, step.label or (relpath(step.file) .. ":" .. step.l1 .. at)))
 end
 
 step_goto = function(n)
@@ -1375,15 +1485,16 @@ local function rerender_all()
   end
 end
 
---- Load `file` and check that l1-l2 exists and (with `expect`) contains the expected text.
-local function checked_range(file, l1, l2, expect)
-  local buf = load_buf(file)
+--- Load the buffer of location `a` and check that l1-l2 exists and (with `expect`) contains the
+--- expected text.
+local function checked_range(a, l1, l2, expect)
+  local buf = loc_buf(a)
   local count = api.nvim_buf_line_count(buf)
   if l1 < 1 or l2 < l1 then
     fail(("bad range %d-%d"):format(l1, l2), 6)
   end
   if l2 > count then
-    fail(("range %d-%d is beyond end of file (%d lines): %s"):format(l1, l2, count, file), 6)
+    fail(("range %d-%d is beyond end of file (%d lines): %s"):format(l1, l2, count, doc_name(a)), 6)
   end
   if expect and expect ~= "" then
     local found = false
@@ -1396,7 +1507,8 @@ local function checked_range(file, l1, l2, expect)
     if not found then
       local first = api.nvim_buf_get_lines(buf, l1 - 1, l1, false)[1] or ""
       local range = l1 == l2 and tostring(l1) or (l1 .. "-" .. l2)
-      fail(("--expect %q not found in %s:%s; line %d is %q"):format(expect, relpath(file), range, l1, first), 6)
+      local at = a.ref and (" @" .. a.ref) or ""
+      fail(("--expect %q not found in %s:%s%s; line %d is %q"):format(expect, relpath(a.file), range, at, l1, first), 6)
     end
   end
   return buf
@@ -1409,7 +1521,7 @@ H.step = function(a)
     fail("unknown role: " .. tostring(role), 2)
   end
   local l1, l2 = a.l1, a.l2 or a.l1
-  local buf = checked_range(a.file, l1, l2, a.expect)
+  local buf = checked_range(a, l1, l2, a.expect)
   local steps = S.tour.steps
   local at = a.at or (#steps + 1)
   if at < 1 or at > #steps + 1 then
@@ -1424,6 +1536,8 @@ H.step = function(a)
   local step = {
     n = at,
     file = a.file,
+    ref = a.sha and a.ref or nil,
+    sha = a.sha,
     buf = buf,
     l1 = l1,
     l2 = l2,
@@ -1486,9 +1600,12 @@ H.edit = function(a)
   if a.role and not ROLES[a.role] then
     fail("unknown role: " .. tostring(a.role), 2)
   end
-  local file, l1, l2 = a.file or step.file, a.l1 or step.l1, a.l2 or a.l1 or step.l2
-  local buf = checked_range(file, l1, l2, a.expect)
-  step.file, step.buf, step.l1, step.l2 = file, buf, l1, l2
+  -- A new location replaces the old one completely: without a ref it is on the working tree.
+  local loc = a.file and { file = a.file, ref = a.sha and a.ref or nil, sha = a.sha, rel = a.rel, lines = a.lines }
+    or { file = step.file, ref = step.ref, sha = step.sha }
+  local l1, l2 = a.l1 or step.l1, a.l2 or a.l1 or step.l2
+  local buf = checked_range(loc, l1, l2, a.expect)
+  step.file, step.ref, step.sha, step.buf, step.l1, step.l2 = loc.file, loc.ref, loc.sha, buf, l1, l2
   if a.role then
     step.role = a.role
   end
@@ -1629,18 +1746,6 @@ end
 -- Diff
 ---------------------------------------------------------------------------
 
-local function unique_name(base, buf)
-  local name = base
-  for i = 2, 1000 do
-    if vim.fn.bufexists(name) == 0 then
-      api.nvim_buf_set_name(buf, name)
-      return name
-    end
-    name = base .. "#" .. i
-  end
-  fail("too many nvtour diff buffers named " .. base, 5)
-end
-
 H.diff = function(a)
   local real = load_buf(a.file)
   local base = vim.fn.fnamemodify(a.file, ":t")
@@ -1726,7 +1831,7 @@ H.status = function()
   local steps = {}
   for _, s in ipairs(S.tour.steps) do
     steps[#steps + 1] =
-      { n = s.n, file = s.file, l1 = s.l1, l2 = s.l2, role = s.role, label = s.label, note = s.note, expect = s.expect }
+      { n = s.n, file = s.file, ref = s.ref, sha = s.sha, l1 = s.l1, l2 = s.l2, role = s.role, label = s.label, note = s.note, expect = s.expect }
   end
   local focus = {}
   for _, f in pairs(S.focus) do
@@ -1792,6 +1897,10 @@ H.where = function()
     changedtick = vim.b[buf].changedtick,
     mode = mode,
   }
+  local ref = vim.b[buf].nvtour_ref
+  if ref then
+    res.file, res.ref, res.sha = ref.file, ref.ref, ref.sha -- the real path, not nvtour://
+  end
   api.nvim_win_call(win, function()
     local pos = api.nvim_win_get_cursor(win)
     res.line, res.col = pos[1], pos[2] + 1

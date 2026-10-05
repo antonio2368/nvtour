@@ -30,6 +30,7 @@ Neovim in parallel. You step through the tour with `]w` / `[w`.
 | 🚦 **Roles** | Each step is a `fault`, `flow`, `fix`, `context` or `info`, each in its own colour. |
 | 📋 **Step panel** | A side panel lists the steps by file, with a markdown summary. |
 | 🔍 **Focus** | Folds or dims all code that is not related to the tour. |
+| 🕰️ **Old code as a step** | `--ref GITREF` puts a step on a file as it is at a git ref, also a deleted file. |
 | 🔀 **Read-only diffs** | Shows a file against a git ref, another file or stdin. |
 | ✅ **Self-checking ranges** | `--expect TEXT` stops a wrong line number before it shows the wrong code. |
 
@@ -122,6 +123,23 @@ How the steps behave:
 - **A jump scrolls** so that the note and the range are in view: centred when they fit, else the note at the
   top, and never past the end of the file. The range flashes briefly after a jump.
 
+### Old code as a step
+
+`--ref GITREF` puts a step on the file as it is at a git ref, not on the working tree. Use it for code that a
+change removed or moved, or to show the old version of a range and then the new one:
+
+```sh
+nvtour step src/cache.cpp:16-20 --ref origin/master --role fault --label "refresh before the check"
+nvtour step src/cache.cpp:16-21 --role fix --label "check end() first"
+```
+
+- The old version opens in a read-only scratch buffer `nvtour://origin/master/src/cache.cpp`, with the
+  syntax highlighting of the file. Notes, roles, `--expect`, the panel and the keys work as on any step.
+- The step is bound to the commit that the ref points to when the step is added, so a ref that moves later
+  does not change it. The file does not have to exist in the working tree.
+- The winbar shows `@origin/master`, and the panel groups the step under `src/cache.cpp @origin/master`.
+- The buffer has `b:nvtour_ref` (`{ ref, sha, file }`). `clear` deletes it.
+
 ---
 
 ## 📖 Command reference
@@ -139,8 +157,8 @@ How the steps behave:
 | command | what it does |
 |---|---|
 | `start [TITLE]` | start a new tour (keeps an open panel) |
-| `step FILE:L1[-L2] [--note TEXT\|-] [--label] [--role] [--expect TEXT] [--at N] [--jump\|--no-jump]` | add a step |
-| `edit N [FILE:L1[-L2]] [--note] [--label] [--role] [--expect] [--jump]` | change a step (`''` removes a label or note) |
+| `step FILE:L1[-L2] [--ref GITREF] [--note TEXT\|-] [--label] [--role] [--expect TEXT] [--at N] [--jump\|--no-jump]` | add a step (`--ref`: on the file at that git ref) |
+| `edit N [FILE:L1[-L2] [--ref GITREF]] [--note] [--label] [--role] [--expect] [--jump]` | change a step (`''` removes a label or note; a new location without `--ref` is on the working tree) |
 | `remove N` | remove a step |
 | `panel [TEXT\|-\|--file PATH] [--toggle] [--clear]` | side panel text |
 

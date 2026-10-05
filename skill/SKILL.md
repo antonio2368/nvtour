@@ -55,10 +55,18 @@ description: Give a visual, read-only walkthrough of code inside the user's runn
 - During a tour, focus does not move the view; the folds appear when that file is shown.
 - Fold mode removes the user's own manual folds in that window. Use `--dim` if the user has manual folds or the surrounding code matters. `nvtour unfocus` undoes it.
 
+## Old code
+
+- `nvtour step FILE:L1-L2 --ref GITREF` shows the range as it is at a git ref, in a read-only buffer. Everything else works as on a normal step.
+- Use it for code that a change removed or moved, and for before/after: a step on the old range (`--ref origin/master`), then a step on the new range (no `--ref`).
+- Get line numbers of the old version from `git show GITREF:PATH | sed -n 'A,Bp'` (or `| rg -n`), not from the working tree.
+- The file does not have to exist in the working tree.
+- `nvtour edit N FILE:L1-L2` without `--ref` moves the step to the working tree. Add `--ref` to keep it on the old version.
+
 ## Diff
 
-- Before/after a fix: `nvtour diff FILE --stdin` with the proposed version.
-- Compare versions: `nvtour diff FILE --ref origin/master`.
+- Before/after a fix that is not applied: `nvtour diff FILE --stdin` with the proposed version.
+- Compare full files: `nvtour diff FILE --ref origin/master`.
 - Read-only. `nvtour diff-close` closes it.
 
 ## Point and ask

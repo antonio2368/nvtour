@@ -146,3 +146,40 @@ def test_parser_accepts_globals_anywhere():
     assert p.parse_args(["where", "--json"]).json is True
     assert p.parse_args(["--socket", "/s", "where"]).socket == "/s"
     assert p.parse_args(["where"]).timeout == 5.0
+
+
+def _git_repo(tmp_path):
+    import subprocess
+
+    repo = tmp_path / "repo"
+    (repo / "sub").mkdir(parents=True)
+    git = ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@example.com"]
+    subprocess.run(git + ["init", "-q"], check=True)
+    (repo / "sub" / "f.txt").write_text("one\ntwo\n")
+    subprocess.run(git + ["add", "."], check=True)
+    subprocess.run(git + ["commit", "-qm", "1"], check=True)
+    first = subprocess.run(git + ["rev-parse", "HEAD"], check=True, capture_output=True, text=True).stdout.strip()
+    (repo / "sub" / "f.txt").unlink()
+    (repo / "sub").rmdir()
+    subprocess.run(git + ["commit", "-qam", "2"], check=True)
+    return repo.resolve(), git, first
+
+
+def test_blob_at_is_bound_to_the_commit(tmp_path):
+    from nvtour import gitutil
+
+    repo, _git, first = _git_repo(tmp_path)
+    blob = gitutil.blob_at(str(repo / "sub" / "f.txt"), "HEAD~1")  # the directory no longer exists
+    assert (blob.rel, blob.sha, blob.text) == ("sub/f.txt", first, "one\ntwo\n")
+    with pytest.raises(NvtourError, match="not a file at HEAD"):
+        gitutil.blob_at(str(repo / "sub" / "f.txt"), "HEAD")
+    with pytest.raises(NvtourError, match="unknown git ref"):
+        gitutil.blob_at(str(repo / "sub" / "f.txt"), "--output=x")  # never read as an option
+    with pytest.raises(NvtourError, match="not inside a git repository"):
+        gitutil.blob_at(str(tmp_path / "f.txt"), "HEAD")
+
+
+def test_text_lines():
+    assert cli.text_lines("a\nb\n") == ["a", "b"]
+    assert cli.text_lines("a\nb") == ["a", "b"]
+    assert cli.text_lines("") == []
