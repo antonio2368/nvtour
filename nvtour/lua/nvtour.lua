@@ -25,6 +25,7 @@ local function new_state()
     focus = {},
     diff_tabs = {},
     keymaps = {},
+    keys = {},
     keymaps_installed = false,
     workspace = nil,
     warned = {},
@@ -471,6 +472,19 @@ end
 
 local step_goto -- forward declaration
 
+local KEY_ORDER = { "next", "prev", "first", "last", "panel", "clear" }
+
+--- "]w next · [w prev · ..." for the keys that are installed.
+local function keys_line()
+  local parts = {}
+  for _, name in ipairs(KEY_ORDER) do
+    if S.keys[name] then
+      parts[#parts + 1] = S.keys[name] .. " " .. name
+    end
+  end
+  return table.concat(parts, " · ")
+end
+
 local function render_panel()
   if not valid_buf(S.panel.buf) then
     return
@@ -491,6 +505,11 @@ local function render_panel()
     if s.n == S.tour.current then
       cur_line = #lines
     end
+  end
+  if #S.tour.steps > 0 then
+    local keys = keys_line()
+    lines[#lines + 1] = ""
+    lines[#lines + 1] = (keys ~= "" and (keys .. " · ") or "") .. "<CR> jump · q close"
   end
   if #S.panel.text > 0 then
     lines[#lines + 1] = ""
@@ -780,6 +799,7 @@ local function install_keymaps()
       if vim.fn.maparg(lhs, "n") == "" then
         vim.keymap.set("n", lhs, fn, { desc = "nvtour " .. name })
         S.keymaps[lhs] = true
+        S.keys[name] = lhs
       else
         local msg = "key " .. lhs .. " is already mapped; skipping '" .. name .. "'"
         if not S.warned[lhs] then
@@ -800,6 +820,7 @@ local function remove_keymaps()
     pcall(vim.keymap.del, "n", lhs)
   end
   S.keymaps = {}
+  S.keys = {}
   S.keymaps_installed = false
 end
 
@@ -888,6 +909,19 @@ end
 -- Steps
 ---------------------------------------------------------------------------
 
+--- Installed keys by action; an empty map is sent as {} (not []).
+local function installed_keys()
+  return next(S.keys) and S.keys or vim.empty_dict()
+end
+
+local function step_text(step)
+  if not valid_buf(step.buf) or not api.nvim_buf_is_loaded(step.buf) then
+    return nil
+  end
+  local line = api.nvim_buf_get_lines(step.buf, step.l1 - 1, step.l1, false)[1] or ""
+  return vim.fn.strcharpart(line, 0, 100)
+end
+
 local function step_result(step, extra)
   local r = {
     ok = true,
@@ -898,6 +932,8 @@ local function step_result(step, extra)
     l2 = step.l2,
     role = step.role,
     label = step.label,
+    text = step_text(step),
+    keys = installed_keys(),
   }
   for k, v in pairs(extra or {}) do
     r[k] = v
@@ -950,7 +986,50 @@ H.start = function(a)
   S.workspace = a.workspace or S.workspace
   ensure_started()
   render_panel()
-  return { ok = true, title = S.tour.title }
+  return { ok = true, title = S.tour.title, keys = installed_keys() }
+end
+
+--- Renumber the steps and render all of them again (after an insert, edit or remove).
+local function rerender_all()
+  for _, b in ipairs(api.nvim_list_bufs()) do
+    if valid_buf(b) then
+      api.nvim_buf_clear_namespace(b, S.ns_steps, 0, -1)
+    end
+  end
+  for i, s in ipairs(S.tour.steps) do
+    s.n = i
+    s.extmark_ids = {}
+    if valid_buf(s.buf) and api.nvim_buf_is_loaded(s.buf) then
+      render_step(s, tour_win(s.buf))
+    end
+  end
+end
+
+--- Load `file` and check that l1-l2 exists and (with `expect`) contains the expected text.
+local function checked_range(file, l1, l2, expect)
+  local buf = load_buf(file)
+  local count = api.nvim_buf_line_count(buf)
+  if l1 < 1 or l2 < l1 then
+    fail(("bad range %d-%d"):format(l1, l2), 6)
+  end
+  if l2 > count then
+    fail(("range %d-%d is beyond end of file (%d lines): %s"):format(l1, l2, count, file), 6)
+  end
+  if expect and expect ~= "" then
+    local found = false
+    for _, line in ipairs(api.nvim_buf_get_lines(buf, l1 - 1, l2, false)) do
+      if line:find(expect, 1, true) then
+        found = true
+        break
+      end
+    end
+    if not found then
+      local first = api.nvim_buf_get_lines(buf, l1 - 1, l1, false)[1] or ""
+      local range = l1 == l2 and tostring(l1) or (l1 .. "-" .. l2)
+      fail(("--expect %q not found in %s:%s; line %d is %q"):format(expect, relpath(file), range, l1, first), 6)
+    end
+  end
+  return buf
 end
 
 H.step = function(a)
@@ -959,24 +1038,21 @@ H.step = function(a)
   if not ROLES[role] then
     fail("unknown role: " .. tostring(role), 2)
   end
-  local buf = load_buf(a.file)
-  local count = api.nvim_buf_line_count(buf)
   local l1, l2 = a.l1, a.l2 or a.l1
-  if l1 < 1 or l2 < l1 then
-    fail(("bad range %d-%d"):format(l1, l2), 6)
-  end
-  if l2 > count then
-    fail(("range %d-%d is beyond end of file (%d lines): %s"):format(l1, l2, count, a.file), 6)
+  local buf = checked_range(a.file, l1, l2, a.expect)
+  local steps = S.tour.steps
+  local at = a.at or (#steps + 1)
+  if at < 1 or at > #steps + 1 then
+    fail(("--at %d is out of range (tour has %d steps)"):format(at, #steps), 6)
   end
   ensure_started()
-  local steps = S.tour.steps
   -- Only the first step of a tour moves the view, so a finished tour starts at step 1.
   local do_jump = a.jump or (#steps == 0 and not a.no_jump)
   if #steps == 0 and vim.g.nvtour_auto_panel ~= false and not S.panel.user_closed then
     panel_open() -- before rendering, so the first note is wrapped to the final window width
   end
   local step = {
-    n = #steps + 1,
+    n = at,
     file = a.file,
     buf = buf,
     l1 = l1,
@@ -1001,7 +1077,13 @@ H.step = function(a)
     S.tour.current = prev_current
     error(err, 0)
   end
-  steps[#steps + 1] = step
+  table.insert(steps, at, step)
+  if at < #steps then
+    if not do_jump and S.tour.current >= at then
+      S.tour.current = S.tour.current + 1
+    end
+    rerender_all()
+  end
   if do_jump then
     update_qf(step.n)
   else
@@ -1016,6 +1098,56 @@ end
 
 H["goto"] = function(a)
   return step_goto(a.n)
+end
+
+local function step_at(n)
+  local steps = S.tour.steps
+  if not n or n < 1 or n > #steps then
+    fail(("no such step %s (tour has %d)"):format(tostring(n), #steps), 6)
+  end
+  return steps[n]
+end
+
+H.edit = function(a)
+  S.workspace = a.workspace or S.workspace
+  local step = step_at(a.n)
+  if a.role and not ROLES[a.role] then
+    fail("unknown role: " .. tostring(a.role), 2)
+  end
+  local file, l1, l2 = a.file or step.file, a.l1 or step.l1, a.l2 or a.l1 or step.l2
+  local buf = checked_range(file, l1, l2, a.expect)
+  step.file, step.buf, step.l1, step.l2 = file, buf, l1, l2
+  if a.role then
+    step.role = a.role
+  end
+  if a.label ~= nil then
+    step.label = a.label ~= "" and a.label or nil
+  end
+  if a.note ~= nil then
+    step.note = a.note ~= "" and a.note or nil
+  end
+  rerender_all()
+  if a.jump then
+    return step_goto(step.n)
+  end
+  update_qf()
+  render_panel()
+  return step_result(step)
+end
+
+H.remove = function(a)
+  local step = step_at(a.n)
+  table.remove(S.tour.steps, step.n)
+  local cur = S.tour.current
+  if cur == step.n then
+    S.tour.current = 0 -- nothing is shown as current until the next navigation
+  elseif cur > step.n then
+    S.tour.current = cur - 1
+  end
+  rerender_all()
+  update_qf()
+  render_panel()
+  return { ok = true, removed = step.n, total = #S.tour.steps, current = S.tour.current }
 end
 
 H["next"] = function()
@@ -1213,6 +1345,36 @@ H.panel = function(a)
   end
   render_panel()
   return { ok = true, status = status }
+end
+
+H.status = function()
+  local steps = {}
+  for _, s in ipairs(S.tour.steps) do
+    steps[#steps + 1] = { n = s.n, file = s.file, l1 = s.l1, l2 = s.l2, role = s.role, label = s.label, note = s.note }
+  end
+  local focus = {}
+  for _, f in pairs(S.focus) do
+    focus[#focus + 1] = { file = f.file, ranges = f.ranges, mode = f.dim and "dim" or "fold" }
+  end
+  local diffs = 0
+  for _, t in ipairs(S.diff_tabs) do
+    if valid_tab(t) then
+      diffs = diffs + 1
+    end
+  end
+  return {
+    ok = true,
+    title = S.tour.title,
+    current = S.tour.current,
+    total = #S.tour.steps,
+    steps = steps,
+    focus = focus,
+    diff_tabs = diffs,
+    panel = { open = panel_shown(), user_closed = S.panel.user_closed },
+    keys = installed_keys(),
+    workspace = S.workspace,
+    version = M.VERSION,
+  }
 end
 
 H.clear = function(a)

@@ -95,9 +95,25 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--note", metavar="TEXT", help="note text, or - to read stdin")
     p.add_argument("--label")
     p.add_argument("--role", choices=ROLES, default="info")
+    p.add_argument("--expect", metavar="TEXT", help="fail (exit 6) unless TEXT occurs in the range")
+    p.add_argument("--at", type=int, metavar="N", help="insert as step N instead of appending")
     g = p.add_mutually_exclusive_group()
     g.add_argument("--jump", action="store_true", help="jump to this step even if it is not the first")
     g.add_argument("--no-jump", action="store_true", help="do not jump, even for the first step")
+
+    p = cmd("edit", "change step N (location, note, label or role)")
+    p.add_argument("n", type=int)
+    p.add_argument("spec", nargs="?", metavar="FILE:L1[-L2]", help="new location")
+    p.add_argument("--note", metavar="TEXT", help="new note, - to read stdin, '' to remove")
+    p.add_argument("--label", help="new label, '' to remove")
+    p.add_argument("--role", choices=ROLES)
+    p.add_argument("--expect", metavar="TEXT", help="fail (exit 6) unless TEXT occurs in the range")
+    p.add_argument("--jump", action="store_true", help="jump to the step")
+
+    p = cmd("remove", "remove step N")
+    p.add_argument("n", type=int)
+
+    cmd("status", "show the tour, focus, panel and keys")
 
     p = cmd("goto", "go to step N")
     p.add_argument("n", type=int)
@@ -202,12 +218,23 @@ def build_request(args: argparse.Namespace, workspace: str) -> tuple[str, dict[s
         path, l1, l2 = ranges.parse_file_range(args.spec)
         ranges.require_file(path)
         return "step", {**base, "file": path, "l1": l1, "l2": l2, "note": read_text_arg(args.note, "--note -"),
-                        "label": args.label, "role": args.role, "jump": args.jump or None, "no_jump": args.no_jump or None}
+                        "label": args.label, "role": args.role, "expect": args.expect, "at": args.at,
+                        "jump": args.jump or None, "no_jump": args.no_jump or None}
+    if c == "edit":
+        req: dict[str, Any] = {**base, "n": args.n, "note": read_text_arg(args.note, "--note -"), "label": args.label,
+                               "role": args.role, "expect": args.expect, "jump": args.jump or None}
+        if args.spec:
+            path, l1, l2 = ranges.parse_file_range(args.spec)
+            ranges.require_file(path)
+            req.update(file=path, l1=l1, l2=l2)
+        return "edit", req
+    if c == "remove":
+        return "remove", {"n": args.n}
     if c == "goto":
         return "goto", {"n": args.n}
     if c == "clear":
         return c, {"keep_buffers": args.keep_buffers or None}
-    if c in ("next", "prev", "first", "last", "where", "diff-close"):
+    if c in ("next", "prev", "first", "last", "where", "diff-close", "status"):
         return c, {}
     if c == "focus":
         path, l1, l2 = ranges.parse_file_range(args.spec)
@@ -248,12 +275,19 @@ def build_request(args: argparse.Namespace, workspace: str) -> tuple[str, dict[s
 def format_result(args: argparse.Namespace, res: dict[str, Any], workspace: str) -> str:
     """One-line (or short) human output for a successful command."""
     c = args.command
-    if c in ("step", "goto", "next", "prev", "first", "last"):
+    if c in ("step", "edit", "goto", "next", "prev", "first", "last"):
         if res.get("message"):
             return str(res["message"])
         label = f" {res['label']}" if res.get("label") else ""
         loc = f"{display_path(res['file'], workspace)}:{fmt_range(res['l1'], res['l2'])}"
-        return f"step {res['n']}/{res['total']}: {loc} [{res['role']}]{label}"
+        out = f"step {res['n']}/{res['total']}: {loc} [{res['role']}]{label}"
+        if res.get("text") is not None:
+            out += f"\n  {res['l1']}| {res['text']}"  # lets the agent see what it highlighted
+        return out
+    if c == "remove":
+        return f"removed step {res['removed']}; {res['total']} step(s) left"
+    if c == "status":
+        return format_status(res, workspace)
     if c == "start":
         return f"started: {res.get('title') or 'Walkthrough'}"
     if c == "focus":
@@ -273,6 +307,28 @@ def format_result(args: argparse.Namespace, res: dict[str, Any], workspace: str)
     if c == "where":
         return format_where(res, workspace)
     return json.dumps(res)
+
+
+def format_keys(keys: Mapping[str, str] | None) -> str:
+    order = ["next", "prev", "first", "last", "panel", "clear"]
+    return ", ".join(f"{keys[k]} {k}" for k in order if keys and keys.get(k)) or "(none installed)"
+
+
+def format_status(res: dict[str, Any], workspace: str) -> str:
+    """Multi-line output for ``status``."""
+    title = res.get("title") or "Walkthrough"
+    out = [f"tour: {title} ({res['total']} step(s), current {res['current'] or '-'})"]
+    for s in res.get("steps") or []:
+        mark = "▶" if s["n"] == res["current"] else " "
+        label = f" {s['label']}" if s.get("label") else ""
+        out.append(f"  {mark} {s['n']}. {display_path(s['file'], workspace)}:{fmt_range(s['l1'], s['l2'])} [{s['role']}]{label}")
+    for f in res.get("focus") or []:
+        rs = " ".join(fmt_range(a, b) for a, b in f["ranges"])
+        out.append(f"focus: {display_path(f['file'], workspace)} {rs} ({f['mode']})")
+    panel = res.get("panel") or {}
+    out.append(f"panel: {'open' if panel.get('open') else 'closed'}   diff tabs: {res.get('diff_tabs', 0)}")
+    out.append(f"keys: {format_keys(res.get('keys'))}")
+    return "\n".join(out)
 
 
 def format_where(res: dict[str, Any], workspace: str) -> str:

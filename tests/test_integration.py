@@ -39,7 +39,7 @@ def test_step_creates_marks_and_jumps(cli, nv, sandbox):
     out = ok(cli("start", "T1"))
     assert out.strip() == "started: T1"
     out = ok(cli("step", "a.txt:5-7", "--role", "fault", "--label", "bad", "--note", "Explains the bug in a few words."))
-    assert out.strip() == "step 1/1: a.txt:5-7 [fault] bad"
+    assert out.splitlines() == ["step 1/1: a.txt:5-7 [fault] bad", "  5| line 5 of a"]
     buf = find_buf(nv, "a.txt")
     assert buf is not None
     marks = ns_marks(nv, "nvtour_steps", buf.handle)
@@ -73,8 +73,8 @@ def test_nav_and_quickfix(cli, nv):
     ok(cli("step", "b.txt:9", "--role", "fix", "--note", "fix note"))
     assert current(nv) == 1
     assert "already at first step" in ok(cli("prev"))
-    assert ok(cli("next")).strip() == "step 2/2: b.txt:9 [fix]"
-    assert ok(cli("prev")).strip() == "step 1/2: a.txt:3-4 [fault] first"
+    assert ok(cli("next")).splitlines()[0] == "step 2/2: b.txt:9 [fix]"
+    assert ok(cli("prev")).splitlines()[0] == "step 1/2: a.txt:3-4 [fault] first"
     ok(cli("goto", "2"))
     assert nv.exec_lua("return _G.nvtour.state.tour.current") == 2
     assert nv.current.buffer.name.endswith("b.txt") and nv.current.window.cursor[0] == 9
@@ -242,8 +242,8 @@ def test_tour_stays_on_first_step_and_first_last_keys(cli, nv):
     assert current(nv) == 3
     nv.command("NvtourFirst")
     assert current(nv) == 1
-    assert ok(cli("last")).strip() == "step 3/3: a.txt:20 [info] three"
-    assert ok(cli("first")).strip() == "step 1/3: a.txt:3 [info] one"
+    assert ok(cli("last")).splitlines()[0] == "step 3/3: a.txt:20 [info] three"
+    assert ok(cli("first")).splitlines()[0] == "step 1/3: a.txt:3 [info] one"
     ok(cli("clear"))
     assert nv.eval("maparg('[W', 'n')") == "" and nv.eval("maparg(']W', 'n')") == ""
     assert cli("first").returncode == 6
@@ -573,6 +573,74 @@ def test_swap_file_does_not_prompt(cli, nv, sandbox, tmp_path):
         other.kill()
         other.wait(timeout=10)
         f.unlink()
+
+
+def step_list(nv):
+    return nv.exec_lua("local o = {} for _, s in ipairs(_G.nvtour.state.tour.steps) do"
+                       " o[#o + 1] = { s.n, s.l1, s.label or '' } end return o")
+
+
+def test_expect_checks_the_highlighted_text(cli, nv):
+    ok(cli("start", "E"))
+    ok(cli("step", "a.txt:5-7", "--expect", "line 6 of a"))
+    r = cli("step", "a.txt:9", "--expect", "line 10 of a")
+    assert r.returncode == 6 and 'line 9 is "line 9 of a"' in r.stderr
+    assert nv.exec_lua("return #_G.nvtour.state.tour.steps") == 1
+
+
+def test_insert_edit_remove_steps(cli, nv):
+    ok(cli("start", "Edit"))
+    ok(cli("step", "a.txt:3", "--label", "A"))
+    ok(cli("step", "a.txt:9", "--label", "C"))
+    assert ok(cli("step", "a.txt:6", "--label", "B", "--at", "2")).startswith("step 2/3: a.txt:6 [info] B")
+    assert step_list(nv) == [[1, 3, "A"], [2, 6, "B"], [3, 9, "C"]]
+    buf = find_buf(nv, "a.txt")
+    signs = sorted((m[1], m[3]["sign_text"].strip()) for m in ns_marks(nv, "nvtour_steps", buf.handle)
+                   if m[3].get("sign_text"))
+    assert signs == [(2, "1"), (5, "2"), (8, "3")]
+    out = ok(cli("edit", "2", "a.txt:7-8", "--label", "B2", "--role", "fault", "--note", "moved"))
+    assert out.splitlines() == ["step 2/3: a.txt:7-8 [fault] B2", "  7| line 7 of a"]
+    assert cli("edit", "2", "--expect", "nope").returncode == 6
+    ok(cli("goto", "3"))
+    assert ok(cli("remove", "1")).strip() == "removed step 1; 2 step(s) left"
+    assert step_list(nv) == [[1, 7, "B2"], [2, 9, "C"]]
+    assert current(nv) == 2
+    assert cli("remove", "5").returncode == 6
+    qf = nv.call("getqflist", {"items": 0})["items"]
+    assert [i["lnum"] for i in qf] == [7, 9]
+
+
+def test_status_reports_everything(cli, nv):
+    ok(cli("start", "S"))
+    ok(cli("step", "a.txt:3", "--role", "fault", "--label", "first"))
+    ok(cli("step", "b.txt:4"))
+    ok(cli("focus", "b.txt:4-5", "--dim"))
+    data = json.loads(ok(cli("--json", "status")))
+    assert data["title"] == "S" and data["total"] == 2 and data["current"] == 1
+    assert [s["l1"] for s in data["steps"]] == [3, 4]
+    assert data["focus"][0]["mode"] == "dim" and data["panel"]["open"] is True
+    assert data["keys"]["first"] == "[W" and data["keys"]["next"] == "]w"
+    text = ok(cli("status"))
+    assert "tour: S (2 step(s), current 1)" in text and "▶ 1. a.txt:3 [fault] first" in text
+    assert "keys: ]w next, [w prev, [W first, ]W last" in text
+    ok(cli("clear"))
+    data = json.loads(ok(cli("--json", "status")))
+    assert data["total"] == 0 and data["keys"] == {}
+
+
+def test_panel_footer_and_skipped_key_warning(cli, nv):
+    nv.command("nnoremap ]W <Nop>")
+    try:
+        data = json.loads(ok(cli("--json", "start", "K")))  # start installs the keys
+        assert "last" not in data["keys"] and any("]W" in w for w in data["warnings"])
+        r = cli("step", "a.txt:3")
+        assert "last" not in json.loads(ok(cli("--json", "status")))["keys"] and r.returncode == 0
+        pb = find_buf(nv, "nvtour://panel")
+        footer = lines_of(nv, pb.handle)[-1]
+        assert footer.startswith("]w next · [w prev · [W first · <leader>wp panel") and footer.endswith("q close")
+    finally:
+        ok(cli("clear"))
+        nv.command("nunmap ]W")
 
 
 def test_doctor(cli, sandbox):

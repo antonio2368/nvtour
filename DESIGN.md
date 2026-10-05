@@ -6,7 +6,8 @@ concept in chat and, in parallel, drives the editor: jump to a range, highlight 
 comment as virtual text, fold away irrelevant code, show a read-only diff, and keep a side panel
 with the step list and a longer markdown explanation. The user steps through with keys.
 
-It is **not** a code editing or review tool. It never writes to a file buffer or to disk.
+It is **not** a code editing or review tool. It never writes to a file buffer or to a file the user edits
+(its own pin cache and `instances --prune` are the only file system writes).
 
 ## 1. Non-goals
 
@@ -32,9 +33,16 @@ agent (Bash) ──► nvtour CLI (Python, pynvim) ──msgpack-RPC over unix s
   rendering. Every CLI command is **one** `nvim_exec_lua` round trip calling
   `_G.nvtour.dispatch(cmd, args)` so each operation is atomic from nvim's point of view.
 - **Loading**: on every CLI run the client evaluates `return _G.nvtour and _G.nvtour.VERSION`.
-  If it is missing or differs from the Python package's `LUA_VERSION`, the client sends the whole
-  Lua source with `nvim_exec_lua`. Reloading must preserve existing state
-  (`M.state = (_G.nvtour and _G.nvtour.state) or new_state()`).
+  If it is missing or differs from the packaged version (the first 12 hex digits of the SHA-1 of the
+  Lua source, passed to the chunk as its first vararg), the client sends the whole Lua source with
+  `nvim_exec_lua`. Reloading must preserve existing state
+  (`M.state = (_G.nvtour and _G.nvtour.state) or new_state()`). Keymaps and panel maps call
+  `_G.nvtour.dispatch` at call time; after an upgrade during a tour the keys are re-installed.
+- **Blocked nvim**: before the first request the client calls `nvim_get_mode()` (answered at once).
+  If `blocking` is true (hit-enter or other prompt), the command is refused with exit 5 and "the
+  command was not run"; otherwise nvim would queue the request and run it after the user answers.
+- **Timeouts**: one budget (`--timeout`) for the whole command: connect, mode check, version check,
+  runtime load and dispatch share it. A timeout error names the phase.
 - **Return protocol**: `dispatch` always returns a table `{ ok = true, ... }` or
   `{ ok = false, error = "message" }`. Lua errors are caught with `pcall` and converted to the
   error form. Python maps `ok = false` to exit code 5 and prints the message to stderr.
@@ -51,13 +59,16 @@ Neovim ≥ 0.7 starts an RPC server per instance at `stdpath('run')/nvim.<pid>.0
 2. `/tmp/nvim.$USER/*/nvim.*.0`
 3. `/tmp/nvim.*.0`
 
-For each socket: parse `<pid>` from the filename. If `/proc/<pid>` does not exist, mark **stale**
-and skip (do not delete; `nvtour instances --prune` may unlink stale sockets, nothing else does).
-Otherwise **probe** with an RPC call, 2 s timeout. The probe is one `exec_lua` returning:
+For each socket: parse `<pid>` from the filename. If `/proc/<pid>` does not exist, or
+`/proc/<pid>/comm` is not `nvim*` (a reused pid), mark **stale** and skip (do not delete;
+`nvtour instances --prune` may unlink stale sockets, nothing else does, and only Unix sockets owned
+by the user). Otherwise **probe** with an RPC call, 2 s timeout, all sockets in parallel. The probe
+first calls `nvim_get_mode()`: an nvim that waits for input is **blocked**. Otherwise one `exec_lua`
+returns:
 
 ```lua
 { pid = vim.fn.getpid(), cwd = vim.fn.getcwd(), version = vim.version(),
-  buffers = <listed, named buffers, absolute paths, max 200>, tabpages = #vim.api.nvim_list_tabpages() }
+  buffers = <listed, named buffers, realpath'd, max 200>, tabpages = #vim.api.nvim_list_tabpages() }
 ```
 
 A socket that fails the probe (connection refused or timeout) is reported as `unresponsive`.
@@ -75,9 +86,12 @@ cwd. Always `os.path.realpath`. Git worktrees resolve naturally to their own top
 | `W` is an ancestor of `cwd` (nvim opened in a subdir) | 80 |
 | `cwd` is an ancestor of `W` (nvim opened in `~/projects`) | 60 |
 | otherwise, any listed buffer path under `W` | 40 |
-| none | 0 |
+| none (or empty cwd) | 0 |
 
-Pick the unique highest score > 0. Ties or no score > 0 → not selectable.
+Pick the unique highest score > 0. If exactly one live instance exists, pick it even with score 0
+(`kind = "only instance"`, with a note on stderr). Ties, or several instances that all score 0 →
+not selectable. If no instance is live but some are blocked → exit 5 (ask the user to answer the
+prompt).
 
 ### Precedence of socket choice
 
@@ -90,22 +104,28 @@ Pick the unique highest score > 0. Ties or no score > 0 → not selectable.
 
 ### Pin cache
 
-`$XDG_RUNTIME_DIR/nvtour/<sha256(W)[:16]>` (fallback `~/.cache/nvtour/`) containing the socket
-path. Written by `nvtour attach` and by a successful automatic selection. `nvtour attach --clear`
-removes it. A dead pinned socket is ignored and removed.
+`$XDG_RUNTIME_DIR/nvtour/<sha256(W)[:16]>` (fallback `~/.cache/nvtour/`) containing
+`{"socket": PATH, "pid": PID or null}` (plain-text pins of 0.1 are still read). The pid is stored only
+when `/proc/<pid>` exists, so a custom socket name (`--listen`) or an nvim in another pid namespace
+(socket mounted into a container) is validated by existence alone. Written atomically by
+`nvtour attach` and by a successful automatic selection. `nvtour attach --clear` removes it. A dead
+pinned socket is ignored and removed. `attach SOCKET` probes that socket directly and only pins a
+live instance.
 
 ### Exit codes
 
 | code | meaning | stderr content |
 |---|---|---|
 | 0 | ok | |
-| 2 | usage error | argparse message |
+| 2 | usage error | argparse message (or invalid `--timeout`/`--context`, stdin is a terminal) |
 | 3 | no unique match | table of live instances (pid, cwd, score) + hint: `open nvim in <W>` or `nvtour attach <pid>` |
-| 4 | no live nvim at all | `no running nvim found; open nvim in <W> and retry` |
-| 5 | RPC failure or timeout | message + hint `nvim may be waiting at a prompt; press <Enter> in nvim` |
-| 6 | bad file / range (file missing, L1 > L2, beyond EOF) | message |
+| 4 | no live nvim at all, or `--socket` path missing | `no running nvim found; open nvim in <W> and retry` / `socket not found: P` |
+| 5 | RPC failure or timeout, nvim waiting for input | message with the phase; `waiting for input ... not run` |
+| 6 | bad file / range (file missing, L1 > L2, beyond EOF, `--expect` mismatch) | message |
 
-The agent relays 3/4 messages to the user verbatim.
+The agent relays 3/4 messages to the user verbatim. With `--json` every failure (also usage errors)
+prints `{"ok": false, "code": N, "error": "..."}` on stdout. Unexpected exceptions become one line
+(`OSError` → 6, others → 5), never a traceback.
 
 ## 4. CLI reference
 
@@ -118,63 +138,84 @@ nvtour instances [--prune]
 nvtour attach [PID|SOCKET] [--clear]
 nvtour where
 nvtour start [TITLE]
-nvtour step FILE:L1[-L2] [--note TEXT | --note -] [--label TEXT] [--role ROLE] [--no-jump]
-nvtour goto N | nvtour next | nvtour prev
+nvtour step FILE:L1[-L2] [--note TEXT | --note -] [--label TEXT] [--role ROLE] [--expect TEXT]
+            [--at N] [--jump | --no-jump]
+nvtour edit N [FILE:L1[-L2]] [--note TEXT | --note -] [--label TEXT] [--role ROLE] [--expect TEXT] [--jump]
+nvtour remove N
+nvtour goto N | nvtour next | nvtour prev | nvtour first | nvtour last
+nvtour status
 nvtour focus FILE:L1-L2 [L3-L4 ...] [--context N] [--dim]
 nvtour unfocus [FILE]
 nvtour diff FILE (--ref GITREF | --file PATH | --stdin) [--title TEXT]
 nvtour diff-close
 nvtour panel [TEXT | --file PATH | -] [--toggle] [--clear]
-nvtour clear
+nvtour clear [--keep-buffers]
 nvtour doctor
 ```
 
-Range syntax: `path:L1` (single line) or `path:L1-L2`. `focus` takes one file and one or more
-ranges; extra bare `L3-L4` arguments apply to the same file.
+Range syntax: `path:L1` (single line), `path:L1-L2` or `path:L1,L2`; `path:L:COL` is accepted and the
+column is ignored (unless a file literally named `path:L` exists). `focus` takes one file and one or
+more ranges; extra bare `L3-L4` arguments apply to the same file.
 
 ### Commands
 
-- **instances** — prints one line per socket: `pid  state(live|stale|unresponsive)  score  cwd
-  (#buffers)`. With `--prune` unlinks stale sockets.
+- **instances** — prints one line per socket: `pid  state(live|stale|unresponsive|blocked)  score
+  cwd (#buffers)`. With `--prune` unlinks stale sockets (Unix sockets owned by the user only).
 - **attach** — selects and pins an instance. With no argument runs selection; prints
   `attached: pid P  socket S  cwd C  (exact match|subdir|parent|buffers)`.
-- **where** — context for "point and ask": `file:line:col`, mode, last visual selection of the
-  current buffer (`'<`/`'>` marks, with the selected text, max 200 lines), visible range
-  `top-bottom`, window cwd. Lets the user select code and ask "why is this here?".
+- **where** — context for "point and ask", read from the user's file window (the current window,
+  or the previous one when the current window is a terminal, the panel or another special window):
+  `file:line:col`, mode, buffer flags (`modified`, `buftype`, `changedtick`), visible range
+  `top-bottom`, window cwd, and the selection `{live, kind = char|line|block, l1, c1, l2, c2, text,
+  truncated}`: live in visual mode, else the previous `'<`/`'>` selection. Char and block selections
+  give the exact text (`getregion()`); at most 200 lines and 64 KiB.
 - **start** — resets any existing tour (same as `clear` but keeps the panel if open), sets the
   title, creates a fresh quickfix list, installs keymaps. `step` without a prior `start` implicitly
   starts an untitled tour.
-- **step** — appends a step (see §6) and jumps to it unless `--no-jump`. Prints
-  `step N/N: file:L1-L2 [role] label`. `--note -` reads the note from stdin (lets agents pass
-  multi-line text with a heredoc).
-- **goto / next / prev** — move the current step (wraps at ends is **not** desired; clamp and say
-  `already at last step`). Prints the same line as `step`.
+- **step** — appends a step (see §6), or inserts it with `--at N`. Only the first step of a tour
+  jumps (so a finished tour is at step 1); `--jump` forces a jump, `--no-jump` suppresses it for the
+  first step. Prints `step N/N: file:L1-L2 [role] label` and the first highlighted line
+  (`  L1| text`). `--expect TEXT` fails with exit 6 unless `TEXT` occurs in the range. `--note -`
+  reads the note from stdin (lets agents pass multi-line text with a heredoc). A step is added only
+  after it rendered (and jumped); on an error nothing of it remains.
+- **edit / remove** — change or delete step N; all steps are renumbered and rendered again.
+- **goto / next / prev / first / last** — move the current step (wraps at ends is **not** desired;
+  clamp and say `already at last step`). `prev` before any jump goes to step 1. Prints the same
+  lines as `step`.
+- **status** — the tour (title, steps, current), focus, panel, diff tabs and installed keys. Read only.
 - **focus / unfocus** — §8.
 - **diff / diff-close** — §9.
 - **panel** — §7. `TEXT`, `--file`, or `-` replaces the free markdown section. `--toggle`
   shows/hides the window. `--clear` empties the free section.
 - **clear** — removes everything nvtour created: extmarks, signs, folds (restoring fold options),
-  dim, diff tabs, panel window and buffer, keymaps, the nvtour quickfix list. Buffers that were
-  loaded stay loaded. Prints `cleared`.
-- **doctor** — checks: nvim on PATH and version ≥ 0.10, pynvim importable, runtime dirs scanned,
-  live/stale sockets, selected instance, Lua runtime version loaded in it. Exit 0 if a usable
-  instance exists.
+  dim, diff tabs, panel window and buffer, keymaps, the nvtour quickfix items. Buffers that were
+  loaded stay loaded; the ones nvtour added to the buffer list are unlisted again unless shown,
+  modified, or `--keep-buffers`. Prints `cleared`.
+- **doctor** — checks: nvim on PATH (optional), pynvim importable, runtime dirs scanned,
+  live/stale sockets, selected instance, version of that nvim ≥ 0.10, Lua runtime version loaded in
+  it. The exit code is the code of the first failed required check (pynvim, selected instance,
+  nvim version, connection).
 
 `--json` makes every command print a single JSON object instead of text (the `dispatch` return
-table plus `socket`, `pid`).
+table plus `socket`, `pid`, and `warnings` when there are any). Without `--json`, warnings are
+printed on stderr as `warning: ...`.
 
 ## 5. Lua runtime: state
 
 ```lua
-M.VERSION = "<same string as Python LUA_VERSION>"
+M.VERSION = (...) or "dev" -- source hash passed by the client
 M.state = {
   tour = { title = "", steps = {}, current = 0, qf_id = nil },
   ns_steps = nvim_create_namespace("nvtour_steps"),
   ns_focus = nvim_create_namespace("nvtour_focus"),
   panel = { buf = nil, win = nil, text = {}, user_closed = false },
-  focus = { [bufnr] = { ranges = {...}, dim = bool, saved = { foldmethod=, foldenable=, foldlevel=, foldminlines= } } },
+  focus = { [bufnr] = { ranges = {...}, dim = bool, file = path,
+                        saved = { [winid] = { foldmethod=, foldenable=, foldlevel=, foldminlines= } } } },
+  pending_folds = { [winid] = { [bufnr] = saved fold options } }, -- restored on BufWinEnter
   diff_tabs = { tabpage handles },
-  keymaps_installed = false,
+  keys = { [action] = lhs },  -- the keys that were installed
+  tour_win = winid,           -- last window used for the tour
+  added_bufs = { [bufnr] = true }, -- buffers nvtour added to the buffer list
 }
 ```
 
@@ -182,34 +223,48 @@ Each step: `{ n, file, buf, l1, l2, role, label, note, extmark_ids = {} }`.
 
 ### Tour window
 
-The window where files are shown. Rule: the current window, unless it is the panel or belongs to
-an nvtour diff tab; then the previous window (`wincmd p` target) or the first window in the first
-non-diff tabpage that is not the panel. If the current tabpage is an nvtour diff tab, switch to
-the previous tabpage first.
+The window where files are shown. A window is usable when it is a normal (non-floating) window
+that is not the panel, shows a buffer with `buftype == ""` (never a terminal, quickfix, help or
+plugin window), and is not in an nvtour diff tab. Order: (1) a usable window of the current tab that
+already shows the step's buffer, (2) the current window, (3) the previous window (`wincmd p`
+target), (4) the last tour window, (5) the first usable window of the current tab, then of the other
+tabs, (6) a new split next to the first normal window of the current tab.
+
+Entering the tour window: when the current window is a terminal, it keeps the focus; the file
+window still moves (`vim.g.nvtour_steal_focus = "unless_terminal"` default, `"always"`, `"never"`).
 
 ### Showing a buffer, safely
 
 `local buf = vim.fn.bufadd(path); vim.fn.bufload(buf); vim.bo[buf].buflisted = true;
 nvim_win_set_buf(tourwin, buf)`. Never `:edit`, never `:edit!`. Switching the buffer of a window
-with `hidden` set keeps the previous buffer's modifications. (The user has `hidden = true`; also
-set `vim.o.hidden = true` defensively on load, it is harmless.)
+with `hidden` set keeps the previous buffer's modifications; the runtime sets `vim.o.hidden = true`
+on load because of this. A modified buffer that cannot be hidden (`'bufhidden'` is
+`unload`/`delete`/`wipe`, or `'hidden'` is off) and is shown in only this window is never replaced:
+`nvim_win_set_buf` would run `'autowrite'` (a write to disk) or fail with E37. A split is opened
+next to it instead, with a warning.
+
+`bufload()` shows no swap-file dialog. Inside `pcall`, its ATTENTION message (E325) becomes an error
+instead of a hit-enter prompt; the buffer is loaded anyway and nvtour continues with a warning.
 
 ## 6. Step rendering
 
 Roles and highlight groups (all defined with `default = true` so the user can override in
 `init.lua`):
 
-| role | line group | links to | sign/label group |
-|---|---|---|---|
-| `fault` | `NvtourLineFault` | `DiffDelete` | `NvtourSignFault` → `DiagnosticError` |
-| `flow` | `NvtourLineFlow` | `DiffChange` | `NvtourSignFlow` → `DiagnosticInfo` |
-| `fix` | `NvtourLineFix` | `DiffAdd` | `NvtourSignFix` → `DiagnosticOk` |
-| `context` | `NvtourLineContext` | `CursorLine` | `NvtourSignContext` → `Comment` |
-| `info` (default) | none | | `NvtourSignInfo` → `DiagnosticHint` |
+| role | line group | accent from |
+|---|---|---|
+| `fault` | `NvtourLineFault` | `DiagnosticError` |
+| `flow` | `NvtourLineFlow` | `DiagnosticInfo` |
+| `fix` | `NvtourLineFix` | `DiagnosticOk` |
+| `context` | `NvtourLineContext` | `Comment` |
+| `info` (default) | none | `DiagnosticHint` |
 
-Also `NvtourNote` → `Comment` with `italic = true`, `NvtourNoteBorder` → `NonText`,
-`NvtourLabel<Role>` → same as the sign group, `NvtourDim` → `Comment` (used by focus `--dim`),
-`NvtourPanelCurrent` → `Visual`.
+The line group is a background tint: the accent colour blended into the `Normal` background, so
+syntax highlighting stays visible (`Diff*` groups are not used: many colorschemes define them with
+`reverse`). `NvtourNumber<Role>`, `NvtourSign<Role>` and `NvtourLabel<Role>` use the accent as
+foreground. Also `NvtourNote`, `NvtourNoteBorder`, `NvtourDim` (focus `--dim`) and
+`NvtourPanelCurrent`, all blended from `Normal`. A `User NvtourHighlights` autocmd runs after they are
+defined.
 
 For a step at `l1..l2` in buffer `buf` (0-based rows internally):
 
@@ -220,18 +275,21 @@ For a step at `l1..l2` in buffer `buf` (0-based rows internally):
 3. **Note** — virtual lines **above** `l1` (`virt_lines_above = true`), one chunk per wrapped
    line: `{ {prefix, "NvtourNoteBorder"}, {text, "NvtourNote"} }`. Prefix `╭ ` for the first
    line, `│ ` for middle lines, `╰ ` for the last line; a single-line note uses `▸ `. Wrap width =
-   tour window width − `textoff` (from `vim.fn.getwininfo`) − 4, minimum 30. Blank lines in the
-   note are kept as `│`.
+   tour window width − `textoff` (from `vim.fn.getwininfo`) − 4, minimum 30; words wider than
+   that are split. Blank lines in the note are kept as `│`. Notes are wrapped again on `WinResized`.
 4. **Label** — on `l1`: `virt_text = { {"  ← " .. label, "NvtourLabel<Role>"} }`,
    `virt_text_pos = "eol"`.
-5. **Jump** (unless `no_jump`) — show the buffer in the tour window, `nvim_win_set_cursor(win,
-   {l1, 0})`, then `normal! zv` and `normal! zz` executed in that window via
-   `nvim_win_call`. Set `tour.current = n`.
+5. **Jump** (first step of a tour, or `--jump`; never with `--no-jump`) — show the buffer in the
+   tour window, `nvim_win_set_cursor(win, {l1, 0})`, then `normal! zv` and `normal! zz` executed in
+   that window via `nvim_win_call`. Set `tour.current = n`.
 6. **Quickfix** — `vim.fn.setqflist({}, "r", { id = tour.qf_id, title = "nvtour: " .. title,
-   items = <one item per step: filename, lnum, end_lnum, text = label or first note line, type =
-   role initial> })`. The list is created with `setqflist({}, " ", {...})` by `start` and its `id`
-   read back with `getqflist({ id = 0 }).id`, so the user's other quickfix lists are untouched.
-7. **Panel** — re-render (§7); open it automatically on the first step unless
+   items = <one item per step: filename, lnum, end_lnum, text = "[role] " .. (label or first note
+   line)> })`. The index moves only when the step jumped. The list is created with
+   `setqflist({}, " ", {...})` and its `id` read back with `getqflist({ id = 0 }).id`, so the
+   user's other quickfix lists are untouched. The next tour reuses the list while it is the current
+   one.
+7. **Panel** — re-render (§7); on the first step the panel is opened automatically (before the
+   note is rendered, so the note is wrapped to the final width) unless
    `vim.g.nvtour_auto_panel == false` or `panel.user_closed`.
 8. `vim.notify(("nvtour %d/%d: %s"):format(n, total, label or file:l1), vim.log.levels.INFO)`.
 
@@ -258,9 +316,15 @@ Rendered content:
   2. src/b.cpp:88       erase on cleanup thread
   3. src/a.cpp:430      the fix
 
+
+]w next · [w prev · [W first · ]W last · <leader>wp panel · <leader>wc clear · <CR> jump · q close
+
 ---
 <free markdown text set via `nvtour panel`>
 ```
+
+The footer line lists only the keys that were installed. The panel opens in the tab of the tour
+window; a panel window left in another tab is closed first.
 
 Paths shown relative to `W` (passed from Python as `workspace`). The current step line gets an
 extmark `line_hl_group = NvtourPanelCurrent`. Buffer-local normal-mode maps in the panel: `<CR>`
@@ -277,10 +341,13 @@ closed (do not reopen automatically for steps if `user_closed`).
 
 - Ranges are extended by `N` context lines (default 2), merged if overlapping, clamped to the
   buffer.
-- Default (fold mode): show the buffer in the tour window; save the window's `foldmethod`,
-  `foldenable`, `foldlevel`, `foldminlines` into `state.focus[buf].saved`; set `foldmethod =
-  manual`, `foldenable = true`, `foldminlines = 0`; `normal! zE` (only if we set manual ourselves
-  — document that pre-existing manual folds in that window are lost); then for every gap between
+- Before the first step of a tour, `focus` shows the buffer in the tour window and moves the cursor
+  to the first range. During a tour it does not move the view: folds are applied now if the tour
+  window shows the buffer, else when the buffer is shown (by a step or by the user).
+- Default (fold mode): save the window's local `foldmethod`, `foldenable`, `foldlevel`,
+  `foldminlines` into `state.focus[buf].saved[win]` (one entry per window); set them with
+  `:setlocal` semantics (`foldmethod = manual`, `foldenable = true`, `foldminlines = 0`);
+  `normal! zE` (pre-existing manual folds in that window are lost); then for every gap between
   kept ranges `vim.cmd(("%d,%dfold"):format(a, b))`; close them (`zM` would also close kept
   regions, so instead create folds already closed: after creating, `normal! zM` then `zv` at the
   cursor is wrong; use `vim.cmd(("%d,%dfoldclose"):format(a, b))` per gap).
@@ -289,8 +356,11 @@ closed (do not reopen automatically for steps if `user_closed`).
 - Focus state is per buffer. When `step` later shows that buffer in the tour window, fold-mode
   focus is re-applied (folds are window-local and may be gone). Fold the step's own range open
   (`zv` after the jump already does this).
-- `unfocus [FILE]` — restore saved fold options for the tour window, `normal! zE` if we had set
-  manual, clear `ns_focus` extmarks, drop the state. With no FILE, unfocus all.
+- `unfocus [FILE]` — for each saved window: if it still shows the buffer, `normal! zE` and restore
+  the options; if it shows another buffer now, keep the saved options in `pending_folds` and restore
+  them on the next `BufWinEnter` of that buffer in that window (another buffer's options are never
+  touched). Clear `ns_focus` extmarks, drop the state. FILE is compared with the stored path (no
+  `bufnr()` pattern). With no FILE, unfocus all.
 
 ## 9. Read-only diff
 
@@ -314,28 +384,33 @@ the tab.
 ## 10. Keymaps and user commands
 
 Installed by `start`/first `step`, removed by `clear`. Global normal-mode maps, each set **only if
-`vim.fn.maparg(lhs, "n") == ""`**; otherwise `vim.notify` a warning once and skip that key.
+`vim.fn.maparg(lhs, "n") == ""`**; otherwise `vim.notify` a warning once, return it in `warnings`,
+and skip that key. `vim.g.nvtour_keys` is read (missing entries use the defaults), never written.
 
 ```lua
-vim.g.nvtour_keys = vim.g.nvtour_keys or {
-  next = "]w", prev = "[w", panel = "<leader>wp", clear = "<leader>wc",
+DEFAULT_KEYS = {
+  next = "]w", prev = "[w", first = "[W", last = "]W", panel = "<leader>wp", clear = "<leader>wc",
 }
 ```
 
-User commands (defined on load, always available): `:NvtourNext`, `:NvtourPrev`,
-`:NvtourGoto N`, `:NvtourPanel`, `:NvtourClear`.
+User commands (defined on load, always available): `:NvtourNext`, `:NvtourPrev`, `:NvtourFirst`,
+`:NvtourLast`, `:NvtourGoto N`, `:NvtourPanel`, `:NvtourClear`.
 
-The quickfix list also works (`:cnext`, `:cprev`, `:copen`).
+The quickfix list also works (`:cnext`, `:cprev`, `:copen`); it moves the cursor only, not the
+current step.
 
 ## 11. Safety rules (enforce in code and tests)
 
 1. Never call `nvim_buf_set_lines`/`nvim_buf_set_text` on a buffer that is not an `nvtour://`
    scratch buffer. Never `:w`, `:edit!`, `:bd!`, `:qa`.
-2. Never change global options except `hidden = true`. Window-local fold options are saved and
-   restored. Highlight groups use `default = true`.
+2. Never change global options except `hidden = true`. Window-local fold options are set locally,
+   saved and restored per window. Highlight groups use `default = true`.
+3a. Never replace a modified buffer that cannot be hidden (that would run `'autowrite'`).
 3. Never close windows/tabs we did not create (panel window, diff tabs only).
 4. Never touch an nvim instance the user did not select (no broadcasting).
-5. Every RPC call has a timeout; a hang never blocks the agent for more than `--timeout` seconds.
+5. Every command has one timeout budget for all its RPC calls; a hang never blocks the agent for
+   more than `--timeout` seconds (plus the 2 s discovery probes, which run in parallel). A command
+   is not sent to an nvim that waits for input.
 6. Tests never connect to sockets under the real `$XDG_RUNTIME_DIR`; they set `XDG_RUNTIME_DIR` to
    a temp dir and start their own `nvim --headless --clean` there (nvim then creates its socket in
    that dir, so discovery is exercised end to end).
@@ -347,7 +422,7 @@ The quickfix list also works (`:cnext`, `:cprev`, `:copen`).
   pyproject.toml          # name nvtour, console_scripts nvtour = nvtour.cli:main, dependency pynvim
   README.md               # usage, keys, example session, init.lua options
   DESIGN.md
-  nvtour/__init__.py      # __version__, LUA_VERSION
+  nvtour/__init__.py      # __version__
   nvtour/cli.py           # argparse, subcommands, output
   nvtour/discover.py      # socket scan, probe, score, pin cache
   nvtour/client.py        # pynvim attach with timeout, ensure_lua_loaded, call(cmd, args)
@@ -372,26 +447,11 @@ description: Give a visual, read-only walkthrough of code inside the user's runn
 ---
 ```
 
-Body (concise, imperative):
-
-- **Workflow**: `nvtour attach` first (relay exit 3/4 messages to the user verbatim and stop; do not
-  start nvim yourself). Then `nvtour start "<title>"`. Then, interleaved with the chat
-  explanation, one `nvtour step` per point. Prefer 3–8 steps, one idea per step, in reading order
-  of the explanation (cause → propagation → effect, or entry → core → exit). Finish with `nvtour
-  panel -` holding a short markdown summary and tell the user the keys (`]w` / `[w`, `<leader>wp`,
-  `<leader>wc`, or `:cnext`).
-- **Writing notes**: note ≤ 3 short sentences, label ≤ 6 words, roles: `fault` for the wrong
-  line(s), `flow` for how data/control gets there, `fix` for where/how it should change,
-  `context` for background, `info` for neutral explanation. Reference identifiers by name in the
-  note; the highlight already shows the location.
-- **When to use focus**: concept spans a long file → `nvtour focus FILE:a-b c-d` once per file
-  before the steps in it. Use `--dim` when surrounding code matters for reading.
-- **When to use diff**: before/after a fix (`--stdin` with the proposed version), or compare
-  versions (`--ref origin/master`, `--ref v25.8`). It is read-only.
-- **Point and ask**: if the user says "this" / "here", run `nvtour where` to read their cursor or
-  selection.
-- **Multi-line notes** via heredoc: `nvtour step f.cpp:10-12 --role fault --note - <<'EOF' … EOF`.
-- **Never** modify files, never run `nvtour clear` unless the user asks or you start a new tour.
+Body (concise, imperative): see `skill/SKILL.md`. It covers the workflow (attach, start, one step
+per point, panel summary; only the first step moves the view), how to get line numbers right
+(`rg -n`, the echoed line, `--expect`), fixing a tour (`edit`, `remove`, `--at`, `status`), note
+style and roles, focus and its manual-fold caveat, diffs, `where` and its previous-selection
+caveat, and what to do on each exit code.
 
 ## 13. Future
 

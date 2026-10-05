@@ -24,6 +24,23 @@ def test_parse_range_errors(bad):
     assert e.value.code == EXIT_BAD_FILE
 
 
+def test_parse_line_col_and_comma(tmp_path):
+    f = tmp_path / "f.cpp"
+    f.write_text("x")
+    assert parse_file_range(f"{f}:12:5") == (str(f), 12, 12)
+    assert parse_file_range(f"{f}:12-14:5") == (str(f), 12, 14)
+    assert parse_file_range(f"{f}:12,15") == (str(f), 12, 15)
+    # a missing file is reported without the line number glued to its name
+    assert parse_file_range(f"{tmp_path}/missing.cpp:3:1")[0] == str(tmp_path / "missing.cpp")
+
+
+def test_file_literally_named_with_a_line_number(tmp_path):
+    f = tmp_path / "odd:12"
+    f.write_text("x")
+    assert parse_file_range(f"{f}:5") == (str(f), 5, 5)
+    assert parse_file_range(f"{tmp_path}/odd:12:5") == (str(f), 5, 5)
+
+
 def test_parse_file_range_needs_colon():
     with pytest.raises(NvtourError):
         parse_file_range("nocolon")

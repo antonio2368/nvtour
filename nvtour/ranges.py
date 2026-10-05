@@ -1,4 +1,4 @@
-"""Parsing of ``FILE:L1[-L2]`` specs and path resolution."""
+"""Parsing of ``FILE:L1[-L2]`` specs (also ``FILE:L1,L2`` and ``FILE:L:COL``) and path resolution."""
 
 from __future__ import annotations
 
@@ -7,11 +7,13 @@ import re
 
 from .errors import EXIT_BAD_FILE, NvtourError
 
-_RANGE_RE = re.compile(r"^(\d+)(?:-(\d+))?$")
+_RANGE_RE = re.compile(r"^(\d+)(?:[-,](\d+))?$")
+# FILE:L:COL as printed by compilers, `rg -n --column` and LSP tools; the column is ignored.
+_COL_RE = re.compile(r"^(.+):(\d+(?:[-,]\d+)?):(\d+)$")
 
 
 def parse_range(text: str) -> tuple[int, int]:
-    """Parse ``L1`` or ``L1-L2`` into an inclusive (l1, l2) pair."""
+    """Parse ``L1``, ``L1-L2`` or ``L1,L2`` into an inclusive (l1, l2) pair."""
     m = _RANGE_RE.match(text.strip())
     if not m:
         raise NvtourError(EXIT_BAD_FILE, f"bad range {text!r}: expected L1 or L1-L2")
@@ -32,7 +34,14 @@ def resolve_path(path: str, cwd: str | None = None) -> str:
 
 
 def parse_file_range(spec: str, cwd: str | None = None) -> tuple[str, int, int]:
-    """Parse ``path:L1[-L2]`` into (absolute path, l1, l2)."""
+    """Parse ``path:L1[-L2]`` (or ``path:L1,L2``, ``path:L:COL``) into (absolute path, l1, l2)."""
+    m = _COL_RE.match(spec)
+    if m:
+        with_col = resolve_path(m.group(1), cwd)
+        # Only a file literally named "x.cpp:12" makes "x.cpp:12:5" mean line 5 of it.
+        if os.path.isfile(with_col) or not os.path.isfile(resolve_path(spec.rpartition(":")[0], cwd)):
+            l1, l2 = parse_range(m.group(2))
+            return with_col, l1, l2
     path, sep, rng = spec.rpartition(":")
     if not sep or not path:
         raise NvtourError(EXIT_BAD_FILE, f"bad spec {spec!r}: expected FILE:L1[-L2]")
