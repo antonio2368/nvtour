@@ -47,12 +47,12 @@ INK = (24, 20, 12)
 DIM_LEVEL = 0.55  # how much the pane that does not act is dimmed
 
 SOLO_RECT = (310, 80, 1300, 820)  # x, y, w, h
-CHAT_RECT = (48, 64, 680, 864)
-NVIM_RECT = (752, 64, 1120, 864)
+CHAT_RECT = (36, 64, 540, 864)
+NVIM_RECT = (596, 64, 1288, 864)
 LABEL_Y = 26
 TITLE_H = 40
-CAPTION_Y = 965
-NVIM_FONT, NVIM_PAD = 15, 10
+CAPTION_Y = 958
+NVIM_FONT, NVIM_PAD = 20, 10
 NO_LIGATURES = ["-liga", "-calt"]  # keep `->` and `<<` as typed
 PLUGIN_DIRS = [Path.home() / ".local/share/nvim/lazy", Path.home() / ".local/share/nvim/site/pack"]
 
@@ -72,7 +72,7 @@ KINDS = {
     "out": ("  ", DIM, DIM, "regular", ()),
 }
 
-ANSWER = re.sub(r"(lines?) (\d)", rf"\1{NB}\2", (
+ANSWER = re.sub(r"([Ll]ines?) (\d)", rf"\1{NB}\2", (
     "`get()` finds the entry on line 16 and keeps the iterator `it`. Line 19 calls `refresh(key)`, which "
     "(lines 50-55) calls `entries.extract(key)` on line 52. That unlinks the node and invalidates `it`; line 54 "
     "puts it back with `insert()`. Back in `get()`, line 20 reads `it->second.value` through the invalid "
@@ -156,8 +156,8 @@ def pane(w: int, h: int, title: str, fill: tuple, fonts: Fonts) -> Image.Image:
     for i, c in enumerate([(237, 106, 94), (245, 191, 79), (98, 197, 84)]):
         cx, cy = 22 + i * 22, TITLE_H // 2
         d.ellipse([cx - 6, cy - 6, cx + 6, cy + 6], fill=mix(CHROME, c, 0.8))
-    font = fonts.get(16)
-    d.text(((w - d.textlength(title, font=font)) / 2, TITLE_H // 2 - 10), title, font=font, fill=DIM)
+    font = fonts.get(18)
+    d.text(((w - d.textlength(title, font=font)) / 2, TITLE_H // 2 - 11), title, font=font, fill=DIM)
     d.rounded_rectangle([0, 0, w - 1, h - 1], radius=14, outline=BORDER, width=1)
     return img
 
@@ -333,10 +333,10 @@ class Stage:
         img = Image.new("RGB", (W, H), BG)
         if self.layout == "solo":
             x, y, w, h = SOLO_RECT
-            img.paste(render_chat(self.items, w, h, "agent", self.f, 22)[0], (x, y))
+            img.paste(render_chat(self.items, w, h, "agent", self.f, 26)[0], (x, y))
         else:
             x, y, w, h = CHAT_RECT
-            chat, ay = render_chat(self.items, w, h, "agent", self.f, 16)
+            chat, ay = render_chat(self.items, w, h, "agent", self.f, 19)
             self.active_y = None if ay is None else y + ay
             img.paste(chat, (x, y))
             assert self.nvim_pane is not None
@@ -351,7 +351,7 @@ class Stage:
             self.pane_label(d, NVIM_RECT, "YOUR NEOVIM", "already open", self.dim["nvim"])
             img = self.effects(img)
         if self.caption:
-            size = 36
+            size = 46
             cw = self.f.get(size).getlength("M")
             d = ImageDraw.Draw(img)
             draw_attrs(d, (W - len(self.caption) * cw) / 2, CAPTION_Y, self.caption,
@@ -361,20 +361,20 @@ class Stage:
     def pane_label(self, d: ImageDraw.ImageDraw, rect: tuple, name: str, note: str, dim: float) -> None:
         on = 1 - dim / DIM_LEVEL
         x = rect[0] + 6
-        d.ellipse([x, LABEL_Y + 5, x + 12, LABEL_Y + 17], fill=mix(BORDER, FX, on))
-        bold = self.f.get(20, "bold")
-        d.text((x + 22, LABEL_Y - 2), name, font=bold, fill=mix(DIM, TEXT, on))
-        d.text((x + 22 + d.textlength(name + "  ", font=bold), LABEL_Y), note, font=self.f.get(17),
+        d.ellipse([x, LABEL_Y + 4, x + 14, LABEL_Y + 18], fill=mix(BORDER, FX, on))
+        bold = self.f.get(24, "bold")
+        d.text((x + 24, LABEL_Y - 6), name, font=bold, fill=mix(DIM, TEXT, on))
+        d.text((x + 24 + d.textlength(name + "  ", font=bold), LABEL_Y - 3), note, font=self.f.get(20),
                fill=mix(BORDER, DIM, on))
 
     def pill(self, d: ImageDraw.ImageDraw, x: float, y: float, text: str, alpha: int) -> tuple[float, float, float, float]:
-        font = self.f.get(19, "bold")
-        w = d.textlength(text, font=font, features=NO_LIGATURES) + 26
+        font = self.f.get(24, "bold")
+        w = d.textlength(text, font=font, features=NO_LIGATURES) + 30
         x = min(max(x, NVIM_RECT[0] + 8), NVIM_RECT[0] + NVIM_RECT[2] - w - 8)
-        d.rounded_rectangle([x, y + 3, x + w, y + 37], radius=10, fill=(0, 0, 0, alpha // 2))
-        d.rounded_rectangle([x, y, x + w, y + 34], radius=10, fill=(*FX, alpha))
-        d.text((x + 13, y + 5), text, font=font, fill=(*INK, alpha), features=NO_LIGATURES)
-        return x, y, x + w, y + 34
+        d.rounded_rectangle([x, y + 4, x + w, y + 46], radius=12, fill=(0, 0, 0, alpha // 2))
+        d.rounded_rectangle([x, y, x + w, y + 42], radius=12, fill=(*FX, alpha))
+        d.text((x + 15, y + 6), text, font=font, fill=(*INK, alpha), features=NO_LIGATURES)
+        return x, y, x + w, y + 42
 
     def effects(self, img: Image.Image) -> Image.Image:
         if not (self.boxes and self.box_fade > 0 or self.effect and self.effect_fade > 0 or self.packet
@@ -518,7 +518,7 @@ class Trailer(rd.Demo):
         _, _, w, h = NVIM_RECT
         cols = (w - 2 * NVIM_PAD - 8) // self.cw
         rows = (h - TITLE_H - 2 * NVIM_PAD - 8) // self.ch
-        super().__init__(cols, rows, setup_lua)
+        super().__init__(cols, rows, "vim.o.wrap = false\n" + setup_lua)  # long code lines would wrap
         self.stage, self.fonts = stage, fonts
         iw, ih = cols * self.cw + 2 * NVIM_PAD, rows * self.ch + 2 * NVIM_PAD
         self.paste_at = ((w - iw) // 2, TITLE_H + (h - TITLE_H - ih) // 2)
@@ -599,8 +599,8 @@ class Trailer(rd.Demo):
         st.boxes, st.effect = rects, effect
         if big:
             st.effect_at = (x0 + 10, y0 + 12)
-        elif y0 - 44 >= self.origin[1]:
-            st.effect_at = (x0, y0 - 44)
+        elif y0 - 52 >= self.origin[1]:
+            st.effect_at = (x0, y0 - 52)
         else:
             st.effect_at = (x0, y1 + 10)
 
@@ -696,8 +696,8 @@ def main() -> None:
     t = Trailer(s, fonts, colorscheme_lua(a.colorscheme) if a.colorscheme else "")
     try:
         # 1. Title.
-        v.fade(title_card(fonts), 0.8)
-        v.hold(2.2)
+        v.emit(title_card(fonts))  # no fade-in: the first frame is the preview image of the video
+        v.hold(3.0)
         v.still("title")
 
         # 2. The usual answer: a wall of line numbers.
