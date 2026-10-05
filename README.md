@@ -11,8 +11,7 @@ The agent explains a bug in chat. Your editor shows you where it is.
 ![Read-only](https://img.shields.io/badge/files-never%20modified-brightgreen)
 ![No plugin](https://img.shields.io/badge/nvim%20plugin-not%20needed-blue)
 
-https://github.com/user-attachments/assets/2e543512-b788-4bfa-b37b-53ec5630fa56
-
+https://github.com/user-attachments/assets/c96e9a46-a11a-45b1-9368-ac68932a90de
 
 
 </div>
