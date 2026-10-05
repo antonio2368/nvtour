@@ -542,15 +542,17 @@ Install: `pip install --user --break-system-packages -e ~/projects/nvtour` → `
 ```
 ---
 name: nvtour
-description: Give a visual, read-only walkthrough of code inside the user's running Neovim while explaining a bug or a concept in chat — jump, highlight, annotate with virtual-text notes, fold to the relevant parts, show read-only diffs, keep a step panel. Use when the user asks to explain, walk through, show, or visualize something "in nvim" / "in the editor", or asks for a guided tour of a bug, a code path, or a concept. Never edits files.
+description: Give a visual, read-only walkthrough of code inside the user's running Neovim while explaining a bug or a concept in chat — jump, highlight, annotate with virtual-text notes, fold to the relevant parts, show read-only diffs, keep a step panel. Use when the user explicitly asks to explain, walk through, show, or visualize something "in nvim" / "in the editor". Also use it, without asking first, when the user asks about code ("this chunk", "this function", "here", "what does this do"), gives no file, line or pasted code, and "this" does not point to something earlier in the chat: read their nvim cursor or selection to find the location and answer in chat. Never edits files.
 ---
 ```
 
-Body (concise, imperative): see `skill/SKILL.md`. It covers the workflow (attach, start, one step
-per point, panel summary; only the first step moves the view), how to get line numbers right
-(`rg -n`, the echoed line, `--expect`), fixing a tour (`edit`, `remove`, `--at`, `status`), note
-style and roles, focus and its manual-fold caveat, diffs, `where` and its previous-selection
-caveat, and what to do on each exit code.
+Body (concise, imperative): see `skill/SKILL.md`. It covers point and ask (`attach` and `where`
+when no location is given, the previous-selection caveat, the `@REF`, `modified` and no-file
+flags, an answer in chat and a tour only on an explicit request in nvim), the workflow (attach,
+start, one step per point, panel summary; only the first step moves the view), how to get line
+numbers right (`rg -n`, the echoed line, `--expect`), fixing a tour (`edit`, `remove`, `--at`,
+`status`), note style and roles, focus and its manual-fold caveat, diffs, and what to do on each
+exit code.
 
 ## 13. Future
 

@@ -1,11 +1,27 @@
 ---
 name: nvtour
-description: Give a visual, read-only walkthrough of code inside the user's running Neovim while explaining a bug or a concept in chat — jump, highlight, annotate with virtual-text notes, fold to the relevant parts, show read-only diffs, keep a step panel. Use when the user asks to explain, walk through, show, or visualize something "in nvim" / "in the editor", or asks for a guided tour of a bug, a code path, or a concept. Never edits files.
+description: Give a visual, read-only walkthrough of code inside the user's running Neovim while explaining a bug or a concept in chat — jump, highlight, annotate with virtual-text notes, fold to the relevant parts, show read-only diffs, keep a step panel. Use when the user explicitly asks to explain, walk through, show, or visualize something "in nvim" / "in the editor". Also use it, without asking first, when the user asks about code ("this chunk", "this function", "here", "what does this do"), gives no file, line or pasted code, and "this" does not point to something earlier in the chat: read their nvim cursor or selection to find the location and answer in chat. Never edits files.
 ---
 
 # nvtour
 
 `nvtour` drives the user's already-running Neovim from the shell. It never edits files and never starts nvim.
+
+## Point and ask (no location given)
+
+Use this when the user asks about code ("this", "here", "this chunk") but gives no file, line or pasted code. Do not use it when "this" points to something earlier in the chat (a snippet, a command, an output).
+
+1. Run `nvtour attach`, then `nvtour where` to read their cursor or selection. Do not ask the user for the location first.
+   - Exit 3 or 4: relay the stderr message to the user verbatim and stop. Do not start nvim and do not guess a location.
+   - A live selection is the code the user means.
+   - A selection marked `previous, may be old` is the last visual selection, not a live one. Use it if the user said they selected something, or if they point to a range ("this chunk", "these lines") and the cursor is in or near it. Otherwise use the cursor line and the code around it.
+2. Read the code that the user sees, not only the file on disk. Check the flags on the first line of `where`:
+   - `@REF` (`at git ref ...`): the buffer shows the file at a git ref. Read `git show REF:PATH`, not the working tree.
+   - `modified (differs from disk)`: the file on disk is not what the user sees. Use the selection text that `where` prints. If there is no selection, tell the user that the line on disk can be different from their buffer, or ask them to save.
+   - `[No Name]` or a `buftype` (for example `terminal`): there is no file to read. Use the selection text, or ask the user where the code is.
+3. Answer the question in chat. Read what the code calls as needed. Do not create a tour.
+4. After the answer, offer a walkthrough in nvim only if it would help (for example the answer goes across several files or functions). Ask in one short line. Do not offer it for a short, local answer.
+5. Create a tour only if the user explicitly asks for it in nvim or the editor ("show me in nvim", "walk me through it in the editor"), or says yes to your offer. Then use the Workflow below and skip its step 1 (you already attached).
 
 ## Workflow
 
@@ -69,13 +85,10 @@ description: Give a visual, read-only walkthrough of code inside the user's runn
 - Compare full files: `nvtour diff FILE --ref origin/master`.
 - Read-only. `nvtour diff-close` closes it.
 
-## Point and ask
-
-If the user says "this" or "here", run `nvtour where` to read their cursor or selection. A selection marked `previous, may be old` is the last visual selection, not a live one: use it only if the user said they selected something.
-
 ## Rules
 
 - Never modify files.
+- Never create a tour unless the user explicitly asks for it in nvim or the editor ("in nvim", "in the editor", "show me in vim") or says yes to your offer. "Walk me through", "explain" or "tour" alone is not enough: answer in chat.
 - Never run `nvtour clear` unless the user asks or you start a new tour.
 - Exit codes: 2 usage, 3 no unique nvim match, 4 no nvim (or `--socket` path missing), 5 RPC failure, 6 bad file, range or `--expect`.
 - Exit 5 with `waiting for input`: nothing ran. Ask the user to press `<Esc>` or `<Enter>` in nvim, then retry once.
