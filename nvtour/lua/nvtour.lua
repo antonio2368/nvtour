@@ -1,7 +1,8 @@
 -- nvtour runtime: read-only guided code walkthroughs, injected over RPC.
 -- Every CLI command is one call to _G.nvtour.dispatch(cmd, args).
 local M = {}
-M.VERSION = "2"
+M.VERSION = (...) or "dev" -- the client passes a hash of this source
+
 local PREV_VERSION = _G.nvtour and _G.nvtour.VERSION
 
 local api = vim.api
@@ -27,6 +28,8 @@ local function new_state()
     keymaps_installed = false,
     workspace = nil,
     warned = {},
+    tour_win = nil,
+    pending_folds = {},
   }
 end
 
@@ -38,10 +41,8 @@ for k, v in pairs(new_state()) do
 end
 M.state = S
 
-local DEFAULT_KEYS = { next = "]w", prev = "[w", panel = "<leader>wp", clear = "<leader>wc" }
-if vim.g.nvtour_keys == nil then
-  vim.g.nvtour_keys = DEFAULT_KEYS
-end
+local DEFAULT_KEYS =
+  { next = "]w", prev = "[w", first = "[W", last = "]W", panel = "<leader>wp", clear = "<leader>wc" }
 
 ---------------------------------------------------------------------------
 -- Highlights
@@ -132,6 +133,17 @@ local function notify(msg, level)
   pcall(vim.notify, msg, level or vim.log.levels.INFO)
 end
 
+-- Warnings collected during one dispatch; returned to the CLI as `warnings`.
+local W
+
+local function warn(msg)
+  if W then
+    W[#W + 1] = msg
+  else
+    notify("nvtour: " .. msg, vim.log.levels.WARN)
+  end
+end
+
 local function valid_win(w)
   return w ~= nil and api.nvim_win_is_valid(w)
 end
@@ -155,12 +167,27 @@ local function is_normal_win(w)
   return valid_win(w) and api.nvim_win_get_config(w).relative == ""
 end
 
-local function usable_tour_win(w)
-  return is_normal_win(w) and w ~= S.panel.win and not is_diff_tab(api.nvim_win_get_tabpage(w))
+--- A normal window that shows a file buffer (not a terminal, quickfix, help, or the panel).
+local function file_win(w)
+  return is_normal_win(w) and w ~= S.panel.win and vim.bo[api.nvim_win_get_buf(w)].buftype == ""
 end
 
---- Window where files are shown (see DESIGN.md section 5).
-local function tour_win()
+local function usable_tour_win(w)
+  return file_win(w) and not is_diff_tab(api.nvim_win_get_tabpage(w))
+end
+
+--- Window where files are shown (see DESIGN.md section 5). With `buf`, a usable window of the
+--- current tab that already shows it wins. Returns nil when no window is usable, unless `create`
+--- is set: then a split is opened for `buf` next to the first normal window of the current tab.
+local function tour_win(buf, create)
+  local tab = api.nvim_get_current_tabpage()
+  if buf and valid_buf(buf) then
+    for _, w in ipairs(vim.fn.win_findbuf(buf)) do
+      if usable_tour_win(w) and api.nvim_win_get_tabpage(w) == tab then
+        return w
+      end
+    end
+  end
   local cur = api.nvim_get_current_win()
   if usable_tour_win(cur) then
     return cur
@@ -169,16 +196,52 @@ local function tour_win()
   if prev ~= 0 and usable_tour_win(prev) then
     return prev
   end
-  for _, tab in ipairs(api.nvim_list_tabpages()) do
-    if not is_diff_tab(tab) then
-      for _, w in ipairs(api.nvim_tabpage_list_wins(tab)) do
+  if valid_win(S.tour_win) and usable_tour_win(S.tour_win) then
+    return S.tour_win
+  end
+  local tabs = { tab }
+  for _, t in ipairs(api.nvim_list_tabpages()) do
+    if t ~= tab then
+      tabs[#tabs + 1] = t
+    end
+  end
+  for _, t in ipairs(tabs) do
+    if not is_diff_tab(t) then
+      for _, w in ipairs(api.nvim_tabpage_list_wins(t)) do
         if usable_tour_win(w) then
           return w
         end
       end
     end
   end
-  return cur
+  if not (create and buf) then
+    return nil
+  end
+  local anchor = -1
+  for _, w in ipairs(api.nvim_tabpage_list_wins(tab)) do
+    if is_normal_win(w) and w ~= S.panel.win then
+      anchor = w
+      break
+    end
+  end
+  return api.nvim_open_win(buf, false, { split = "left", win = anchor })
+end
+
+--- Make `win` current. By default the user's terminal window keeps the focus
+--- (vim.g.nvtour_steal_focus = "unless_terminal" | "always" | "never").
+local function enter_win(win)
+  local cur = api.nvim_get_current_win()
+  if cur == win then
+    return
+  end
+  local policy = vim.g.nvtour_steal_focus or "unless_terminal"
+  if policy == "never" then
+    return
+  end
+  if policy ~= "always" and vim.bo[api.nvim_win_get_buf(cur)].buftype == "terminal" then
+    return
+  end
+  api.nvim_set_current_win(win)
 end
 
 local function split_lines(text)
@@ -252,28 +315,41 @@ local function gaps_of(ranges, count)
   return gaps
 end
 
+local FOLD_OPTS = { "foldmethod", "foldenable", "foldlevel", "foldminlines" }
+
+--- Window-local fold options of `win` (`:setlocal` values, so other buffers are not affected).
+local function get_fold_opts(win)
+  local sv = {}
+  for _, o in ipairs(FOLD_OPTS) do
+    sv[o] = api.nvim_get_option_value(o, { scope = "local", win = win })
+  end
+  return sv
+end
+
+local function set_fold_opts(win, sv)
+  for _, o in ipairs(FOLD_OPTS) do
+    api.nvim_set_option_value(o, sv[o], { scope = "local", win = win })
+  end
+end
+
 local function apply_folds(buf, win)
   local f = S.focus[buf]
   if not f or f.dim or not valid_win(win) or not valid_buf(buf) then
     return
   end
-  if not f.saved then
-    f.saved = {
-      foldmethod = vim.wo[win].foldmethod,
-      foldenable = vim.wo[win].foldenable,
-      foldlevel = vim.wo[win].foldlevel,
-      foldminlines = vim.wo[win].foldminlines,
-      win = win,
-    }
+  f.saved = f.saved or {}
+  if not f.saved[win] then
+    -- A restore still pending for this window holds the user's values; the live ones are ours.
+    local pending = S.pending_folds[win]
+    f.saved[win] = (pending and pending[buf]) or get_fold_opts(win)
+    if pending then
+      pending[buf] = nil
+    end
   end
-  f.saved.win = win
   local count = api.nvim_buf_line_count(buf)
   api.nvim_win_call(win, function()
     local cursor = api.nvim_win_get_cursor(win)
-    vim.wo[win].foldmethod = "manual"
-    vim.wo[win].foldenable = true
-    vim.wo[win].foldminlines = 0
-    vim.wo[win].foldlevel = 0
+    set_fold_opts(win, { foldmethod = "manual", foldenable = true, foldminlines = 0, foldlevel = 0 })
     vim.cmd("normal! zE")
     for _, g in ipairs(gaps_of(f.ranges, count)) do
       vim.cmd(("%d,%dfold"):format(g[1], g[2]))
@@ -291,27 +367,54 @@ local function unfocus_buf(buf)
   if valid_buf(buf) then
     api.nvim_buf_clear_namespace(buf, S.ns_focus, 0, -1)
   end
-  local sv = f.saved
-  if sv and valid_win(sv.win) then
-    api.nvim_win_call(sv.win, function()
-      if api.nvim_win_get_buf(sv.win) == buf then
+  for win, sv in pairs(f.saved or {}) do
+    if valid_win(win) and api.nvim_win_get_buf(win) == buf then
+      api.nvim_win_call(win, function()
         vim.cmd("normal! zE")
-      end
-      vim.wo[sv.win].foldmethod = sv.foldmethod
-      vim.wo[sv.win].foldenable = sv.foldenable
-      vim.wo[sv.win].foldlevel = sv.foldlevel
-      vim.wo[sv.win].foldminlines = sv.foldminlines
-    end)
+        set_fold_opts(win, sv)
+      end)
+    elseif valid_win(win) and valid_buf(buf) then
+      -- The window shows another buffer now; restore when this buffer comes back to it.
+      S.pending_folds[win] = S.pending_folds[win] or {}
+      S.pending_folds[win][buf] = sv
+    end
   end
   S.focus[buf] = nil
 end
 
+api.nvim_create_autocmd("BufWinEnter", {
+  group = aug,
+  callback = function(ev)
+    local win = api.nvim_get_current_win()
+    local pending = S.pending_folds[win]
+    local sv = pending and pending[ev.buf]
+    if not sv or S.focus[ev.buf] then
+      return
+    end
+    pending[ev.buf] = nil
+    vim.cmd("normal! zE")
+    set_fold_opts(win, sv)
+  end,
+})
+
 --- Show buf in win without :edit; re-apply fold focus when the window switched buffers.
+--- Returns the window that shows buf. A modified buffer that cannot be hidden is never replaced
+--- (that would run 'autowrite' or fail with E37); a split is opened next to it instead.
 local function show_buf(win, buf)
-  if api.nvim_win_get_buf(win) ~= buf then
-    api.nvim_win_set_buf(win, buf)
-    apply_folds(buf, win)
+  local cur = api.nvim_win_get_buf(win)
+  if cur == buf then
+    return win
   end
+  local bh = vim.bo[cur].bufhidden
+  local hideable = bh == "hide" or (bh == "" and vim.o.hidden)
+  if vim.bo[cur].modified and not hideable and #vim.fn.win_findbuf(cur) <= 1 then
+    win = api.nvim_open_win(buf, false, { split = "right", win = win })
+    warn(("kept modified buffer %s in its window; opened a split"):format(api.nvim_buf_get_name(cur)))
+  else
+    api.nvim_win_set_buf(win, buf)
+  end
+  apply_folds(buf, win)
+  return win
 end
 
 ---------------------------------------------------------------------------
@@ -333,9 +436,24 @@ local function ensure_panel_buf()
   return buf
 end
 
+--- True when the panel window exists and still shows the panel buffer.
+local function panel_shown()
+  local w = S.panel.win
+  return valid_win(w) and valid_buf(S.panel.buf) and api.nvim_win_get_buf(w) == S.panel.buf
+end
+
 local function panel_close(user)
-  if valid_win(S.panel.win) and #api.nvim_list_wins() > 1 then
-    pcall(api.nvim_win_close, S.panel.win, true)
+  if panel_shown() then
+    local w = S.panel.win
+    local others = 0
+    for _, x in ipairs(api.nvim_tabpage_list_wins(api.nvim_win_get_tabpage(w))) do
+      if x ~= w and is_normal_win(x) then
+        others = others + 1
+      end
+    end
+    if others > 0 or #api.nvim_list_tabpages() > 1 then
+      pcall(api.nvim_win_close, w, true)
+    end
   end
   S.panel.win = nil
   if user then
@@ -380,24 +498,48 @@ local function render_panel()
   api.nvim_buf_clear_namespace(buf, S.ns_panel, 0, -1)
   if cur_line then
     api.nvim_buf_set_extmark(buf, S.ns_panel, cur_line - 1, 0, { line_hl_group = "NvtourPanelCurrent" })
-    if valid_win(S.panel.win) then
+    if panel_shown() then
       pcall(api.nvim_win_set_cursor, S.panel.win, { cur_line, 0 })
     end
   end
 end
 
+--- Buffer-local panel keys; they call through _G so they survive a runtime upgrade.
+local function map_panel_keys(buf)
+  local function map(lhs, fn)
+    vim.keymap.set("n", lhs, fn, { buffer = buf, nowait = true, silent = true })
+  end
+  map("<CR>", function()
+    local n = S.panel.line_map[api.nvim_win_get_cursor(0)[1]]
+    if n then
+      local res = _G.nvtour.dispatch("goto", { n = n })
+      if not res.ok then
+        notify(res.error, vim.log.levels.WARN)
+      end
+    end
+  end)
+  map("q", function()
+    _G.nvtour.dispatch("panel", { toggle = true })
+  end)
+end
+
 local function panel_open()
-  if valid_win(S.panel.win) then
-    return
+  -- The panel lives in the tab of the tour window.
+  local target = tour_win() or api.nvim_get_current_win()
+  local tab = api.nvim_win_get_tabpage(target)
+  if panel_shown() then
+    if api.nvim_win_get_tabpage(S.panel.win) == tab then
+      return
+    end
+    pcall(api.nvim_win_close, S.panel.win, true)
   end
+  S.panel.win = nil
   local buf = ensure_panel_buf()
-  local origin = api.nvim_get_current_win()
-  local target = tour_win()
-  if target ~= origin then
-    api.nvim_set_current_win(target)
-  end
   local width = math.max(40, math.min(70, math.floor(vim.o.columns * 0.3)))
-  local win = api.nvim_open_win(buf, false, { split = "right", win = -1, width = width })
+  local win
+  api.nvim_win_call(target, function()
+    win = api.nvim_open_win(buf, false, { split = "right", win = -1, width = width })
+  end)
   S.panel.win = win
   local wo = vim.wo[win]
   wo.winfixwidth = true
@@ -410,24 +552,7 @@ local function panel_open()
   wo.cursorline = true
   wo.foldenable = false
   wo.list = false
-  local function map(lhs, fn)
-    vim.keymap.set("n", lhs, fn, { buffer = buf, nowait = true, silent = true })
-  end
-  map("<CR>", function()
-    local n = S.panel.line_map[api.nvim_win_get_cursor(0)[1]]
-    if n then
-      local ok, res = pcall(step_goto, n)
-      if not ok then
-        notify(type(res) == "table" and res.msg or tostring(res), vim.log.levels.WARN)
-      end
-    end
-  end)
-  map("q", function()
-    panel_close(true)
-  end)
-  if valid_win(origin) then
-    api.nvim_set_current_win(origin)
-  end
+  map_panel_keys(buf)
   render_panel()
 end
 
@@ -570,8 +695,9 @@ end
 local dispatch -- forward declaration
 
 local function key_actions()
+  -- Resolved through _G at call time, so the keys keep working after a runtime upgrade.
   local function run(cmd, args)
-    local res = dispatch(cmd, args or {})
+    local res = _G.nvtour.dispatch(cmd, args or {})
     if not res.ok then
       notify(res.error, vim.log.levels.WARN)
     elseif res.message then
@@ -584,6 +710,12 @@ local function key_actions()
     end,
     prev = function()
       run("prev")
+    end,
+    first = function()
+      run("first")
+    end,
+    last = function()
+      run("last")
     end,
     panel = function()
       run("panel", { toggle = true })
@@ -612,9 +744,15 @@ local function install_keymaps()
       if vim.fn.maparg(lhs, "n") == "" then
         vim.keymap.set("n", lhs, fn, { desc = "nvtour " .. name })
         S.keymaps[lhs] = true
-      elseif not S.warned[lhs] then
-        S.warned[lhs] = true
-        notify("nvtour: key " .. lhs .. " is already mapped; skipping '" .. name .. "'", vim.log.levels.WARN)
+      else
+        local msg = "key " .. lhs .. " is already mapped; skipping '" .. name .. "'"
+        if not S.warned[lhs] then
+          S.warned[lhs] = true
+          notify("nvtour: " .. msg, vim.log.levels.WARN)
+        end
+        if W then
+          W[#W + 1] = msg
+        end
       end
     end
   end
@@ -685,7 +823,8 @@ local function reset(keep_panel)
     S.panel.line_map = {}
   end
   for _, b in ipairs(api.nvim_list_bufs()) do
-    if valid_buf(b) and api.nvim_buf_get_name(b):match("^nvtour://") then
+    local keep = keep_panel and b == S.panel.buf
+    if not keep and valid_buf(b) and api.nvim_buf_get_name(b):match("^nvtour://") then
       pcall(api.nvim_buf_delete, b, { force = true })
     end
   end
@@ -720,15 +859,13 @@ local function step_result(step, extra)
 end
 
 local function jump(step)
-  local win = tour_win()
-  if api.nvim_get_current_win() ~= win then
-    api.nvim_set_current_win(win)
-  end
   if not valid_buf(step.buf) or not api.nvim_buf_is_loaded(step.buf) then
     step.buf = load_buf(step.file)
-    render_step(step, win)
+    render_step(step, tour_win(step.buf))
   end
-  show_buf(win, step.buf)
+  local win = show_buf(tour_win(step.buf, true), step.buf)
+  S.tour_win = win
+  enter_win(win)
   api.nvim_win_set_cursor(win, { step.l1, 0 })
   api.nvim_win_call(win, function()
     vim.cmd("normal! zv")
@@ -786,6 +923,11 @@ H.step = function(a)
   end
   ensure_started()
   local steps = S.tour.steps
+  -- Only the first step of a tour moves the view, so a finished tour starts at step 1.
+  local do_jump = a.jump or (#steps == 0 and not a.no_jump)
+  if #steps == 0 and vim.g.nvtour_auto_panel ~= false and not S.panel.user_closed then
+    panel_open() -- before rendering, so the first note is wrapped to the final window width
+  end
   local step = {
     n = #steps + 1,
     file = a.file,
@@ -797,20 +939,32 @@ H.step = function(a)
     note = a.note,
     extmark_ids = {},
   }
-  steps[#steps + 1] = step
-  render_step(step, tour_win())
-  if not a.no_jump then
-    jump(step)
+  -- The step is added only after it rendered (and jumped); a failure leaves no half step behind.
+  local prev_current = S.tour.current
+  local ok, err = pcall(function()
+    render_step(step, tour_win(buf))
+    if do_jump then
+      jump(step)
+    end
+  end)
+  if not ok then
+    for _, id in ipairs(step.extmark_ids) do
+      pcall(api.nvim_buf_del_extmark, step.buf, S.ns_steps, id)
+    end
+    S.tour.current = prev_current
+    error(err, 0)
   end
-  update_qf(a.no_jump and nil or step.n)
-  if #steps == 1 and vim.g.nvtour_auto_panel ~= false and not S.panel.user_closed then
-    panel_open()
+  steps[#steps + 1] = step
+  if do_jump then
+    update_qf(step.n)
+  else
+    update_qf()
   end
   render_panel()
-  if not a.no_jump then
+  if do_jump then
     announce(step)
   end
-  return step_result(step)
+  return step_result(step, { jumped = do_jump and true or false })
 end
 
 H["goto"] = function(a)
@@ -827,11 +981,21 @@ end
 
 H.prev = function()
   local n = S.tour.current
-  if #S.tour.steps > 0 and n <= 1 then
-    local step = S.tour.steps[math.max(n, 1)]
-    return step_result(step, { message = "already at first step" })
+  if n == 0 then
+    return step_goto(1)
+  end
+  if n == 1 and #S.tour.steps > 0 then
+    return step_result(S.tour.steps[1], { message = "already at first step" })
   end
   return step_goto(n - 1)
+end
+
+H.first = function()
+  return step_goto(1)
+end
+
+H.last = function()
+  return step_goto(#S.tour.steps)
 end
 
 ---------------------------------------------------------------------------
@@ -855,34 +1019,48 @@ H.focus = function(a)
   unfocus_buf(buf)
   local merged = merge_ranges(ranges, a.context or 2, count)
   S.focus[buf] = { ranges = merged, dim = a.dim and true or false, file = a.file }
-  local win = tour_win()
-  if api.nvim_get_current_win() ~= win then
-    api.nvim_set_current_win(win)
+  -- Before the first step focus shows the file; during a tour the view stays on the current step
+  -- and folds are applied when the file is shown (by a step or by the user).
+  local move = S.tour.current == 0
+  local win = tour_win(buf, move)
+  if move then
+    win = show_buf(win, buf)
+    S.tour_win = win
+    enter_win(win)
   end
-  show_buf(win, buf)
+  local shown = win ~= nil and api.nvim_win_get_buf(win) == buf
   if a.dim then
     for _, g in ipairs(gaps_of(merged, count)) do
       for l = g[1], g[2] do
         api.nvim_buf_set_extmark(buf, S.ns_focus, l - 1, 0, { end_row = l, end_col = 0, hl_group = "NvtourDim", hl_eol = true, priority = 200 })
       end
     end
-  else
+  elseif shown then
     apply_folds(buf, win)
   end
-  api.nvim_win_set_cursor(win, { merged[1][1], 0 })
-  api.nvim_win_call(win, function()
-    vim.cmd("normal! zv")
-  end)
-  return { ok = true, file = a.file, ranges = merged, mode = a.dim and "dim" or "fold" }
+  if move then
+    api.nvim_win_set_cursor(win, { merged[1][1], 0 })
+    api.nvim_win_call(win, function()
+      vim.cmd("normal! zv")
+    end)
+  end
+  return {
+    ok = true,
+    file = a.file,
+    ranges = merged,
+    mode = a.dim and "dim" or "fold",
+    deferred = (not a.dim and not shown) or nil,
+  }
 end
 
 H.unfocus = function(a)
   local n = 0
   if a.file then
-    local buf = vim.fn.bufnr(a.file)
-    if buf ~= -1 and S.focus[buf] then
-      unfocus_buf(buf)
-      n = 1
+    for buf, f in pairs(S.focus) do
+      if f.file == a.file then
+        unfocus_buf(buf)
+        n = n + 1
+      end
     end
   else
     for buf in pairs(S.focus) do
@@ -898,15 +1076,15 @@ end
 ---------------------------------------------------------------------------
 
 local function unique_name(base, buf)
-  local name, i = base, 1
-  while true do
-    local ok = pcall(api.nvim_buf_set_name, buf, name)
-    if ok then
+  local name = base
+  for i = 2, 1000 do
+    if vim.fn.bufexists(name) == 0 then
+      api.nvim_buf_set_name(buf, name)
       return name
     end
-    i = i + 1
     name = base .. "#" .. i
   end
+  fail("too many nvtour diff buffers named " .. base, 5)
 end
 
 H.diff = function(a)
@@ -973,7 +1151,7 @@ H.panel = function(a)
   ensure_panel_buf()
   local status
   if a.toggle then
-    if valid_win(S.panel.win) then
+    if panel_shown() then
       panel_close(true)
       status = "hidden"
     else
@@ -995,34 +1173,83 @@ H.clear = function()
   return { ok = true }
 end
 
+local MAX_SEL_LINES, MAX_SEL_BYTES = 200, 65536
+local SEL_KIND = { v = "char", V = "line", ["\22"] = "block" }
+
 H.where = function()
-  local win = api.nvim_get_current_win()
+  local cur = api.nvim_get_current_win()
+  local win = cur
+  if not file_win(cur) then
+    -- The user is in a terminal, the panel or a special window: report the file window instead.
+    local prev = vim.fn.win_getid(vim.fn.winnr("#"))
+    win = (prev ~= 0 and file_win(prev) and prev) or tour_win() or cur
+  end
   local buf = api.nvim_win_get_buf(win)
-  local pos = api.nvim_win_get_cursor(win)
   local mode = api.nvim_get_mode().mode
+  local live = win == cur and SEL_KIND[mode] ~= nil
   local res = {
     ok = true,
     file = api.nvim_buf_get_name(buf),
-    line = pos[1],
-    col = pos[2] + 1,
+    bufnr = buf,
+    winid = win,
+    current_window = win == cur,
+    buftype = vim.bo[buf].buftype,
+    filetype = vim.bo[buf].filetype,
+    modified = vim.bo[buf].modified,
+    changedtick = vim.b[buf].changedtick,
     mode = mode,
-    top = vim.fn.line("w0"),
-    bottom = vim.fn.line("w$"),
-    cwd = vim.fn.getcwd(0),
   }
-  local s, e
-  if mode == "v" or mode == "V" or mode == "\22" then
-    s, e = vim.fn.getpos("v")[2], vim.fn.getpos(".")[2]
-  else
-    s, e = vim.fn.getpos("'<")[2], vim.fn.getpos("'>")[2]
-  end
-  if s and s > 0 and e and e > 0 then
-    if s > e then
-      s, e = e, s
+  api.nvim_win_call(win, function()
+    local pos = api.nvim_win_get_cursor(win)
+    res.line, res.col = pos[1], pos[2] + 1
+    res.top, res.bottom = vim.fn.line("w0"), vim.fn.line("w$")
+    res.cwd = vim.fn.getcwd(0)
+    local p1, p2, kind
+    if live then
+      p1, p2, kind = vim.fn.getpos("v"), vim.fn.getpos("."), mode
+    else
+      p1, p2, kind = vim.fn.getpos("'<"), vim.fn.getpos("'>"), vim.fn.visualmode()
     end
-    local last = math.min(e, s + 199, api.nvim_buf_line_count(buf))
-    res.selection = { l1 = s, l2 = e, text = api.nvim_buf_get_lines(buf, s - 1, last, false) }
-  end
+    if not SEL_KIND[kind] or p1[2] < 1 or p2[2] < 1 then
+      return
+    end
+    local l1, l2 = math.min(p1[2], p2[2]), math.max(p1[2], p2[2])
+    local c1, c2
+    if kind == "\22" then
+      c1, c2 = math.min(p1[3], p2[3]), math.max(p1[3], p2[3])
+    elseif kind == "v" then
+      local a, b = p1, p2
+      if p1[2] > p2[2] or (p1[2] == p2[2] and p1[3] > p2[3]) then
+        a, b = p2, p1
+      end
+      c1, c2 = a[3], b[3]
+    end
+    local text
+    if kind ~= "V" then
+      local ok, region = pcall(vim.fn.getregion, p1, p2, { type = kind })
+      text = ok and region or nil
+    end
+    text = text or api.nvim_buf_get_lines(buf, l1 - 1, math.min(l2, l1 + MAX_SEL_LINES), false)
+    local out, bytes, truncated = {}, 0, false
+    for i, line in ipairs(text) do
+      if i > MAX_SEL_LINES or bytes + #line > MAX_SEL_BYTES then
+        truncated = true
+        break
+      end
+      out[#out + 1] = line
+      bytes = bytes + #line + 1
+    end
+    res.selection = {
+      live = live,
+      kind = SEL_KIND[kind],
+      l1 = l1,
+      l2 = l2,
+      c1 = c1,
+      c2 = c2,
+      text = out,
+      truncated = truncated or (#text < l2 - l1 + 1),
+    }
+  end)
   return res
 end
 
@@ -1035,13 +1262,20 @@ dispatch = function(cmd, args)
   if not h then
     return { ok = false, error = "unknown command: " .. tostring(cmd), code = 2, pid = vim.fn.getpid() }
   end
+  local outer = W
+  W = {}
   local ok, res = pcall(h, args or {})
+  local warnings = W
+  W = outer
   if not ok then
     if type(res) == "table" and res.nvtour then
       res = { ok = false, error = res.msg, code = res.code }
     else
       res = { ok = false, error = tostring(res), code = 5 }
     end
+  end
+  if #warnings > 0 then
+    res.warnings = warnings
   end
   res.pid = vim.fn.getpid()
   return res
@@ -1069,6 +1303,12 @@ end)
 ucmd("NvtourPrev", function()
   return dispatch("prev", {})
 end)
+ucmd("NvtourFirst", function()
+  return dispatch("first", {})
+end)
+ucmd("NvtourLast", function()
+  return dispatch("last", {})
+end)
 ucmd("NvtourGoto", function(o)
   return dispatch("goto", { n = tonumber(o.args) or 0 })
 end, { nargs = 1 })
@@ -1078,6 +1318,17 @@ end)
 ucmd("NvtourClear", function()
   return dispatch("clear", {})
 end)
+
+-- After an upgrade during a tour, re-install the keys so new or renamed actions appear.
+if PREV_VERSION ~= nil and PREV_VERSION ~= M.VERSION then
+  if S.keymaps_installed then
+    remove_keymaps()
+    install_keymaps()
+  end
+  if valid_buf(S.panel.buf) then
+    map_panel_keys(S.panel.buf)
+  end
+end
 
 _G.nvtour = M
 return M

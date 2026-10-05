@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import threading
+from functools import cache
 from importlib import resources
 from typing import Any, Callable
 
-from . import LUA_VERSION
 from .errors import EXIT_RPC, NvtourError
 
 HINT = "nvim may be waiting at a prompt; press <Enter> in nvim"
@@ -36,9 +37,15 @@ def run_with_timeout(fn: Callable[[], Any], timeout: float) -> Any:
     return box.get("value")
 
 
+@cache
 def lua_source() -> str:
     """Return the packaged Lua runtime source."""
     return resources.files("nvtour").joinpath("lua/nvtour.lua").read_text(encoding="utf-8")
+
+
+def lua_version() -> str:
+    """Version of the packaged runtime: a hash of its source, so any edit reloads it in nvim."""
+    return hashlib.sha1(lua_source().encode()).hexdigest()[:12]
 
 
 class Client:
@@ -60,7 +67,10 @@ class Client:
             raise NvtourError(EXIT_RPC, f"RPC failure on {self.socket}: {exc}; {HINT}") from exc
 
     def connect(self) -> "Client":
-        import pynvim
+        try:
+            import pynvim
+        except ImportError:
+            raise NvtourError(EXIT_RPC, "pynvim is not installed; install with: pip install pynvim") from None
 
         self.nvim = self._guard(lambda: pynvim.attach("socket", path=self.socket))
         return self
@@ -75,9 +85,11 @@ class Client:
 
     def ensure_lua_loaded(self) -> None:
         """Send the Lua runtime when it is missing or has a different version."""
-        if self.loaded_version() != LUA_VERSION:
-            # Wrap the runtime so the chunk returns a plain string, not the module table.
-            self.exec_lua("local m = (function()\n" + lua_source() + "\nend)()\nreturn m.VERSION")
+        version = lua_version()
+        if self.loaded_version() != version:
+            # Wrap the runtime so the chunk returns a plain string, not the module table; the version
+            # is passed as the chunk's first vararg.
+            self.exec_lua("local m = (function(...)\n" + lua_source() + "\nend)(...)\nreturn m.VERSION", version)
 
     def call(self, cmd: str, args: dict[str, Any] | None = None) -> dict[str, Any]:
         """Dispatch one command and return the result table."""

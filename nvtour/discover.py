@@ -5,14 +5,15 @@ from __future__ import annotations
 import getpass
 import glob
 import hashlib
+import json
 import os
 import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
-from .client import Client
-from .errors import EXIT_NO_MATCH, EXIT_NO_NVIM, NvtourError
+from .client import HINT, Client
+from .errors import EXIT_NO_MATCH, EXIT_NO_NVIM, EXIT_RPC, NvtourError
 
 PROBE_LUA = """
 local bufs = {}
@@ -139,6 +140,18 @@ def inspect_all(workspace: str, env: Mapping[str, str], timeout: float = 2.0) ->
     return out
 
 
+def inspect_socket(path: str, workspace: str, timeout: float = 2.0) -> Instance:
+    """Probe one explicitly given socket; raise exit 5 when it does not answer."""
+    info = probe(path, timeout)
+    if info is None:
+        raise NvtourError(EXIT_RPC, f"cannot connect to {path}; {HINT}")
+    cwd = str(info.get("cwd", ""))
+    bufs = [str(b) for b in info.get("buffers", [])]
+    score, kind = score_instance(cwd, workspace, bufs)
+    ver = ".".join(str(x) for x in info.get("version", []))
+    return Instance(path, int(info.get("pid", 0)), "live", cwd, bufs, int(info.get("tabpages", 0)), ver, score, kind or "manual")
+
+
 def format_instances(instances: list[Instance]) -> str:
     """One line per instance: ``pid  state  score  cwd (#buffers)``."""
     lines = []
@@ -178,21 +191,34 @@ def pin_path(workspace: str, env: Mapping[str, str]) -> Path:
     return base / digest
 
 
-def write_pin(workspace: str, socket: str, env: Mapping[str, str]) -> None:
-    """Remember ``socket`` for ``workspace``."""
+def write_pin(workspace: str, socket: str, env: Mapping[str, str], pid: int | None = None) -> None:
+    """Remember ``socket`` for ``workspace`` (atomically).
+
+    The pid is stored only when it is visible here: a socket with a custom name, or one that belongs
+    to an nvim in another pid namespace (a container), is then checked by existence alone.
+    """
+    if pid is None:
+        pid = pid_of(socket)
     p = pin_path(workspace, env)
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(socket)
+    tmp = p.with_name(f"{p.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps({"socket": socket, "pid": pid if pid_alive(pid) else None}))
+    os.replace(tmp, p)
 
 
 def read_pin(workspace: str, env: Mapping[str, str]) -> str | None:
     """Return the pinned socket if it is still alive; otherwise drop the stale pin."""
     p = pin_path(workspace, env)
     try:
-        sock = p.read_text().strip()
+        raw = p.read_text().strip()
     except OSError:
         return None
-    if sock and os.path.exists(sock) and pid_alive(pid_of(sock)):
+    try:
+        data = json.loads(raw)
+        sock, pid = str(data.get("socket") or ""), data.get("pid")
+    except (ValueError, AttributeError):  # plain-text pin written by nvtour 0.1
+        sock, pid = raw, pid_of(raw)
+    if sock and os.path.exists(sock) and (pid is None or pid_alive(int(pid))):
         return sock
     clear_pin(workspace, env)
     return None

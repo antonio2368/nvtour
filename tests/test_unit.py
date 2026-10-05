@@ -70,6 +70,39 @@ def test_dead_pin_is_removed(tmp_path):
     assert not discover.pin_path(W, env).exists()
 
 
+def test_custom_socket_pin_survives(tmp_path):
+    env = {"XDG_RUNTIME_DIR": str(tmp_path)}
+    sock = tmp_path / "custom.sock"
+    sock.write_text("")
+    discover.write_pin(W, str(sock), env, pid=999999999)  # pid not visible here: checked by existence
+    assert discover.read_pin(W, env) == str(sock)
+    sock.unlink()
+    assert discover.read_pin(W, env) is None
+
+
+def test_plain_text_pin_from_older_version(tmp_path):
+    import os
+
+    env = {"XDG_RUNTIME_DIR": str(tmp_path)}
+    sock = tmp_path / f"nvim.{os.getpid()}.0"
+    sock.write_text("")
+    p = discover.pin_path(W, env)
+    p.parent.mkdir(parents=True)
+    p.write_text(str(sock))
+    assert discover.read_pin(W, env) == str(sock)
+
+
+def test_stdin_on_a_terminal_is_refused(monkeypatch):
+    class Tty:
+        def isatty(self):
+            return True
+
+    monkeypatch.setattr("sys.stdin", Tty())
+    with pytest.raises(NvtourError) as e:
+        cli.read_text_arg("-", "--note -")
+    assert e.value.code == 2
+
+
 def test_socket_precedence(tmp_path):
     import os
 

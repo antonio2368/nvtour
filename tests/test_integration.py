@@ -58,14 +58,18 @@ def test_wrapped_note_uses_border_prefixes(cli, nv):
     assert vl[0][0][0].startswith("╭") and vl[-1][0][0].startswith("╰")
 
 
+def current(nv):
+    return nv.exec_lua("return _G.nvtour.state.tour.current")
+
+
 def test_nav_and_quickfix(cli, nv):
     ok(cli("start", "Nav"))
     ok(cli("step", "a.txt:3-4", "--role", "fault", "--label", "first"))
     ok(cli("step", "b.txt:9", "--role", "fix", "--note", "fix note"))
-    assert nv.exec_lua("return _G.nvtour.state.tour.current") == 2
-    assert ok(cli("prev")).strip() == "step 1/2: a.txt:3-4 [fault] first"
-    assert nv.exec_lua("return _G.nvtour.state.tour.current") == 1
+    assert current(nv) == 1
     assert "already at first step" in ok(cli("prev"))
+    assert ok(cli("next")).strip() == "step 2/2: b.txt:9 [fix]"
+    assert ok(cli("prev")).strip() == "step 1/2: a.txt:3-4 [fault] first"
     ok(cli("goto", "2"))
     assert nv.exec_lua("return _G.nvtour.state.tour.current") == 2
     assert nv.current.buffer.name.endswith("b.txt") and nv.current.window.cursor[0] == 9
@@ -92,7 +96,7 @@ def test_panel_content_and_mappings(cli, nv):
     assert "# Panel title" in text
     assert "alpha step" in text and "beta step" in text and "a.txt:3-4" in text
     assert "free text here" in text and "---" in text
-    assert "▶ 2." in text
+    assert "▶ 1." in text
     maps = nv.api.buf_get_keymap(pb.handle, "n")
     assert "<CR>" in [m["lhs"] for m in maps]
     assert "q" in [m["lhs"] for m in maps]
@@ -182,7 +186,7 @@ def test_clear_removes_everything(cli, nv):
         for name in ("nvtour_steps", "nvtour_focus"):
             assert ns_marks(nv, name, b.handle) == []
     assert len(nv.tabpages) == tabs
-    for lhs in ("]w", "[w"):
+    for lhs in ("]w", "[w", "]W", "[W"):
         assert nv.eval(f"maparg('{lhs}', 'n')") == ""
     assert nv.eval("maparg('<leader>wp', 'n')") == ""
 
@@ -208,8 +212,182 @@ def test_step_no_jump_and_idempotent_window(cli, nv):
     ok(cli("step", "a.txt:8-9", "--no-jump", "--label", "later"))
     assert len(nv.windows) == wins
     assert nv.current.window.cursor[0] == 3
-    ok(cli("step", "a.txt:10"))
+    assert nv.call("getqflist", {"idx": 0})["idx"] == 1
+    ok(cli("step", "a.txt:10", "--jump"))
     assert len(nv.windows) == wins
+    assert nv.current.window.cursor[0] == 10 and current(nv) == 3
+    assert nv.call("getqflist", {"idx": 0})["idx"] == 3
+
+
+def test_tour_stays_on_first_step_and_first_last_keys(cli, nv):
+    ok(cli("start", "Order"))
+    ok(cli("step", "a.txt:3", "--label", "one"))
+    data = json.loads(ok(cli("--json", "step", "b.txt:9", "--label", "two")))
+    assert data["jumped"] is False
+    ok(cli("step", "a.txt:20", "--label", "three"))
+    assert current(nv) == 1
+    assert nv.current.buffer.name.endswith("a.txt") and nv.current.window.cursor[0] == 3
+    assert nv.call("getqflist", {"idx": 0})["idx"] == 1
+    assert nv.eval("maparg('[W', 'n')") != "" and nv.eval("maparg(']W', 'n')") != ""
+    nv.command("normal ]W")
+    assert current(nv) == 3 and nv.current.window.cursor[0] == 20
+    nv.command("normal [W")
+    assert current(nv) == 1 and nv.current.window.cursor[0] == 3
+    nv.command("NvtourLast")
+    assert current(nv) == 3
+    nv.command("NvtourFirst")
+    assert current(nv) == 1
+    assert ok(cli("last")).strip() == "step 3/3: a.txt:20 [info] three"
+    assert ok(cli("first")).strip() == "step 1/3: a.txt:3 [info] one"
+    ok(cli("clear"))
+    assert nv.eval("maparg('[W', 'n')") == "" and nv.eval("maparg(']W', 'n')") == ""
+    assert cli("first").returncode == 6
+
+
+def test_prev_before_first_jump_goes_to_step_1(cli, nv):
+    ok(cli("start", "P"))
+    ok(cli("step", "a.txt:4", "--no-jump"))
+    assert current(nv) == 0
+    assert ok(cli("prev")).startswith("step 1/1")
+    assert current(nv) == 1
+
+
+def test_modified_unhideable_buffer_is_never_replaced(cli, nv, sandbox):
+    nv.command("set autowrite")
+    try:
+        nv.command("edit b.txt")
+        nv.command("setlocal bufhidden=unload")
+        nv.current.buffer[0] = "changed in nvim"
+        b = nv.current.buffer
+        win = nv.current.window
+        r = cli("step", "a.txt:3")
+        ok(r)
+        assert "kept modified buffer" in r.stderr
+        assert win.buffer.handle == b.handle
+        assert any(w.buffer.name.endswith("a.txt") for w in nv.windows)
+        assert nv.api.get_option_value("modified", {"buf": b.handle}) is True
+        assert b[0] == "changed in nvim"
+        assert (sandbox.ws / "b.txt").read_text().startswith("line 1 of b")
+        assert any(w.buffer.handle == b.handle for w in nv.windows)
+    finally:
+        nv.command("set noautowrite")
+
+
+def test_failed_jump_adds_no_step(cli, nv):
+    ok(cli("start", "F"))
+    nv.command("call bufload(bufadd('a.txt'))")  # loaded already: only the jump runs BufWinEnter
+    nv.command("autocmd BufWinEnter a.txt lua error('boom from user autocmd')")
+    try:
+        r = cli("step", "a.txt:3", "--label", "x")
+        assert r.returncode == 5 and "boom" in r.stderr
+        assert nv.exec_lua("return #_G.nvtour.state.tour.steps") == 0
+        buf = find_buf(nv, "a.txt")
+        assert ns_marks(nv, "nvtour_steps", buf.handle) == []
+    finally:
+        nv.command("autocmd! BufWinEnter a.txt")
+    assert ok(cli("step", "a.txt:3")).startswith("step 1/1")
+
+
+def test_terminal_window_is_left_alone(cli, nv):
+    nv.command("edit b.txt")
+    nv.command("botright split | terminal")
+    term = nv.current.window
+    term_buf = term.buffer.handle
+    assert nv.api.get_option_value("buftype", {"buf": term_buf}) == "terminal"
+    ok(cli("start", "Term"))
+    ok(cli("step", "a.txt:6"))
+    assert term.buffer.handle == term_buf
+    assert nv.current.window.handle == term.handle  # the terminal keeps the focus
+    shown = [w for w in nv.windows if w.buffer.name.endswith("a.txt")]
+    assert shown and shown[0].cursor[0] == 6
+    data = json.loads(ok(cli("--json", "where")))
+    assert data["file"].endswith("a.txt") and data["current_window"] is False
+    nv.command("bwipeout! " + str(term_buf))
+
+
+def test_unfocus_restores_only_the_focused_buffer(cli, nv):
+    nv.command("edit a.txt")
+    win = nv.current.window
+    before = nv.eval("&l:foldmethod")
+    ok(cli("focus", "a.txt:20-22"))
+    nv.command("edit b.txt")
+    nv.command("setlocal foldmethod=indent")
+    ok(cli("unfocus"))
+    assert nv.current.window.handle == win.handle
+    assert nv.eval("&l:foldmethod") == "indent"
+    nv.command("buffer a.txt")
+    assert nv.eval("&l:foldmethod") == before
+    assert nv.eval("foldclosed(5)") == -1
+
+
+def test_focus_during_tour_keeps_the_view(cli, nv):
+    ok(cli("start", "Keep"))
+    ok(cli("step", "a.txt:3"))
+    out = ok(cli("focus", "b.txt:5-6"))
+    assert "applied when the file is shown" in out
+    assert nv.current.buffer.name.endswith("a.txt") and nv.current.window.cursor[0] == 3
+    ok(cli("step", "b.txt:5", "--jump"))
+    assert nv.current.buffer.name.endswith("b.txt")
+    assert nv.eval("foldclosed(20)") != -1 and nv.eval("foldclosed(5)") == -1
+
+
+def test_start_keeps_open_panel(cli, nv):
+    ok(cli("start", "One"))
+    ok(cli("step", "a.txt:3"))
+    pb = find_buf(nv, "nvtour://panel")
+    assert any(w.buffer.handle == pb.handle for w in nv.windows)
+    ok(cli("start", "Two"))
+    pb2 = find_buf(nv, "nvtour://panel")
+    assert pb2 is not None and pb2.handle == pb.handle
+    assert any(w.buffer.handle == pb.handle for w in nv.windows)
+    assert "# Two" in "\n".join(lines_of(nv, pb.handle))
+
+
+def test_unfocus_by_name_with_glob_characters(cli, nv, sandbox):
+    f = sandbox.ws / "br[1].txt"
+    f.write_text("".join(f"x {i}\n" for i in range(1, 31)))
+    try:
+        ok(cli("focus", "br[1].txt:10-11", "--dim"))
+        assert ok(cli("unfocus", "br[1].txt")).strip() == "unfocused 1 buffer(s)"
+    finally:
+        f.unlink()
+
+
+def test_where_blockwise_selection(cli, nv):
+    nv.command("edit b.txt")
+    nv.command("normal! 2G5l\x16j2l\x1b")
+    data = json.loads(ok(cli("--json", "where")))
+    sel = data["selection"]
+    assert sel["kind"] == "block" and sel["live"] is False
+    assert (sel["l1"], sel["l2"], sel["c1"], sel["c2"]) == (2, 3, 6, 8)
+    assert sel["text"] == ["2 o", "3 o"]
+    assert "previous, may be old" in ok(cli("where"))
+
+
+def test_cli_validation_and_json_errors(cli, tmp_path):
+    assert cli("--timeout", "0", "where").returncode == 2
+    assert cli("--timeout", "nan", "where").returncode == 2
+    assert cli("focus", "a.txt:3", "--context", "-1").returncode == 2
+    r = cli("--json", "step", "missing.txt:1")
+    assert r.returncode == 6
+    data = json.loads(r.stdout)
+    assert data == {"ok": False, "code": 6, "error": data["error"]} and "missing.txt" in data["error"]
+    r = cli("--json", "step")
+    assert r.returncode == 2 and json.loads(r.stdout)["code"] == 2
+    r = cli("panel", "--file", str(tmp_path / "nope.md"))
+    assert r.returncode == 6 and "Traceback" not in r.stderr
+    r = cli("where", socket=False, env_extra={"NVTOUR_SOCKET": ""})  # discovery still works
+    assert r.returncode in (0, 3)
+    r = cli("--socket", str(tmp_path / "missing.sock"), "where", socket=False)
+    assert r.returncode == 4 and "socket not found" in r.stderr
+
+
+def test_attach_requires_a_live_socket(cli, sandbox, tmp_path):
+    dead = tmp_path / "custom.sock"
+    dead.write_text("")
+    r = cli("--workspace", str(sandbox.ws), "attach", str(dead), socket=False)
+    assert r.returncode == 5
+    assert "cannot connect" in r.stderr
 
 
 def test_bad_inputs_exit_6(cli):
