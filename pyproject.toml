@@ -1,0 +1,26 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nvtour"
+version = "0.1.0"
+description = "Read-only guided code walkthroughs inside a running Neovim, driven by AI agents"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = ["pynvim>=0.5"]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.scripts]
+nvtour = "nvtour.cli:main"
+
+[tool.setuptools]
+packages = ["nvtour"]
+
+[tool.setuptools.package-data]
+nvtour = ["lua/*.lua"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
