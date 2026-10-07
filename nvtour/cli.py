@@ -57,6 +57,13 @@ def non_negative_int(text: str) -> int:
     return value
 
 
+def positive_int(text: str) -> int:
+    value = non_negative_int(text)
+    if value == 0:
+        raise argparse.ArgumentTypeError(f"must be positive: {text!r}")
+    return value
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the argparse parser (global flags are accepted before or after the subcommand)."""
     sup = argparse.SUPPRESS
@@ -97,6 +104,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--label")
     p.add_argument("--role", choices=ROLES, default="info")
     p.add_argument("--expect", metavar="TEXT", help="fail (exit 6) unless TEXT occurs in the range; TEXT is underlined in the current step")
+    p.add_argument("--via", metavar="TEXT", help="why the tour goes to this step from the step before it (or from --from N)")
+    p.add_argument("--from", dest="from_", type=positive_int, metavar="N", help="the link (--via) comes from step N, not from the step before")
     p.add_argument("--at", type=int, metavar="N", help="insert as step N instead of appending")
     g = p.add_mutually_exclusive_group()
     g.add_argument("--jump", action="store_true", help="jump to this step even if it is not the first")
@@ -110,6 +119,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--label", help="new label, '' to remove")
     p.add_argument("--role", choices=ROLES)
     p.add_argument("--expect", metavar="TEXT", help="fail (exit 6) unless TEXT occurs in the range; TEXT is underlined in the current step ('' removes it)")
+    p.add_argument("--via", metavar="TEXT", help="new link text, '' to remove")
+    p.add_argument("--from", dest="from_", type=non_negative_int, metavar="N", help="the link comes from step N (0: the step before it)")
     p.add_argument("--jump", action="store_true", help="jump to the step")
 
     p = cmd("remove", "remove step N")
@@ -244,11 +255,12 @@ def build_request(args: argparse.Namespace, workspace: str) -> tuple[str, dict[s
         return "start", {**base, "title": args.title or None}
     if c == "step":
         return "step", {**base, **location(args.spec, args.ref), "note": read_text_arg(args.note, "--note -"),
-                        "label": args.label, "role": args.role, "expect": args.expect, "at": args.at,
-                        "jump": args.jump or None, "no_jump": args.no_jump or None}
+                        "label": args.label, "role": args.role, "expect": args.expect, "via": args.via,
+                        "from": args.from_, "at": args.at, "jump": args.jump or None, "no_jump": args.no_jump or None}
     if c == "edit":
         req: dict[str, Any] = {**base, "n": args.n, "note": read_text_arg(args.note, "--note -"), "label": args.label,
-                               "role": args.role, "expect": args.expect, "jump": args.jump or None}
+                               "role": args.role, "expect": args.expect, "via": args.via, "from": args.from_,
+                               "jump": args.jump or None}
         if args.spec:
             req.update(location(args.spec, args.ref))
         elif args.ref is not None:
@@ -344,6 +356,10 @@ def format_status(res: dict[str, Any], workspace: str) -> str:
         mark = "▶" if s["n"] == res["current"] else " "
         label = f" {s['label']}" if s.get("label") else ""
         out.append(f"  {mark} {s['n']}. {fmt_loc(s, workspace)} [{s['role']}]{label}")
+        if s.get("via") or s.get("from"):
+            src = f"from {s['from']}" if s.get("from") else ""
+            via = " ".join((s.get("via") or "").split())
+            out.append(f"       ↓ {src}{': ' if src and via else ''}{via}")
     for f in res.get("focus") or []:
         rs = " ".join(fmt_range(a, b) for a, b in f["ranges"])
         out.append(f"focus: {display_path(f['file'], workspace)} {rs} ({f['mode']})")

@@ -139,9 +139,9 @@ nvtour attach [PID|SOCKET] [--clear]
 nvtour where
 nvtour start [TITLE]
 nvtour step FILE:L1[-L2] [--ref GITREF] [--note TEXT | --note -] [--label TEXT] [--role ROLE]
-            [--expect TEXT] [--at N] [--jump | --no-jump]
+            [--expect TEXT] [--via TEXT] [--from N] [--at N] [--jump | --no-jump]
 nvtour edit N [FILE:L1[-L2] [--ref GITREF]] [--note TEXT | --note -] [--label TEXT] [--role ROLE]
-            [--expect TEXT] [--jump]
+            [--expect TEXT] [--via TEXT] [--from N] [--jump]
 nvtour remove N
 nvtour goto N | nvtour next | nvtour prev | nvtour first | nvtour last
 nvtour status
@@ -181,7 +181,9 @@ more ranges; extra bare `L3-L4` arguments apply to the same file.
   reads the note from stdin (lets agents pass multi-line text with a heredoc). A step is added only
   after it rendered (and jumped); on an error nothing of it remains. `--ref GITREF` puts the step on
   the file as it is at that git ref, not on the working tree (§6, "Steps at a git ref"); the output
-  then shows the location as `file:L1-L2 @GITREF`.
+  then shows the location as `file:L1-L2 @GITREF`. `--via TEXT` is the link to the step: why the
+  tour goes there from the step before it, or from step N with `--from N` (§6, "Links between
+  steps"). `--from N` with a step number that does not exist is exit 6.
 - **edit / remove** — change or delete step N; all steps are renumbered and rendered again. A new
   location replaces the old one completely: `FILE:L1[-L2]` alone puts the step on the working tree,
   `FILE:L1[-L2] --ref GITREF` on that ref. `--ref` without a location is a usage error (exit 2).
@@ -229,8 +231,11 @@ M.state = {
 }
 ```
 
-Each step: `{ n, file, buf, l1, l2, role, label, note, expect, ref, sha, extmark_ids = {} }`. `ref` and
-`sha` are nil for a step on the working tree.
+Each step: `{ n, file, buf, l1, l2, role, label, note, expect, via, from, ref, sha, extmark_ids = {} }`.
+`ref` and `sha` are nil for a step on the working tree. `from` is the step table of a `--from N`
+link (not a number, so it stays correct when steps are inserted or removed); a link to a removed
+step falls back to the step before. `below` is the number of link lines below the range, and
+`drawn_win` the window that the band was computed for.
 
 ### Tour window
 
@@ -275,7 +280,8 @@ many lines is heavy, and `Diff*` groups are defined with `reverse` in many color
 `NvtourNumber<Role>`, `NvtourSign<Role>` and `NvtourLabel<Role>` use the accent as foreground and `NvtourMark<Role>` (bold, underlined in the accent; no `fg`, so the syntax colour
 stays) marks the `--expect` text. Also `NvtourNote`, `NvtourNoteCode` (fg of `@markup.raw` or
 `String`), `NvtourNoteBold`, `NvtourNoteCollapsed`, `NvtourNoteBorder`, `NvtourDim` (focus `--dim`),
-`NvtourFlash` and `NvtourPanelCurrent`, all blended from `Normal`, and `NvtourPanelFile` (→
+`NvtourFlash`, `NvtourPanelCurrent`, `NvtourVia` and `NvtourViaLoc` (blended from `Directory`), all
+blended from `Normal`, `NvtourVersion` (fg of `Special`, bold), `NvtourNoteBg` (the band), and `NvtourPanelFile` (→
 `Directory`), `NvtourPanelProgress` (→ `Comment`). A `User NvtourHighlights` autocmd runs after they
 are defined.
 
@@ -298,7 +304,8 @@ For a step at `l1..l2` in buffer `buf` (0-based rows internally):
    width − `textoff` (from `vim.fn.getwininfo`) − 4, minimum 30; words wider than that are split.
    Blank lines in the note are kept as `│`. Other steps: one virtual line `╶ <first line>`, in
    `NvtourNoteCollapsed`, with ` …` when the note is longer. Notes are wrapped again on
-   `WinResized`.
+   `WinResized`. For the current step, the link lines ("Links between steps" below) come before
+   the note in the same block, and the "next" line is a virtual line **below** `l2`.
 3. **Expect marks** (current step only) — every occurrence of `expect` in `l1..l2`:
    `hl_group = NvtourMark<Role>`, `priority = 150`.
 4. **Marker** — on `l1`, for every step: `virt_text = { {"  ← ", NvtourLabel<Role>}, {n,
@@ -306,13 +313,15 @@ For a step at `l1..l2` in buffer `buf` (0-based rows internally):
 5. **Jump** (first step of a tour, or `--jump`; never with `--no-jump`) — show the buffer in the
    tour window, set `tour.current = n`, re-render the old and the new current step, set the winbar,
    then scroll (in that window via `nvim_win_call`): cursor on `l1`, `normal! zv`, and
-   `winrestview({ topline, topfill })`. The block (the note and `l1..l2`, measured with
-   `nvim_win_text_height`, so virtual lines and wrapped lines count) is centred when it fits in the
+   `winrestview({ topline, topfill })`. The block (the note, `l1..l2` and the "next" line, measured
+   with `nvim_win_text_height`, so virtual lines and wrapped lines count; it counts the lines below
+   `l2` with the next row, so they are added) is centred when it fits in the
    window, else the note starts at the top line. `topfill` shows the virtual lines above the top
    line, so a note on line 1 is visible (`zz` hides it). The view never goes past the end of the
    file. Closed folds count as one row. Then the range flashes: one extmark in `nvtour_flash`
    (`hl_group = NvtourFlash`, `hl_eol`, `priority = 250`) removed after `vim.g.nvtour_flash` ms
-   (default 300; `0` = off).
+   (default 300; `0` = off). Before the buffer is shown, `normal! m'` in the tour window adds the
+   position before the jump to its jumplist, so `<C-o>` goes back to the previous step.
 6. **Winbar** — the tour window gets `setlocal winbar=%{%v:lua.nvtour.winbar()%}`, unless the window
    already has a winbar (the user's or a plugin's) or `vim.g.nvtour_winbar == false`. Text:
    ` nvtour 2/5 fault · <label>` and on the right `next ]w: <file>:<line> <label>` (only the line when
@@ -388,6 +397,50 @@ empty `state.refs`. A ref buffer that no step uses after `edit`/`remove` stays u
 working tree buffer). Language servers: most configurations do not attach to `nofile` buffers; one
 that does can show diagnostics for the old code.
 
+### Links between steps
+
+A jump to another file, or to another version of the same file, loses the "why" and the "where".
+The current step shows both:
+
+```
+← from 2 · a.cpp:412: `get()` calls `evict()` on a miss     ← the link: the source step and --via
+◇ b.cpp @origin/master (1a2b3c4d5e6f)                      ← where: the file and version, when changed
+╭ The cleanup thread erases the entry ...                   ← the note
+  88│   cache.erase(key);
+→ next 4 · c.cpp:10: the reader uses `it` again             ← below l2: where ]w goes, and why
+```
+
+- **Source.** The source of a step is the step given with `--from N`, else the step before it. The
+  "from" line is shown for a `--via` or a `--from` link, or when the buffer (the file, or its
+  version) is different from the step before it in the tour (the code the user saw last; also when
+  `--from` names another step). The location is `line N` in the same buffer, else `path:N` (with
+  ` @ref`, or ` · working tree` when the other step is the same file at a ref). `from N` has the colour
+  `NvtourSign<Role>` of the source step, the location `NvtourViaLoc`, the text `NvtourVia` (with
+  `` `code` `` and `**bold**` as in notes).
+- **Where.** The `◇` line is shown when the buffer is different from the step before: the file
+  name (`NvtourViaLoc`) and the version (`NvtourVersion`): ` @ref` for a step at a git ref, with the
+  first 12 characters of the commit in `()` when the ref is not itself that commit, or
+  ` · working tree` when the step before was at a git ref. The first step has no `◇` line.
+- **Next.** The "next" line is shown when the next step is in another buffer, or its `--via` link
+  comes from this step. It shows the `--via` text of that link, else the label of the next step.
+- Each link line is wrapped to the note width; continuation lines are indented by 2 cells.
+- Only the current step shows link lines. Adding, editing or removing a step renders all steps
+  again, so the steps next to it show the new links.
+
+### Band
+
+All virtual lines of a step (link lines, the note, the collapsed note) are a band, so they do not look
+like code. Each line has `NvtourNoteBg` (a light tint, blended from `Normal`) over the full window
+width: the chunks get `{ "NvtourNoteBg", group }` (so `NvtourNoteCode` keeps its own background), and
+blank padding goes to the window width. The lines start in the gutter (`virt_lines_leftcol`) with
+blank cells up to the code column (`textoff`), so the text is in the column of the code. In the
+current step the gutter has `▎` in `NvtourSign<Role>` in the column of the range bar, so one bar goes
+from the note through the range. The column is `textoff - number width - 1` (the second cell of a
+2-cell sign column before the numbers; the number width as in nvim: `max('numberwidth', digits + 1)`);
+there is no bar with a `'statuscolumn'`, `signcolumn=no` or `signcolumn=number`. The band needs a
+window: a step drawn without one gets only the tint on its text, and is drawn again on `BufWinEnter`
+in the window that shows its buffer.
+
 ## 7. Panel
 
 A scratch buffer `nvtour://panel` (`buftype = nofile`, `bufhidden = hide`, `swapfile = false`,
@@ -404,6 +457,7 @@ Rendered content:
 
 src/a.cpp                                               ← NvtourPanelFile
 ▶ 1. ✗ 412-415  dangling iterator
+    ↓ the cleanup thread erases the entry               ← --via of step 2: NvtourVia
 src/b.cpp
   2. → 88       erase on cleanup thread
 src/a.cpp
@@ -421,7 +475,9 @@ is highlighted with `NvtourSign<Role>`; marks: `✗` fault, `→` flow, `✓` fi
 A step without a label shows the first line of its note (markers removed, cut to 60 cells); the
 quickfix item text uses the same. Before the first jump the progress is `N step(s)`. The footer line
 lists only the keys that were installed; the keys are inline code so markdown does not read
-`[W first · ]W` as a link. `<CR>` on a file name line jumps to its first step. The panel opens in the tab of the tour
+`[W first · ]W` as a link. A step with a `--via` or `--from` link gets a line `↓ [from N: ]<via>`
+before it, and before its file name line, so a link to another file shows before the file changes.
+`<CR>` on a file name line or a link line jumps to the step after it. The panel opens in the tab of the tour
 window; a panel window left in another tab is closed first.
 
 Paths shown relative to `W` (passed from Python as `workspace`). The current step line gets an

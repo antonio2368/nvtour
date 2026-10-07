@@ -108,10 +108,14 @@ local function define_highlights(force)
   end
   local code = hl_attr("@markup.raw", "fg") or hl_attr("String", "fg") or fg
   set("NvtourNote", { fg = blend(fg, bg, 0.80), italic = true })
-  set("NvtourNoteCode", { fg = code, bg = blend(fg, bg, 0.08) })
+  set("NvtourNoteBg", { bg = blend(fg, bg, 0.07) }) -- the band behind all virtual lines of a step
+  set("NvtourNoteCode", { fg = code, bg = blend(fg, bg, 0.16) })
   set("NvtourNoteBold", { fg = fg, bold = true, italic = true })
   set("NvtourNoteCollapsed", { fg = blend(fg, bg, 0.50), italic = true })
   set("NvtourNoteBorder", { fg = blend(fg, bg, 0.40) })
+  set("NvtourVia", { fg = blend(fg, bg, 0.65) })
+  set("NvtourViaLoc", { fg = blend(hl_attr("Directory", "fg") or fg, bg, 0.85) })
+  set("NvtourVersion", { fg = hl_attr("Special", "fg") or fg, bold = true })
   set("NvtourDim", { fg = blend(fg, bg, 0.35) })
   set("NvtourFlash", { bg = blend(fg, bg, 0.25) })
   set("NvtourPanelCurrent", { bg = blend(fg, bg, 0.12), bold = true })
@@ -366,6 +370,22 @@ end
 --- working tree).
 local function same_doc(a, b)
   return a.file == b.file and a.sha == b.sha
+end
+
+--- The step that the link of `step` comes from: the step given with --from (while it is still in
+--- the tour), else the step before it.
+local function source_of(step)
+  local f = step.from
+  if f and f ~= step and S.tour.steps[f.n] == f then
+    return f
+  end
+  return S.tour.steps[step.n - 1]
+end
+
+--- True when `step` has a --from link to a step that is still in the tour.
+local function explicit_from(step)
+  local f = step.from
+  return f ~= nil and f ~= step and S.tour.steps[f.n] == f
 end
 
 local render_step -- forward declaration
@@ -664,8 +684,23 @@ local function render_panel()
   end
   -- Steps keep the tour order; a file name line starts each run of steps in the same file (for a
   -- step at a git ref: the same file at the same commit, "path @ref").
+  -- A step with a --via or --from link gets a line "↓ [from N: ]via" before it (and before its
+  -- file name line, so a link to another file is shown before the file changes).
   local prev
   for _, s in ipairs(steps) do
+    local via = s.via and s.via ~= "" and s.via:gsub("%s+", " ") or nil
+    if prev and (via or explicit_from(s)) then
+      local src = source_of(s)
+      local lead = "    ↓ "
+      local from = explicit_from(s) and ("from " .. src.n) or ""
+      lines[#lines + 1] = lead .. from .. ((from ~= "" and via) and ": " or "") .. (via or "")
+      map[#lines] = s.n
+      hls[#hls + 1] = { #lines, 0, #lead, "NvtourNoteBorder" }
+      if from ~= "" then
+        hls[#hls + 1] = { #lines, #lead, #lead + #from, "NvtourSign" .. cap(src.role) }
+      end
+      hls[#hls + 1] = { #lines, #lead + #from, -1, "NvtourVia" }
+    end
     if not (prev and same_doc(s, prev)) then
       lines[#lines + 1] = doc_name(s)
       map[#lines] = s.n -- <CR> on the file name jumps to its first step
@@ -785,11 +820,11 @@ end
 -- Notes support two inline markdown forms: `code` and **bold**. The markers are not shown.
 local INLINE_HL = { code = "NvtourNoteCode", bold = "NvtourNoteBold" }
 
---- Words of `s`. A word is a list of { text, kind } pieces (`erase`() is one word of two
---- pieces); `sep` is the kind of the space before it.
-local function inline_words(s)
+--- Words of the { text, kind } segments `segs`. A word is a list of { text, kind } pieces
+--- (`erase`() is one word of two pieces); `sep` is the kind of the space before it.
+local function inline_words(segs)
   local words, cur, gap, gap_kind = {}, nil, true, nil
-  for _, seg in ipairs(parse_inline(s)) do
+  for _, seg in ipairs(segs) do
     for space, word in seg[1]:gmatch("(%s*)(%S*)") do
       if space ~= "" then
         gap, gap_kind = true, seg[2]
@@ -845,9 +880,9 @@ local function split_word(w, width)
   return parts
 end
 
---- Wrap one paragraph to `width` display cells. Each line is a list of { text, kind } chunks;
---- an empty paragraph gives one empty line.
-local function wrap_text(s, width)
+--- Wrap the { text, kind } segments of one paragraph to `width` display cells. Each line is a
+--- list of { text, kind } chunks; an empty paragraph gives one empty line.
+local function wrap_segs(segs, width)
   local out, cur, cw = {}, nil, 0
   local function push(w, ww)
     if cur and not w.newline and cw + 1 + ww <= width then
@@ -863,7 +898,7 @@ local function wrap_text(s, width)
       add_chunk(cur, p[1], p[2])
     end
   end
-  for _, w in ipairs(inline_words(s)) do
+  for _, w in ipairs(inline_words(segs)) do
     local ww = word_width(w)
     if ww > width then
       for _, part in ipairs(split_word(w, width)) do
@@ -875,6 +910,10 @@ local function wrap_text(s, width)
   end
   out[#out + 1] = cur or {}
   return out
+end
+
+local function wrap_text(s, width)
+  return wrap_segs(parse_inline(s), width)
 end
 
 --- Lines of `note` wrapped to `width`, without leading and trailing blank lines.
@@ -938,9 +977,187 @@ local function collapsed_chunks(note, width)
   return { line }
 end
 
+---------------------------------------------------------------------------
+-- Links between steps
+---------------------------------------------------------------------------
+
+--- Location of step `s` as seen from step `here`: "line 412" in the same buffer, else "a.cpp:412"
+--- ("a.cpp:412 @ref" at a git ref, "a.cpp:412 · working tree" when `here` is the same file at a ref).
+local function link_loc(s, here)
+  if here and same_doc(s, here) then
+    return "line " .. s.l1
+  end
+  local loc = relpath(s.file) .. ":" .. s.l1
+  if s.ref then
+    return loc .. " @" .. s.ref
+  end
+  return (here and here.sha and here.file == s.file) and (loc .. " · working tree") or loc
+end
+
+--- Segments of the "◇" line of `step`: its file and version. The commit is added when the ref is not
+--- itself the commit ("@origin/master (1a2b3c4d5e6f)"); "working tree" when the step before was at
+--- a git ref.
+local function version_segs(step, prev)
+  local segs = { { relpath(step.file), "NvtourViaLoc" } }
+  if step.ref then
+    segs[#segs + 1] = { " @" .. step.ref, "NvtourVersion" }
+    if step.sha:sub(1, #step.ref) ~= step.ref then
+      segs[#segs + 1] = { " (" .. step.sha:sub(1, 12) .. ")", "NvtourVia" }
+    end
+  elseif prev.sha then
+    segs[#segs + 1] = { " · ", "NvtourNoteBorder" }
+    segs[#segs + 1] = { "working tree", "NvtourVersion" }
+  end
+  return segs
+end
+
+--- Segments of a --via text: `code` and **bold** as in notes, the rest in NvtourVia.
+local function via_segs(via)
+  local out = {}
+  for _, seg in ipairs(parse_inline((via or ""):gsub("%s+", " "))) do
+    out[#out + 1] = { seg[1], seg[2] or "NvtourVia" }
+  end
+  return out
+end
+
+--- virt_lines of one link line: `prefix` on the first line, the segments wrapped to `width`.
+local function link_lines(prefix, segs, width)
+  local out = {}
+  for i, t in ipairs(wrap_segs(segs, width - 2)) do
+    local line = { { i == 1 and prefix or "  ", "NvtourNoteBorder" } }
+    for _, c in ipairs(t) do
+      line[#line + 1] = { c[1], INLINE_HL[c[2]] or c[2] }
+    end
+    out[#out + 1] = line
+  end
+  return out
+end
+
+--- Lines above the note of the current step:
+---   ← from 2 · a.cpp:412: <via>                  where the step comes from, and why (--via)
+---   ◇ a.cpp @origin/master (1a2b3c4d5e6f)        the file and version, when they changed
+--- The "from" line is shown for a --via or --from link, or when the file or the version changed.
+--- The "◇" line is shown when the file or the version changed. A change is from the step before it
+--- in the tour (the code the user saw last), also when the link comes from another step.
+local function arrival_lines(step, width)
+  local prev = S.tour.steps[step.n - 1]
+  if not prev or prev == step then
+    return {}
+  end
+  local lines = {}
+  local src = source_of(step)
+  local moved = not same_doc(prev, step)
+  local via = step.via and step.via ~= "" and step.via or nil
+  if via or moved or explicit_from(step) then
+    local segs = {
+      { "from " .. src.n, "NvtourSign" .. cap(src.role) },
+      { " · ", "NvtourNoteBorder" },
+      { link_loc(src, step), "NvtourViaLoc" },
+    }
+    if via then
+      segs[#segs + 1] = { ": ", "NvtourVia" }
+      vim.list_extend(segs, via_segs(via))
+    end
+    vim.list_extend(lines, link_lines("← ", segs, width))
+  end
+  if moved then
+    vim.list_extend(lines, link_lines("◇ ", version_segs(step, prev), width))
+  end
+  return lines
+end
+
+--- Line below the range of the current step, about the next step: shown when the next step is in
+--- another file, or its --via link comes from this step.
+---   → next 4 · b.cpp:88: <via of step 4>
+local function next_lines(step, width)
+  local nxt = S.tour.steps[step.n + 1]
+  if not nxt or nxt == step then
+    return {}
+  end
+  local via = nxt.via and nxt.via ~= "" and source_of(nxt) == step and nxt.via or nil
+  if not via and same_doc(nxt, step) then
+    return {}
+  end
+  local segs = {
+    { "next " .. nxt.n, "NvtourSign" .. cap(nxt.role) },
+    { " · ", "NvtourNoteBorder" },
+    { link_loc(nxt, step), "NvtourViaLoc" },
+  }
+  if via then
+    segs[#segs + 1] = { ": ", "NvtourVia" }
+    vim.list_extend(segs, via_segs(via))
+  elseif nxt.label and nxt.label ~= "" then
+    segs[#segs + 1] = { " " .. nxt.label, "NvtourVia" }
+  end
+  return link_lines("→ ", segs, width)
+end
+
 -- The bar of the current step, in the second cell of the sign column (next to the line numbers).
 -- The step number is not put in the sign column: "10" would run into the line number ("10348").
 local BAR_SIGN = " ▎"
+
+--- Window column (0-based) of the bar of BAR_SIGN: the second cell of a 2-cell sign column just
+--- before the line numbers. nil when it cannot be known ('statuscolumn', signs in the number
+--- column or no sign column).
+local function bar_col(win, textoff)
+  local wo = vim.wo[win]
+  if wo.statuscolumn ~= "" or wo.signcolumn == "no" or wo.signcolumn == "number" then
+    return nil
+  end
+  local numw = 0
+  if wo.number or wo.relativenumber then
+    -- As number_width() in nvim: only 'relativenumber' counts the window height, else the lines.
+    local n = (wo.relativenumber and not wo.number) and api.nvim_win_get_height(win)
+      or api.nvim_buf_line_count(api.nvim_win_get_buf(win))
+    numw = math.max(wo.numberwidth, #tostring(n) + 1)
+  end
+  local col = textoff - numw - 1
+  return col >= 1 and col or nil
+end
+
+--- Make the virtual lines of a step stand out from the code: a band in NvtourNoteBg over the full
+--- window width. The lines start in the gutter (virt_lines_leftcol) with blank cells up to the code
+--- column; the current step has its role bar in the column of the range bar, so one bar goes from
+--- the note through the range. Returns the extmark options for the lines.
+local function band(lines, win, role, current)
+  local opts = { virt_lines = lines }
+  if not valid_win(win) then
+    -- Drawn again in the window when the buffer is shown (BufWinEnter).
+    for _, line in ipairs(lines) do
+      for _, c in ipairs(line) do
+        c[2] = { "NvtourNoteBg", c[2] }
+      end
+    end
+    return opts
+  end
+  local info = vim.fn.getwininfo(win)[1]
+  local off, full = info.textoff, info.width
+  local col = current and bar_col(win, off) or nil
+  opts.virt_lines_leftcol = true
+  for i, line in ipairs(lines) do
+    local w = off
+    for _, c in ipairs(line) do
+      c[2] = { "NvtourNoteBg", c[2] }
+      w = w + vim.fn.strdisplaywidth(c[1])
+    end
+    if w < full then
+      line[#line + 1] = { (" "):rep(full - w), "NvtourNoteBg" }
+    end
+    local gutter
+    if col then
+      gutter = { { (" "):rep(col), "NvtourNoteBg" }, { "▎", { "NvtourNoteBg", "NvtourSign" .. cap(role) } } }
+      if off - col - 1 > 0 then
+        gutter[3] = { (" "):rep(off - col - 1), "NvtourNoteBg" }
+      end
+    elseif off > 0 then
+      gutter = { { (" "):rep(off), "NvtourNoteBg" } }
+    else
+      gutter = {}
+    end
+    lines[i] = vim.list_extend(gutter, line)
+  end
+  return opts
+end
 
 --- Draw step marks. Only the current step gets the bar, the full note and the --expect marks; the
 --- other steps keep the line numbers, the "← N label" marker and a one-line note.
@@ -965,17 +1182,24 @@ render_step = function(step, win)
       priority = 100,
     })
   end
+  local width = 80
+  step.drawn_win = valid_win(win) and win or nil
+  if valid_win(win) then
+    local info = vim.fn.getwininfo(win)[1]
+    width = info.width - info.textoff
+  end
+  width = math.max(30, width - 4)
+  local above = current and arrival_lines(step, width) or {}
   if step.note and step.note ~= "" then
-    local width = 80
-    if valid_win(win) then
-      local info = vim.fn.getwininfo(win)[1]
-      width = info.width - info.textoff
-    end
-    width = math.max(30, width - 4)
-    local vl = current and note_chunks(step.note, width) or collapsed_chunks(step.note, width)
-    if #vl > 0 then
-      add(step.l1 - 1, { virt_lines = vl, virt_lines_above = true })
-    end
+    vim.list_extend(above, current and note_chunks(step.note, width) or collapsed_chunks(step.note, width))
+  end
+  if #above > 0 then
+    add(step.l1 - 1, vim.tbl_extend("force", band(above, win, step.role, current), { virt_lines_above = true }))
+  end
+  local below = current and next_lines(step, width) or {}
+  step.below = #below -- nvim_win_text_height counts these lines with the next row: scroll_to adds them
+  if #below > 0 then
+    add(step.l2 - 1, band(below, win, step.role, current))
   end
   if current and step.expect and step.expect ~= "" then
     local lines = api.nvim_buf_get_lines(buf, step.l1 - 1, step.l2, false)
@@ -1183,7 +1407,7 @@ local function scroll_to(step, win)
     vim.cmd("normal! zv")
     local height = vim.fn.getwininfo(win)[1].height
     local ok, th = pcall(api.nvim_win_text_height, win, { start_row = step.l1 - 1, end_row = step.l2 - 1 })
-    local block = ok and th.all or (step.l2 - step.l1 + 1)
+    local block = (ok and th.all or (step.l2 - step.l1 + 1)) + (step.below or 0)
     local top, used = step.l1, 0
     local want = block < height and math.floor((height - block) / 2) or 0
     while top > 1 do
@@ -1409,6 +1633,8 @@ local function step_result(step, extra)
     l2 = step.l2,
     role = step.role,
     label = step.label,
+    via = step.via,
+    from = explicit_from(step) and step.from.n or nil,
     ref = step.ref,
     sha = step.sha,
     text = step_text(step),
@@ -1422,7 +1648,12 @@ end
 
 local function jump(step)
   step_buf(step)
-  local win = show_buf(tour_win(step.buf, true), step.buf)
+  local win = tour_win(step.buf, true)
+  -- The position before the jump goes into the jumplist of the window, so <C-o> goes back to it.
+  pcall(api.nvim_win_call, win, function()
+    vim.cmd("normal! m'")
+  end)
+  win = show_buf(win, step.buf)
   S.tour_win = win
   enter_win(win)
   local old = S.tour.steps[S.tour.current]
@@ -1478,6 +1709,8 @@ local function rerender_all()
   end
   for i, s in ipairs(S.tour.steps) do
     s.n = i
+  end
+  for _, s in ipairs(S.tour.steps) do
     s.extmark_ids = {}
     if valid_buf(s.buf) and api.nvim_buf_is_loaded(s.buf) then
       render_step(s, tour_win(s.buf))
@@ -1527,6 +1760,13 @@ H.step = function(a)
   if at < 1 or at > #steps + 1 then
     fail(("--at %d is out of range (tour has %d steps)"):format(at, #steps), 6)
   end
+  local from
+  if a.from then
+    from = steps[a.from]
+    if not from then
+      fail(("--from %d: no such step (tour has %d)"):format(a.from, #steps), 6)
+    end
+  end
   ensure_started()
   -- Only the first step of a tour moves the view, so a finished tour starts at step 1.
   local do_jump = a.jump or (#steps == 0 and not a.no_jump)
@@ -1544,6 +1784,8 @@ H.step = function(a)
     role = role,
     label = a.label,
     note = a.note,
+    via = (a.via ~= "" and a.via) or nil,
+    from = from,
     expect = (a.expect ~= "" and a.expect) or nil,
     extmark_ids = {},
   }
@@ -1564,12 +1806,10 @@ H.step = function(a)
     error(err, 0)
   end
   table.insert(steps, at, step)
-  if at < #steps then
-    if not do_jump and S.tour.current >= at then
-      S.tour.current = S.tour.current + 1
-    end
-    rerender_all()
+  if at < #steps and not do_jump and S.tour.current >= at then
+    S.tour.current = S.tour.current + 1
   end
+  rerender_all() -- the steps next to the new one show links to it
   if do_jump then
     update_qf(step.n)
   else
@@ -1617,6 +1857,20 @@ H.edit = function(a)
   end
   if a.expect ~= nil then
     step.expect = a.expect ~= "" and a.expect or nil
+  end
+  if a.via ~= nil then
+    step.via = a.via ~= "" and a.via or nil
+  end
+  if a.from == 0 then
+    step.from = nil
+  elseif a.from then
+    local from = S.tour.steps[a.from]
+    if not from then
+      fail(("--from %d: no such step (tour has %d)"):format(a.from, #S.tour.steps), 6)
+    elseif from == step then
+      fail(("--from %d: a step cannot link from itself"):format(a.from), 6)
+    end
+    step.from = from
   end
   rerender_all()
   if a.jump then
@@ -1830,8 +2084,20 @@ end
 H.status = function()
   local steps = {}
   for _, s in ipairs(S.tour.steps) do
-    steps[#steps + 1] =
-      { n = s.n, file = s.file, ref = s.ref, sha = s.sha, l1 = s.l1, l2 = s.l2, role = s.role, label = s.label, note = s.note, expect = s.expect }
+    steps[#steps + 1] = {
+      n = s.n,
+      file = s.file,
+      ref = s.ref,
+      sha = s.sha,
+      l1 = s.l1,
+      l2 = s.l2,
+      role = s.role,
+      label = s.label,
+      note = s.note,
+      via = s.via,
+      from = explicit_from(s) and s.from.n or nil,
+      expect = s.expect,
+    }
   end
   local focus = {}
   for _, f in pairs(S.focus) do
@@ -1984,6 +2250,20 @@ dispatch = function(cmd, args)
 end
 M.dispatch = dispatch
 
+-- The band of a step depends on the gutter of its window: draw the steps of a buffer again when
+-- it is shown in a window that they were not drawn for.
+api.nvim_create_autocmd("BufWinEnter", {
+  group = aug,
+  callback = function(ev)
+    local win = api.nvim_get_current_win()
+    for _, s in ipairs(S.tour.steps) do
+      if s.buf == ev.buf and s.drawn_win ~= win and valid_buf(s.buf) and api.nvim_buf_is_loaded(s.buf) then
+        pcall(render_step, s, win)
+      end
+    end
+  end,
+})
+
 -- Notes are wrapped to the window width: re-wrap them when a window that shows them is resized.
 api.nvim_create_autocmd("WinResized", {
   group = aug,
@@ -1999,7 +2279,7 @@ api.nvim_create_autocmd("WinResized", {
     end
     for _, s in ipairs(S.tour.steps) do
       local w = shown[s.buf]
-      if w and s.note and s.note ~= "" and valid_buf(s.buf) then
+      if w and valid_buf(s.buf) and ((s.note and s.note ~= "") or s.n == S.tour.current) then
         pcall(render_step, s, w)
       end
     end

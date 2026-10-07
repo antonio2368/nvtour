@@ -32,6 +32,7 @@ Use this when the user asks about code ("this", "here", "this chunk") but gives 
    - Use 3 to 8 steps. One idea per step.
    - Follow reading order: cause, propagation, effect (or entry, core, exit).
    - Only the first step moves the user's view. Later steps are added without a jump, so the tour opens at step 1.
+   - When a step is in a different file from the step before it, give `--via TEXT`: why the tour goes there (see "Links").
 4. End with `nvtour panel -` holding a short markdown summary (heredoc on stdin).
 5. In chat, only say that the tour is open in nvim. Do not list the steps again and do not list the keys. Then continue with the rest of the reply (for example options or questions that are still open).
 
@@ -55,7 +56,7 @@ Use this when the user asks about code ("this", "here", "this chunk") but gives 
 - Name identifiers in the note. The highlight already shows the location.
 - Put identifiers in backticks (`` `erase()` ``); `**bold**` also works. Other markdown is shown as typed.
 - Only the current step shows its full note; the others show the first line. Make the first sentence of a note stand alone.
-- Text that starts with `-`: write `--note=TEXT` or `--label=TEXT`.
+- Text that starts with `-`: write `--note=TEXT`, `--label=TEXT` or `--via=TEXT`.
 - Multi-line notes:
 
   ```
@@ -64,6 +65,15 @@ Use this when the user asks about code ("this", "here", "this chunk") but gives 
   Second sentence.
   EOF
   ```
+
+## Links
+
+- `--via TEXT` tells why the tour goes from the step before to this step, for example ``--via 'on a miss `get()` calls `evict()`'``. nvim shows it above the note of the step (`← from 2 · a.cpp:412: ...`), below the range of the step before (`→ next 3 · ...`) and in the panel.
+- Give `--via` on each step in another file. Give it also in the same file when the connection is not clear from the code (a call, a callback, a shared variable, the same lock).
+- Write the connection, not the content of the new step: what leads there (a call, a return, data that goes there, a thread). The note tells what the code does. At most one short sentence; put identifiers in backticks.
+- `--from N` makes the link come from step N, not from the step before (for example back to step 1). Use it only when the tour goes back to an earlier point.
+- Do not write the file name, the line or the git ref in a note or `--via`. nvim shows them on each change of file or version.
+- `nvtour edit N --via TEXT` changes a link; `--via ''` removes it; `--from 0` links from the step before again.
 
 ## Focus
 

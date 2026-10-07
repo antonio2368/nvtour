@@ -19,6 +19,18 @@ def ns_marks(nv, name, buf=0):
     return nv.api.buf_get_extmarks(buf, ns, 0, -1, {"details": True})
 
 
+def content(line):
+    """Chunks of a virtual line without the band: no gutter, no padding, no NvtourNoteBg group."""
+    out = []
+    for text, hl in line:
+        groups = hl if isinstance(hl, list) else [hl]
+        groups = [g for g in groups if g != "NvtourNoteBg"]
+        if not groups or text == "▎":
+            continue
+        out.append([text, groups[0]])
+    return out
+
+
 def ok(r):
     assert r.returncode == 0, (r.stdout, r.stderr)
     return r.stdout
@@ -63,7 +75,7 @@ def test_wrapped_note_uses_border_prefixes(cli, nv):
     buf = find_buf(nv, "a.txt")
     vl = [m[3]["virt_lines"] for m in ns_marks(nv, "nvtour_steps", buf.handle) if m[3].get("virt_lines")][0]
     assert len(vl) > 1
-    assert vl[0][0][0].startswith("╭") and vl[-1][0][0].startswith("╰")
+    assert content(vl[0])[0][0].startswith("╭") and content(vl[-1])[0][0].startswith("╰")
 
 
 def current(nv):
@@ -686,7 +698,7 @@ def test_only_the_current_step_is_expanded(cli, nv):
         return sorted(m[1] for m in step_marks(nv, "a.txt") if "▎" in m[3].get("sign_text", ""))
 
     def notes():
-        return {m[1]: m[3]["virt_lines"] for m in step_marks(nv, "a.txt") if m[3].get("virt_lines")}
+        return {m[1]: [content(l) for l in m[3]["virt_lines"]] for m in step_marks(nv, "a.txt") if m[3].get("virt_lines")}
 
     assert bar_rows() == [2, 3]
     vl = notes()
@@ -704,7 +716,7 @@ def test_only_the_current_step_is_expanded(cli, nv):
 def test_note_inline_markdown(cli, nv):
     ok(cli("step", "a.txt:3", "--note", "Calls `erase()` on **it** and `a b`. Lone ` stays."))
     vl = [m[3]["virt_lines"] for m in step_marks(nv, "a.txt") if m[3].get("virt_lines")][0]
-    chunks = [tuple(c) for line in vl for c in line[1:]]  # without the border prefixes
+    chunks = [tuple(c) for line in vl for c in content(line)[1:]]  # without the border prefixes
     assert ("erase()", "NvtourNoteCode") in chunks and ("it", "NvtourNoteBold") in chunks
     assert ("a b", "NvtourNoteCode") in chunks
     text = " ".join(" ".join(c[0] for c in chunks).split())
@@ -948,3 +960,121 @@ def test_where_in_a_ref_buffer(cli, nv, sandbox):
     assert text.startswith("a.txt:3:1 @v1  mode=n") and "at git ref v1 (" in text and "buftype" not in text
     data = json.loads(ok(cli("--json", "where")))
     assert data["file"] == str(sandbox.ws / "a.txt") and data["ref"] == "v1" and len(data["sha"]) == 40
+
+
+def link_texts(nv, suffix, above=True):
+    """Text of the virtual lines above (or below) the ranges of a file: { row: [line, ...] }."""
+    out = {}
+    for m in step_marks(nv, suffix):
+        d = m[3]
+        if d.get("virt_lines") and bool(d.get("virt_lines_above")) == above:
+            out[m[1]] = ["".join(c[0] for c in content(line)) for line in d["virt_lines"]]
+    return out
+
+
+def test_via_links_between_steps(cli, nv):
+    ok(cli("start", "Links"))
+    ok(cli("step", "a.txt:3", "--role", "fault", "--label", "check"))
+    ok(cli("step", "b.txt:9", "--role", "flow", "--via", "calls `evict()`", "--note", "Erases."))
+    ok(cli("step", "a.txt:20-21", "--from", "1", "--via", "back"))
+    # Step 1: the next step is in another file, and its link comes from here.
+    assert link_texts(nv, "a.txt") == {}
+    assert link_texts(nv, "a.txt", above=False) == {2: ["→ next 2 · b.txt:9: calls evict()"]}
+    below = content([m[3]["virt_lines"][0] for m in step_marks(nv, "a.txt") if m[3].get("virt_lines")][0])
+    assert ["next 2", "NvtourSignFlow"] in below and ["evict()", "NvtourNoteCode"] in below
+    ok(cli("next"))
+    assert link_texts(nv, "b.txt") == {8: ["← from 1 · a.txt:3: calls evict()", "◇ b.txt", "▸ Erases."]}
+    assert link_texts(nv, "b.txt", above=False) == {8: ["→ next 3 · a.txt:20"]}  # its link is not from here
+    assert link_texts(nv, "a.txt", above=False) == {}  # only the current step shows links
+    ok(cli("next"))
+    # The link comes from step 1 (same file), but the user comes from b.txt: the file is shown.
+    assert link_texts(nv, "a.txt") == {19: ["← from 1 · line 3: back", "◇ a.txt"]}
+    pb = find_buf(nv, "nvtour://panel")
+    assert lines_of(nv, pb.handle)[2:9] == [
+        "a.txt", "  1. ✗ 3      check", "    ↓ calls `evict()`", "b.txt", "  2. → 9      Erases.",
+        "    ↓ from 1: back", "a.txt"]
+    data = json.loads(ok(cli("--json", "status")))
+    assert [(s.get("via"), s.get("from")) for s in data["steps"]] == [
+        (None, None), ("calls `evict()`", None), ("back", 1)]
+    assert "       ↓ from 1: back" in ok(cli("status")).splitlines()
+    # Edit and remove the links.
+    ok(cli("edit", "3", "--from", "0"))
+    assert link_texts(nv, "a.txt") == {19: ["← from 2 · b.txt:9: back", "◇ a.txt"]}
+    ok(cli("edit", "3", "--via", ""))
+    assert link_texts(nv, "a.txt") == {19: ["← from 2 · b.txt:9", "◇ a.txt"]}  # the file changed: still shown
+    ok(cli("edit", "3", "--from", "1", "--via", "again"))
+    ok(cli("remove", "1"))  # the link falls back to the step before it
+    data = json.loads(ok(cli("--json", "status")))
+    assert [s.get("from") for s in data["steps"]] == [None, None]
+    ok(cli("goto", "1"))
+    ok(cli("edit", "2", "--via", "word " * 20))
+    footer = link_texts(nv, "b.txt", above=False)[8]
+    assert len(footer) > 1 and footer[0].startswith("→ next 2") and all(l.startswith("  word") for l in footer[1:])
+    assert cli("step", "a.txt:5", "--from", "9").returncode == 6
+    assert cli("edit", "2", "--from", "2").returncode == 6
+    assert cli("step", "a.txt:5", "--from", "0").returncode == 2
+
+
+def test_links_show_a_change_of_version(cli, nv, sandbox):
+    sha = subprocess.run(["git", "-C", str(sandbox.ws), "rev-parse", "v1"], capture_output=True, text=True,
+                         check=True).stdout.strip()
+    ok(cli("start", "Versions"))
+    ok(cli("step", "a.txt:5"))
+    ok(cli("step", "a.txt:5", "--ref", "v1"))
+    ok(cli("step", "a.txt:6"))
+    ok(cli("step", "a.txt:8"))
+    ok(cli("step", "a.txt:5", "--ref", sha[:12]))
+    assert link_texts(nv, "a.txt") == {}  # the first step: nothing to compare with
+    assert link_texts(nv, "a.txt", above=False) == {4: ["→ next 2 · a.txt:5 @v1"]}
+    ok(cli("next"))
+    old = ref_buf(nv, "v1", "a.txt").handle
+    above = {m[1]: ["".join(c[0] for c in content(l)) for l in m[3]["virt_lines"]]
+             for m in ns_marks(nv, "nvtour_steps", old) if m[3].get("virt_lines") and m[3].get("virt_lines_above")}
+    assert above == {4: ["← from 1 · a.txt:5 · working tree", f"◇ a.txt @v1 ({sha[:12]})"]}
+    ok(cli("next"))
+    assert link_texts(nv, "a.txt")[5] == ["← from 2 · a.txt:5 @v1", "◇ a.txt · working tree"]
+    ok(cli("next"))
+    assert 7 not in link_texts(nv, "a.txt")  # the same file and version: nothing to show
+    ok(cli("next"))
+    old = ref_buf(nv, "v1", "a.txt").handle  # the same commit as v1: the same buffer
+    lines = [["".join(c[0] for c in content(l)) for l in m[3]["virt_lines"]]
+             for m in ns_marks(nv, "nvtour_steps", old) if m[3].get("virt_lines")]
+    assert lines == [["← from 4 · a.txt:8 · working tree", f"◇ a.txt @{sha[:12]}"]]  # a sha ref: not twice
+
+
+def test_jump_adds_to_the_jumplist(cli, nv):
+    ok(cli("start", "Jumps"))
+    ok(cli("step", "a.txt:3"))
+    ok(cli("step", "b.txt:9", "--jump"))
+    assert nv.current.buffer.name.endswith("b.txt")
+    nv.input("<C-o>")
+    nv.command("sleep 50m")
+    assert nv.current.buffer.name.endswith("a.txt") and nv.current.window.cursor[0] == 3
+
+
+def test_virtual_lines_are_a_band(cli, nv):
+    nv.command("set number signcolumn=yes")
+    try:
+        ok(cli("start", "Band"))
+        ok(cli("step", "a.txt:5-6", "--role", "fault", "--note", "Current note."))
+        ok(cli("step", "a.txt:9", "--note", "Other note."))
+        win = nv.current.window
+        info = nv.call("getwininfo", win.handle)[0]
+        marks = [m[3] for m in step_marks(nv, "a.txt") if m[3].get("virt_lines")]
+        assert all(d.get("virt_lines_leftcol") for d in marks)
+        for d in marks:
+            for line in d["virt_lines"]:
+                assert sum(nv.call("strdisplaywidth", t) for t, _ in line) == info["width"]  # the full width
+                assert all("NvtourNoteBg" in (hl if isinstance(hl, list) else [hl]) for _, hl in line)
+        cur = [d for d in marks if any(c[0] == "▎" for c in d["virt_lines"][0])]
+        assert len(cur) == 1  # only the current step has the bar
+        line = cur[0]["virt_lines"][0]
+        bar = next(i for i, c in enumerate(line) if c[0] == "▎")
+        assert line[bar][1] == ["NvtourNoteBg", "NvtourSignFault"]
+        # The bar is in the column of the range bar: the second cell of the sign column.
+        col = sum(nv.call("strdisplaywidth", t) for t, _ in line[:bar])
+        numw = max(nv.eval("&numberwidth"), len(str(nv.call("line", "$"))) + 1)
+        assert col == info["textoff"] - numw - 1
+        assert "".join(t for t, _ in line[:bar + 1]).strip() == "▎" and len("".join(t for t, _ in line[:bar + 2])) >= info["textoff"]
+    finally:
+        nv.command("set nonumber signcolumn=auto")

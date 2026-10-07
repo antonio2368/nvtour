@@ -27,6 +27,7 @@ Neovim in parallel. You step through the tour with `]w` / `[w`.
 |---|---|
 | 🎯 **Jump and highlight** | Moves to a range and marks it, without changing the colours of the code. |
 | 📝 **Inline notes** | Attaches a note as virtual text, with `` `code` `` and `**bold**`. |
+| 🔗 **Links between steps** | `--via` tells why the tour goes to a step. Each step shows where you came from, a change of file or version, and where `]w` goes next. |
 | 🚦 **Roles** | Each step is a `fault`, `flow`, `fix`, `context` or `info`, each in its own colour. |
 | 📋 **Step panel** | A side panel lists the steps by file, with a markdown summary. |
 | 🔍 **Focus** | Folds or dims all code that is not related to the tour. |
@@ -71,7 +72,11 @@ Then ask your agent to *"walk me through this bug in nvim"*.
   text underlined.
 - **Every step:** coloured line numbers and an end-of-line marker `← N label`. The other steps also keep a
   one-line note.
-- **The code itself never gets a background colour,** so syntax highlighting stays intact.
+- **The code itself never gets a background colour,** so syntax highlighting stays intact. The nvtour lines
+  get a light band over the full width, start in the gutter, and the current step has its role bar from
+  the note through the range, so they do not look like code.
+- **Links:** above the note of the current step, `← from 2 · a.cpp:412: <why>` and `◇ b.cpp @origin/master (1a2b3c4d5e6f)`.
+  Below the range, `→ next 4 · c.cpp:10: <why>`. See [Links between steps](#links-between-steps).
 - **Winbar:** the position in the tour and where `]w` goes next.
 - **Panel:** the steps by file, the keys, and the summary.
 
@@ -100,11 +105,12 @@ nvtour start "Dangling iterator in cleanup"
 nvtour step src/a.cpp:412-415 --role fault --label "dangling iterator" --expect "it->second" \
     --note "The iterator is used after erase() invalidated it."
 
-nvtour step src/b.cpp:88 --role flow --label "erase on cleanup thread" --note - <<'EOF'
+nvtour step src/b.cpp:88 --role flow --label "erase on cleanup thread" \
+    --via 'the cleanup thread runs `evict()`' --note - <<'EOF'
 The cleanup thread erases the entry while the reader still holds `it`.
 EOF
 
-nvtour step src/a.cpp:430 --role fix --label "copy before erase"
+nvtour step src/a.cpp:430 --role fix --label "copy before erase" --from 1 --via "back to the read"
 
 nvtour panel - <<'EOF'
 **Cause**: use after erase. **Fix**: copy the value before `erase()`.
@@ -122,6 +128,31 @@ How the steps behave:
   `**bold**` (the markers are hidden).
 - **A jump scrolls** so that the note and the range are in view: centred when they fit, else the note at the
   top, and never past the end of the file. The range flashes briefly after a jump.
+
+### Links between steps
+
+A jump to another file, or to another version of the same file, loses the context: why the tour goes
+there, and where you are. The current step shows both:
+
+```
+← from 2 · a.cpp:412: `get()` calls `evict()` on a miss     ← where you came from, and why
+◇ b.cpp @origin/master (1a2b3c4d5e6f)                      ← the file and version (when they changed)
+╭ The cleanup thread erases the entry ...                   ← the note
+  88│   cache.erase(key);
+→ next 4 · c.cpp:10: the reader uses `it` again             ← where ]w goes, and why
+```
+
+- **`--via TEXT`** is the link to a step: why the tour goes there from the step before it. `--from N` makes
+  the link come from step N (for example back to step 1). A link to a removed step falls back to the step
+  before it.
+- **The "from" line** is shown for a `--via` or `--from` link, and on every change of file or version,
+  also without `--via`.
+- **The `◇` line** is shown when the file or the version changed: the file, and `@ref (commit)` for a step at
+  a git ref, or `working tree` when the step before was at a git ref.
+- **The "next" line** below the range is shown when the next step is in another file, or its `--via` link
+  comes from this step. You know where `]w` goes before you press it.
+- **In the panel,** each link is a line `↓ [from N: ]text` before the step, so the panel reads as a chain.
+- **Jumplist:** each jump adds the previous position to the jumplist, so `<C-o>` goes back.
 
 ### Old code as a step
 
@@ -157,8 +188,8 @@ nvtour step src/cache.cpp:16-21 --role fix --label "check end() first"
 | command | what it does |
 |---|---|
 | `start [TITLE]` | start a new tour (keeps an open panel) |
-| `step FILE:L1[-L2] [--ref GITREF] [--note TEXT\|-] [--label] [--role] [--expect TEXT] [--at N] [--jump\|--no-jump]` | add a step (`--ref`: on the file at that git ref) |
-| `edit N [FILE:L1[-L2] [--ref GITREF]] [--note] [--label] [--role] [--expect] [--jump]` | change a step (`''` removes a label or note; a new location without `--ref` is on the working tree) |
+| `step FILE:L1[-L2] [--ref GITREF] [--note TEXT\|-] [--label] [--role] [--expect TEXT] [--via TEXT] [--from N] [--at N] [--jump\|--no-jump]` | add a step (`--ref`: on the file at that git ref; `--via`: why the tour goes there from the step before, or from step `--from N`) |
+| `edit N [FILE:L1[-L2] [--ref GITREF]] [--note] [--label] [--role] [--expect] [--via] [--from N] [--jump]` | change a step (`''` removes a label, note or link text; `--from 0` links from the step before again; a new location without `--ref` is on the working tree) |
 | `remove N` | remove a step |
 | `panel [TEXT\|-\|--file PATH] [--toggle] [--clear]` | side panel text |
 
@@ -198,7 +229,7 @@ is skipped.
 | `<leader>wp` | toggle panel |
 | `<leader>wc` | clear everything |
 
-**In the panel:** `<CR>` jumps to the step under the cursor (on a file name: its first step), `q` closes the
+**In the panel:** `<CR>` jumps to the step under the cursor (on a file name or a link line: the step after it), `q` closes the
 panel.
 
 **Commands:** `:NvtourNext`, `:NvtourPrev`, `:NvtourFirst`, `:NvtourLast`, `:NvtourGoto N`, `:NvtourPanel`,
@@ -246,6 +277,8 @@ In the names below, `{...}` is one of `Fault`, `Flow`, `Fix`, `Context`, `Info`.
 | `NvtourNote`, `NvtourNoteCode`, `NvtourNoteBold` | the note of the current step |
 | `NvtourNoteCollapsed` | one-line note of the other steps |
 | `NvtourNoteBorder` | note border |
+| `NvtourVia`, `NvtourViaLoc`, `NvtourVersion` | link text, link location, version (`@ref`, `working tree`) |
+| `NvtourNoteBg` | the band behind all nvtour lines (set it to `{}` for no band colour) |
 | `NvtourDim`, `NvtourFlash` | `focus --dim`, the flash after a jump |
 | `NvtourPanelCurrent`, `NvtourPanelFile`, `NvtourPanelProgress` | panel |
 
