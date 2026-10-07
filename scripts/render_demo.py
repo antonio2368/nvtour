@@ -171,10 +171,10 @@ TOUR = [
      "--note", "`it` is used after `refresh()` moved the node out of `entries` and back in. "
                "The iterator is invalid, so this reads freed memory."),
     ("step", f"{DEMO}:52-54", "--role", "flow", "--label", "extract + insert",
-     "--note", "`extract()` unlinks the node. Iterators to it are invalidated, "
+     "--via", "`get()` calls `refresh()` while it holds `it`", "--note", "`extract()` unlinks the node. Iterators to it are invalidated, "
                "and `insert()` does **not** make them valid again."),
     ("step", f"{DEMO}:19", "--role", "fix", "--label", "update in place",
-     "--note", "Change the expiry in place: `it->second.expires_at += ttl;`. "
+     "--via", "back in `get()`, where `refresh()` is called", "--note", "Change the expiry in place: `it->second.expires_at += ttl;`. "
                "Then `it` stays valid and `refresh()` can go."),
 ]
 SUMMARY = """**Cause**: `get()` keeps `it` across `refresh()`, which re-inserts the node.

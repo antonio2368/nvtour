@@ -751,7 +751,8 @@ def main() -> None:
             ("step list", "dangling iterator", 1, False, 0, 150),
         ))
         s.say("Later steps are added without moving your view.")
-        t.cmd(*rd.TOUR[1], effect="step 2 added · view stays", after=0.9)
+        s.say("--via tells why the tour goes on. It shows before you jump.")
+        t.cmd(*rd.TOUR[1], effect="step 2 added · the why shows below step 1", after=1.2)
         t.cmd(*rd.TOUR[2], effect="step 3: label + short note", after=0.9)
         s.say("A side panel lists the steps and a summary.")
         t.cmd("panel", "-", stdin=rd.SUMMARY, shown="nvtour panel - <<'EOF'\n" + rd.SUMMARY + "EOF", cps=220,
