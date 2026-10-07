@@ -20,15 +20,25 @@ def ns_marks(nv, name, buf=0):
 
 
 def content(line):
-    """Chunks of a virtual line without the band: no gutter, no padding, no NvtourNoteBg group."""
+    """Chunks of a virtual line without the band or the frame: no gutter, padding, border or lead."""
     out = []
     for text, hl in line:
         groups = hl if isinstance(hl, list) else [hl]
         groups = [g for g in groups if g != "NvtourNoteBg"]
-        if not groups or text == "▎":
+        if not groups or text == "▎" or groups[0].startswith("NvtourFrame"):
+            continue
+        if groups[0] == "NvtourNoteBorder" and (text == "╶─ " or text.strip() == ""):
             continue
         out.append([text, groups[0]])
     return out
+
+
+@pytest.fixture()
+def band(nv):
+    """Draw the virtual lines as a band (vim.g.nvtour_note_style), not in a frame."""
+    nv.command("let g:nvtour_note_style = 'band'")
+    yield
+    nv.command("unlet! g:nvtour_note_style")
 
 
 def ok(r):
@@ -69,7 +79,7 @@ def test_step_creates_marks_and_jumps(cli, nv, sandbox):
     assert nv.eval("maparg(']w', 'n')") != ""
 
 
-def test_wrapped_note_uses_border_prefixes(cli, nv):
+def test_wrapped_note_uses_border_prefixes(cli, nv, band):
     note = "word " * 60
     ok(cli("step", "a.txt:2", "--note", note))
     buf = find_buf(nv, "a.txt")
@@ -689,7 +699,7 @@ def step_marks(nv, suffix):
     return [m for m in ns_marks(nv, "nvtour_steps", buf.handle)]
 
 
-def test_only_the_current_step_is_expanded(cli, nv):
+def test_only_the_current_step_is_expanded(cli, nv, band):
     ok(cli("start", "Cur"))
     ok(cli("step", "a.txt:3-4", "--role", "fault", "--note", "First note. It has two lines.\nSecond line."))
     ok(cli("step", "a.txt:9-10", "--role", "flow", "--note", "Other note"))
@@ -713,7 +723,7 @@ def test_only_the_current_step_is_expanded(cli, nv):
     assert eol == [(2, "1"), (8, "2")]  # every step keeps its number
 
 
-def test_note_inline_markdown(cli, nv):
+def test_note_inline_markdown(cli, nv, band):
     ok(cli("step", "a.txt:3", "--note", "Calls `erase()` on **it** and `a b`. Lone ` stays."))
     vl = [m[3]["virt_lines"] for m in step_marks(nv, "a.txt") if m[3].get("virt_lines")][0]
     chunks = [tuple(c) for line in vl for c in content(line)[1:]]  # without the border prefixes
@@ -746,10 +756,10 @@ def test_jump_keeps_note_and_range_in_view(cli, nv):
     ok(cli("start", "View"))
     ok(cli("step", "a.txt:1", "--note", "A note on the first line.\nSecond line."))
     v = view(nv)
-    assert v["topline"] == 1 and v["topfill"] == 2  # virtual lines above line 1 are shown
+    assert v["topline"] == 1 and v["topfill"] == 4  # the framed note above line 1 is shown
     ok(cli("step", "a.txt:20-55", "--note", "Long range.\nTwo lines.", "--jump"))
     v = view(nv)
-    assert v["topline"] == 20 and v["topfill"] == 2 and nv.current.window.cursor[0] == 20
+    assert v["topline"] == 20 and v["topfill"] == 4 and nv.current.window.cursor[0] == 20
     ok(cli("step", "a.txt:40", "--note", "Short.", "--jump"))
     top, bottom = nv.eval("line('w0')"), nv.eval("line('w$')")
     assert top < 40 < bottom and abs((40 - top) - (bottom - 40)) <= 2  # centred
@@ -968,7 +978,8 @@ def link_texts(nv, suffix, above=True):
     for m in step_marks(nv, suffix):
         d = m[3]
         if d.get("virt_lines") and bool(d.get("virt_lines_above")) == above:
-            out[m[1]] = ["".join(c[0] for c in content(line)) for line in d["virt_lines"]]
+            texts = ["".join(c[0] for c in content(line)) for line in d["virt_lines"]]
+            out[m[1]] = [t.rstrip() for t in texts if t.strip()]  # no frame rules
     return out
 
 
@@ -983,12 +994,12 @@ def test_via_links_between_steps(cli, nv):
     below = content([m[3]["virt_lines"][0] for m in step_marks(nv, "a.txt") if m[3].get("virt_lines")][0])
     assert ["next 2", "NvtourSignFlow"] in below and ["evict()", "NvtourNoteCode"] in below
     ok(cli("next"))
-    assert link_texts(nv, "b.txt") == {8: ["← from 1 · a.txt:3: calls evict()", "◇ b.txt", "▸ Erases."]}
-    assert link_texts(nv, "b.txt", above=False) == {8: ["→ next 3 · a.txt:20"]}  # its link is not from here
+    assert link_texts(nv, "b.txt") == {8: ["◇ b.txt", "Erases."]}  # the --via text is only on the next line
+    assert link_texts(nv, "b.txt", above=False) == {8: ["→ next 3 · a.txt:20 (from 1): back"]}
     assert link_texts(nv, "a.txt", above=False) == {}  # only the current step shows links
     ok(cli("next"))
     # The link comes from step 1 (same file), but the user comes from b.txt: the file is shown.
-    assert link_texts(nv, "a.txt") == {19: ["← from 1 · line 3: back", "◇ a.txt"]}
+    assert link_texts(nv, "a.txt") == {19: ["◇ a.txt"]}
     pb = find_buf(nv, "nvtour://panel")
     assert lines_of(nv, pb.handle)[2:9] == [
         "a.txt", "  1. ✗ 3      check", "    ↓ calls `evict()`", "b.txt", "  2. → 9      Erases.",
@@ -999,9 +1010,10 @@ def test_via_links_between_steps(cli, nv):
     assert "       ↓ from 1: back" in ok(cli("status")).splitlines()
     # Edit and remove the links.
     ok(cli("edit", "3", "--from", "0"))
-    assert link_texts(nv, "a.txt") == {19: ["← from 2 · b.txt:9: back", "◇ a.txt"]}
+    ok(cli("goto", "2"))
+    assert link_texts(nv, "b.txt", above=False) == {8: ["→ next 3 · a.txt:20: back"]}
     ok(cli("edit", "3", "--via", ""))
-    assert link_texts(nv, "a.txt") == {19: ["← from 2 · b.txt:9", "◇ a.txt"]}  # the file changed: still shown
+    assert link_texts(nv, "b.txt", above=False) == {8: ["→ next 3 · a.txt:20"]}  # another file: still shown
     ok(cli("edit", "3", "--from", "1", "--via", "again"))
     ok(cli("remove", "1"))  # the link falls back to the step before it
     data = json.loads(ok(cli("--json", "status")))
@@ -1009,7 +1021,7 @@ def test_via_links_between_steps(cli, nv):
     ok(cli("goto", "1"))
     ok(cli("edit", "2", "--via", "word " * 20))
     footer = link_texts(nv, "b.txt", above=False)[8]
-    assert len(footer) > 1 and footer[0].startswith("→ next 2") and all(l.startswith("  word") for l in footer[1:])
+    assert len(footer) > 1 and footer[0].startswith("→ next 2") and all(l.startswith("word") for l in footer[1:])
     assert cli("step", "a.txt:5", "--from", "9").returncode == 6
     assert cli("edit", "2", "--from", "2").returncode == 6
     assert cli("step", "a.txt:5", "--from", "0").returncode == 2
@@ -1028,18 +1040,22 @@ def test_links_show_a_change_of_version(cli, nv, sandbox):
     assert link_texts(nv, "a.txt", above=False) == {4: ["→ next 2 · a.txt:5 @v1"]}
     ok(cli("next"))
     old = ref_buf(nv, "v1", "a.txt").handle
-    above = {m[1]: ["".join(c[0] for c in content(l)) for l in m[3]["virt_lines"]]
+    above = {m[1]: [t for t in ("".join(c[0] for c in content(l)) for l in m[3]["virt_lines"]) if t.strip()]
              for m in ns_marks(nv, "nvtour_steps", old) if m[3].get("virt_lines") and m[3].get("virt_lines_above")}
-    assert above == {4: ["← from 1 · a.txt:5 · working tree", f"◇ a.txt @v1 ({sha[:12]})"]}
+    assert above == {4: [f"◇ a.txt @v1 ({sha[:12]})"]}
+    assert link_texts(nv, "a.txt", above=False) == {}
+    below = [["".join(c[0] for c in content(l)) for l in m[3]["virt_lines"]]
+             for m in ns_marks(nv, "nvtour_steps", old) if m[3].get("virt_lines") and not m[3].get("virt_lines_above")]
+    assert below == [["→ next 3 · a.txt:6 · working tree"]]
     ok(cli("next"))
-    assert link_texts(nv, "a.txt")[5] == ["← from 2 · a.txt:5 @v1", "◇ a.txt · working tree"]
+    assert link_texts(nv, "a.txt")[5] == ["◇ a.txt · working tree"]
     ok(cli("next"))
     assert 7 not in link_texts(nv, "a.txt")  # the same file and version: nothing to show
     ok(cli("next"))
     old = ref_buf(nv, "v1", "a.txt").handle  # the same commit as v1: the same buffer
-    lines = [["".join(c[0] for c in content(l)) for l in m[3]["virt_lines"]]
+    lines = [[t for t in ("".join(c[0] for c in content(l)) for l in m[3]["virt_lines"]) if t.strip()]
              for m in ns_marks(nv, "nvtour_steps", old) if m[3].get("virt_lines")]
-    assert lines == [["← from 4 · a.txt:8 · working tree", f"◇ a.txt @{sha[:12]}"]]  # a sha ref: not twice
+    assert lines == [[f"◇ a.txt @{sha[:12]}"]]  # a sha ref: not twice
 
 
 def test_jump_adds_to_the_jumplist(cli, nv):
@@ -1052,7 +1068,7 @@ def test_jump_adds_to_the_jumplist(cli, nv):
     assert nv.current.buffer.name.endswith("a.txt") and nv.current.window.cursor[0] == 3
 
 
-def test_virtual_lines_are_a_band(cli, nv):
+def test_virtual_lines_are_a_band(cli, nv, band):
     nv.command("set number signcolumn=yes")
     try:
         ok(cli("start", "Band"))
@@ -1076,5 +1092,34 @@ def test_virtual_lines_are_a_band(cli, nv):
         numw = max(nv.eval("&numberwidth"), len(str(nv.call("line", "$"))) + 1)
         assert col == info["textoff"] - numw - 1
         assert "".join(t for t, _ in line[:bar + 1]).strip() == "▎" and len("".join(t for t, _ in line[:bar + 2])) >= info["textoff"]
+    finally:
+        nv.command("set nonumber signcolumn=auto")
+
+
+def test_virtual_lines_are_framed(cli, nv):
+    nv.command("set number signcolumn=yes")
+    try:
+        ok(cli("start", "Frame"))
+        ok(cli("step", "a.txt:5-6", "--role", "fault", "--note", "Current note."))
+        ok(cli("step", "b.txt:9", "--note", "Other note.", "--via", "why"))
+        ok(cli("step", "a.txt:12", "--note", "Third note."))
+        info = nv.call("getwininfo", nv.current.window.handle)[0]
+        marks = {m[1]: m[3] for m in step_marks(nv, "a.txt") if m[3].get("virt_lines")}
+        block = [content_text for content_text in marks[4]["virt_lines"]]
+        assert marks[4].get("virt_lines_leftcol") and marks[4].get("virt_lines_above")
+        texts = ["".join(t for t, _ in line) for line in block]
+        assert [t.strip()[0] + t.strip()[-1] for t in texts] == ["▎╮", "▎│", "▎╯"]  # bar, then the frame
+        assert texts[0].replace("▎", " ").strip().startswith("╭─") and "Current note." in texts[1]
+        for line in block:
+            assert sum(nv.call("strdisplaywidth", t) for t, _ in line) == info["width"]
+            assert ["▎", "NvtourSignFault"] in line
+        assert all(hl == "NvtourFrameFault" for t, hl in block[1] if t.strip().startswith("│") or t.strip().endswith("│"))
+        nxt = marks[5]["virt_lines"]  # below the range: the "next" line with a lead
+        assert len(nxt) == 1 and ["╶─ ", "NvtourFrameFault"] in nxt[0]
+        assert "".join(c[0] for c in content(nxt[0])) == "→ next 2 · b.txt:9: why"
+        collapsed = marks[11]["virt_lines"]  # step 3, not current: a grey lead, no bar
+        assert len(collapsed) == 1 and ["╶─ ", "NvtourNoteBorder"] in collapsed[0]
+        assert not any(t == "▎" for t, _ in collapsed[0])
+        assert "".join(c[0] for c in content(collapsed[0])) == "Third note."
     finally:
         nv.command("set nonumber signcolumn=auto")

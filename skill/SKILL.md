@@ -68,7 +68,7 @@ Use this when the user asks about code ("this", "here", "this chunk") but gives 
 
 ## Links
 
-- `--via TEXT` tells why the tour goes from the step before to this step, for example ``--via 'on a miss `get()` calls `evict()`'``. nvim shows it above the note of the step (`← from 2 · a.cpp:412: ...`), below the range of the step before (`→ next 3 · ...`) and in the panel.
+- `--via TEXT` tells why the tour goes from the step before to this step, for example ``--via 'on a miss `get()` calls `evict()`'``. nvim shows it below the range of the step before (`→ next 3 · a.cpp:412: ...`), so the user knows why before the jump, and in the panel.
 - Give `--via` on each step in another file. Give it also in the same file when the connection is not clear from the code (a call, a callback, a shared variable, the same lock).
 - Write the connection, not the content of the new step: what leads there (a call, a return, data that goes there, a thread). The note tells what the code does. At most one short sentence; put identifiers in backticks.
 - `--from N` makes the link come from step N, not from the step before (for example back to step 1). Use it only when the tour goes back to an earlier point.

@@ -103,6 +103,7 @@ local function define_highlights(force)
     set("NvtourNumber" .. R, { fg = accent, bold = true })
     set("NvtourSign" .. R, { fg = accent, bold = true })
     set("NvtourLabel" .. R, { fg = accent, bold = true, italic = true })
+    set("NvtourFrame" .. R, { fg = blend(accent, bg, 0.75) })
     -- No fg, so the syntax colour of the --expect text stays.
     set("NvtourMark" .. R, { bold = true, underline = true, sp = accent })
   end
@@ -933,13 +934,16 @@ local function note_lines(note, width)
   return lines
 end
 
---- virt_lines for the note of the current step: a bordered block.
-local function note_chunks(note, width)
+--- virt_lines for the note of the current step: a bordered block (`plain`: no border prefixes,
+--- for the frame style, which draws its own border).
+local function note_chunks(note, width, plain)
   local texts = note_lines(note, width)
   local lines = {}
   for i, t in ipairs(texts) do
     local prefix
-    if #texts == 1 then
+    if plain then
+      prefix = ""
+    elseif #texts == 1 then
       prefix = "▸ "
     elseif i == 1 then
       prefix = "╭ "
@@ -949,7 +953,7 @@ local function note_chunks(note, width)
       prefix = "│ "
     end
     if #t == 0 then
-      lines[#lines + 1] = { { "│", "NvtourNoteBorder" } }
+      lines[#lines + 1] = { { plain and "" or "│", "NvtourNoteBorder" } }
     else
       local line = { { prefix, "NvtourNoteBorder" } }
       for _, c in ipairs(t) do
@@ -1033,48 +1037,27 @@ local function link_lines(prefix, segs, width)
   return out
 end
 
---- Lines above the note of the current step:
----   ← from 2 · a.cpp:412: <via>                  where the step comes from, and why (--via)
----   ◇ a.cpp @origin/master (1a2b3c4d5e6f)        the file and version, when they changed
---- The "from" line is shown for a --via or --from link, or when the file or the version changed.
---- The "◇" line is shown when the file or the version changed. A change is from the step before it
---- in the tour (the code the user saw last), also when the link comes from another step.
+--- Line above the note of the current step, when the file or the version is different from the
+--- step before it in the tour (the code the user saw last):
+---   ◇ a.cpp @origin/master (1a2b3c4d5e6f)
+--- The --via text is not repeated here: the "next" line of the step before shows it.
 local function arrival_lines(step, width)
   local prev = S.tour.steps[step.n - 1]
-  if not prev or prev == step then
+  if not prev or prev == step or same_doc(prev, step) then
     return {}
   end
-  local lines = {}
-  local src = source_of(step)
-  local moved = not same_doc(prev, step)
-  local via = step.via and step.via ~= "" and step.via or nil
-  if via or moved or explicit_from(step) then
-    local segs = {
-      { "from " .. src.n, "NvtourSign" .. cap(src.role) },
-      { " · ", "NvtourNoteBorder" },
-      { link_loc(src, step), "NvtourViaLoc" },
-    }
-    if via then
-      segs[#segs + 1] = { ": ", "NvtourVia" }
-      vim.list_extend(segs, via_segs(via))
-    end
-    vim.list_extend(lines, link_lines("← ", segs, width))
-  end
-  if moved then
-    vim.list_extend(lines, link_lines("◇ ", version_segs(step, prev), width))
-  end
-  return lines
+  return link_lines("◇ ", version_segs(step, prev), width)
 end
 
 --- Line below the range of the current step, about the next step: shown when the next step is in
---- another file, or its --via link comes from this step.
+--- another file or version, or has a --via link. "(from N)" when its link comes from another step.
 ---   → next 4 · b.cpp:88: <via of step 4>
 local function next_lines(step, width)
   local nxt = S.tour.steps[step.n + 1]
   if not nxt or nxt == step then
     return {}
   end
-  local via = nxt.via and nxt.via ~= "" and source_of(nxt) == step and nxt.via or nil
+  local via = nxt.via and nxt.via ~= "" and nxt.via or nil
   if not via and same_doc(nxt, step) then
     return {}
   end
@@ -1083,6 +1066,12 @@ local function next_lines(step, width)
     { " · ", "NvtourNoteBorder" },
     { link_loc(nxt, step), "NvtourViaLoc" },
   }
+  local src = source_of(nxt)
+  if via and src ~= step then
+    segs[#segs + 1] = { " (from ", "NvtourVia" }
+    segs[#segs + 1] = { tostring(src.n), "NvtourSign" .. cap(src.role) }
+    segs[#segs + 1] = { ")", "NvtourVia" }
+  end
   if via then
     segs[#segs + 1] = { ": ", "NvtourVia" }
     vim.list_extend(segs, via_segs(via))
@@ -1115,6 +1104,70 @@ local function bar_col(win, textoff)
   return col >= 1 and col or nil
 end
 
+--- The style of the virtual lines of a step: "frame" (the default) or "band" (vim.g.nvtour_note_style).
+local function note_style()
+  return vim.g.nvtour_note_style == "band" and "band" or "frame"
+end
+
+--- Chunks of the gutter in front of a virtual line: blank cells up to the code column (`off`), with
+--- the role bar in the column of the range bar when `col` is set. `hl` wraps a group (for the band).
+local function gutter_chunks(off, col, role, hl)
+  if col then
+    local g = { { (" "):rep(col), hl("NvtourNoteBorder") }, { "▎", hl("NvtourSign" .. cap(role)) } }
+    if off - col - 1 > 0 then
+      g[3] = { (" "):rep(off - col - 1), hl("NvtourNoteBorder") }
+    end
+    return g
+  end
+  return off > 0 and { { (" "):rep(off), hl("NvtourNoteBorder") } } or {}
+end
+
+local function plain_hl(g)
+  return g
+end
+
+--- Make the virtual lines of a step stand out from the code with a border, without a background.
+--- `kind` is "block" (the links and the note of the current step: a frame ╭─╮ │ │ ╰─╯ in the role
+--- colour), "next" (the line below the range: a "╶─" lead) or "collapsed" (the one-line note of
+--- another step: a grey "╶─" lead). Like the band, the lines start in the gutter.
+local function frame(lines, win, role, current, kind)
+  if not valid_win(win) then
+    return { virt_lines = lines } -- drawn again in the window when the buffer is shown (BufWinEnter)
+  end
+  local info = vim.fn.getwininfo(win)[1]
+  local off, full = info.textoff, info.width
+  local col = current and bar_col(win, off) or nil
+  local B = current and ("NvtourFrame" .. cap(role)) or "NvtourNoteBorder"
+  local inner = math.max(10, full - off) -- cells from the code column to the right edge
+  local function row(chunks)
+    return vim.list_extend(gutter_chunks(off, col, role, plain_hl), chunks)
+  end
+  local out = {}
+  if kind == "block" then
+    out[1] = row({ { "╭" .. ("─"):rep(inner - 2) .. "╮", B } })
+    for _, line in ipairs(lines) do
+      local w = 0
+      for _, c in ipairs(line) do
+        w = w + vim.fn.strdisplaywidth(c[1])
+      end
+      local chunks = { { "│ ", B } }
+      vim.list_extend(chunks, line)
+      chunks[#chunks + 1] = { (" "):rep(math.max(0, inner - 4 - w)) .. " │", B }
+      out[#out + 1] = row(chunks)
+    end
+    out[#out + 1] = row({ { "╰" .. ("─"):rep(inner - 2) .. "╯", B } })
+  else
+    for i, line in ipairs(lines) do
+      if kind == "collapsed" and line[1] and line[1][1] == "╶ " then
+        table.remove(line, 1) -- the frame lead replaces the "╶ " prefix
+      end
+      local chunks = { { i == 1 and "╶─ " or "   ", B } }
+      out[#out + 1] = row(vim.list_extend(chunks, line))
+    end
+  end
+  return { virt_lines = out, virt_lines_leftcol = true }
+end
+
 --- Make the virtual lines of a step stand out from the code: a band in NvtourNoteBg over the full
 --- window width. The lines start in the gutter (virt_lines_leftcol) with blank cells up to the code
 --- column; the current step has its role bar in the column of the range bar, so one bar goes from
@@ -1143,18 +1196,9 @@ local function band(lines, win, role, current)
     if w < full then
       line[#line + 1] = { (" "):rep(full - w), "NvtourNoteBg" }
     end
-    local gutter
-    if col then
-      gutter = { { (" "):rep(col), "NvtourNoteBg" }, { "▎", { "NvtourNoteBg", "NvtourSign" .. cap(role) } } }
-      if off - col - 1 > 0 then
-        gutter[3] = { (" "):rep(off - col - 1), "NvtourNoteBg" }
-      end
-    elseif off > 0 then
-      gutter = { { (" "):rep(off), "NvtourNoteBg" } }
-    else
-      gutter = {}
-    end
-    lines[i] = vim.list_extend(gutter, line)
+    lines[i] = vim.list_extend(gutter_chunks(off, col, role, function(g)
+      return g == "NvtourNoteBorder" and "NvtourNoteBg" or { "NvtourNoteBg", g }
+    end), line)
   end
   return opts
 end
@@ -1189,17 +1233,23 @@ render_step = function(step, win)
     width = info.width - info.textoff
   end
   width = math.max(30, width - 4)
+  local framed = note_style() == "frame"
   local above = current and arrival_lines(step, width) or {}
   if step.note and step.note ~= "" then
-    vim.list_extend(above, current and note_chunks(step.note, width) or collapsed_chunks(step.note, width))
+    vim.list_extend(above, current and note_chunks(step.note, width, framed) or collapsed_chunks(step.note, width))
   end
   if #above > 0 then
-    add(step.l1 - 1, vim.tbl_extend("force", band(above, win, step.role, current), { virt_lines_above = true }))
+    local opts = framed and frame(above, win, step.role, current, current and "block" or "collapsed")
+      or band(above, win, step.role, current)
+    add(step.l1 - 1, vim.tbl_extend("force", opts, { virt_lines_above = true }))
   end
   local below = current and next_lines(step, width) or {}
-  step.below = #below -- nvim_win_text_height counts these lines with the next row: scroll_to adds them
   if #below > 0 then
-    add(step.l2 - 1, band(below, win, step.role, current))
+    local opts = framed and frame(below, win, step.role, current, "next") or band(below, win, step.role, current)
+    step.below = #opts.virt_lines -- nvim_win_text_height counts these with the next row: scroll_to adds them
+    add(step.l2 - 1, opts)
+  else
+    step.below = 0
   end
   if current and step.expect and step.expect ~= "" then
     local lines = api.nvim_buf_get_lines(buf, step.l1 - 1, step.l2, false)

@@ -72,11 +72,11 @@ Then ask your agent to *"walk me through this bug in nvim"*.
   text underlined.
 - **Every step:** coloured line numbers and an end-of-line marker `← N label`. The other steps also keep a
   one-line note.
-- **The code itself never gets a background colour,** so syntax highlighting stays intact. The nvtour lines
-  get a light band over the full width, start in the gutter, and the current step has its role bar from
+- **The code itself never gets a background colour,** so syntax highlighting stays intact. The note of the
+  current step is in a frame in the role colour, the lines start in the gutter, and the role bar goes from
   the note through the range, so they do not look like code.
-- **Links:** above the note of the current step, `← from 2 · a.cpp:412: <why>` and `◇ b.cpp @origin/master (1a2b3c4d5e6f)`.
-  Below the range, `→ next 4 · c.cpp:10: <why>`. See [Links between steps](#links-between-steps).
+- **Links:** `◇ b.cpp @origin/master (1a2b3c4d5e6f)` in the frame when the file or version changed, and
+  below the range `╶─ → next 4 · c.cpp:10: <why>`. See [Links between steps](#links-between-steps).
 - **Winbar:** the position in the tour and where `]w` goes next.
 - **Panel:** the steps by file, the keys, and the summary.
 
@@ -135,22 +135,21 @@ A jump to another file, or to another version of the same file, loses the contex
 there, and where you are. The current step shows both:
 
 ```
-← from 2 · a.cpp:412: `get()` calls `evict()` on a miss     ← where you came from, and why
-◇ b.cpp @origin/master (1a2b3c4d5e6f)                      ← the file and version (when they changed)
-╭ The cleanup thread erases the entry ...                   ← the note
-  88│   cache.erase(key);
-→ next 4 · c.cpp:10: the reader uses `it` again             ← where ]w goes, and why
+     ╭──────────────────────────────────────────────╮
+   ▎ │ ◇ b.cpp @origin/master (1a2b3c4d5e6f)         │  ← the file and version (when they changed)
+   ▎ │ The cleanup thread erases the entry ...       │  ← the note
+     ╰──────────────────────────────────────────────╯
+88 ▎   cache.erase(key);
+   ▎ ╶─ → next 4 · c.cpp:10: the reader uses `it` again  ← where ]w goes, and why
 ```
 
 - **`--via TEXT`** is the link to a step: why the tour goes there from the step before it. `--from N` makes
-  the link come from step N (for example back to step 1). A link to a removed step falls back to the step
-  before it.
-- **The "from" line** is shown for a `--via` or `--from` link, and on every change of file or version,
-  also without `--via`.
+  the link come from step N (for example back to step 1); the "next" line then shows `(from N)`. A link to a
+  removed step falls back to the step before it.
 - **The `◇` line** is shown when the file or the version changed: the file, and `@ref (commit)` for a step at
   a git ref, or `working tree` when the step before was at a git ref.
-- **The "next" line** below the range is shown when the next step is in another file, or its `--via` link
-  comes from this step. You know where `]w` goes before you press it.
+- **The "next" line** below the range is shown when the next step is in another file or version, or has a
+  `--via` link. You know where `]w` goes, and why, before you press it.
 - **In the panel,** each link is a line `↓ [from N: ]text` before the step, so the panel reads as a chain.
 - **Jumplist:** each jump adds the previous position to the jumplist, so `<C-o>` goes back.
 
@@ -250,6 +249,7 @@ vim.g.nvtour_auto_panel = false               -- do not open the panel on the fi
 vim.g.nvtour_steal_focus = "unless_terminal"  -- "always" | "never"; default keeps the focus in a terminal window
 vim.g.nvtour_winbar = false                   -- do not show the tour position in the winbar of the tour window
 vim.g.nvtour_flash = 0                        -- ms the range flashes after a jump (default 300; 0 = off)
+vim.g.nvtour_note_style = "band"              -- a background band instead of the frame (default "frame")
 ```
 
 - **Winbar:** set only in a window that has no winbar of its own (from you or a plugin). `clear` removes it.
@@ -278,7 +278,8 @@ In the names below, `{...}` is one of `Fault`, `Flow`, `Fix`, `Context`, `Info`.
 | `NvtourNoteCollapsed` | one-line note of the other steps |
 | `NvtourNoteBorder` | note border |
 | `NvtourVia`, `NvtourViaLoc`, `NvtourVersion` | link text, link location, version (`@ref`, `working tree`) |
-| `NvtourNoteBg` | the band behind all nvtour lines (set it to `{}` for no band colour) |
+| `NvtourFrame{...}` | the frame around the note, the `╶─` lead of the "next" line |
+| `NvtourNoteBg` | the band behind all nvtour lines (`nvtour_note_style = "band"`) |
 | `NvtourDim`, `NvtourFlash` | `focus --dim`, the flash after a jump |
 | `NvtourPanelCurrent`, `NvtourPanelFile`, `NvtourPanelProgress` | panel |
 

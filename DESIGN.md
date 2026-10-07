@@ -281,7 +281,7 @@ many lines is heavy, and `Diff*` groups are defined with `reverse` in many color
 stays) marks the `--expect` text. Also `NvtourNote`, `NvtourNoteCode` (fg of `@markup.raw` or
 `String`), `NvtourNoteBold`, `NvtourNoteCollapsed`, `NvtourNoteBorder`, `NvtourDim` (focus `--dim`),
 `NvtourFlash`, `NvtourPanelCurrent`, `NvtourVia` and `NvtourViaLoc` (blended from `Directory`), all
-blended from `Normal`, `NvtourVersion` (fg of `Special`, bold), `NvtourNoteBg` (the band), and `NvtourPanelFile` (→
+blended from `Normal`, `NvtourVersion` (fg of `Special`, bold), `NvtourNoteBg` (the band), `NvtourFrame<Role>` (the frame), and `NvtourPanelFile` (→
 `Directory`), `NvtourPanelProgress` (→ `Comment`). A `User NvtourHighlights` autocmd runs after they
 are defined.
 
@@ -400,46 +400,57 @@ that does can show diagnostics for the old code.
 ### Links between steps
 
 A jump to another file, or to another version of the same file, loses the "why" and the "where".
-The current step shows both:
+The current step shows the "where" above its note, and the "why" of the next jump below its range:
 
 ```
-← from 2 · a.cpp:412: `get()` calls `evict()` on a miss     ← the link: the source step and --via
-◇ b.cpp @origin/master (1a2b3c4d5e6f)                      ← where: the file and version, when changed
-╭ The cleanup thread erases the entry ...                   ← the note
-  88│   cache.erase(key);
-→ next 4 · c.cpp:10: the reader uses `it` again             ← below l2: where ]w goes, and why
+     ╭──────────────────────────────────────────────╮
+   ▎ │ ◇ b.cpp @origin/master (1a2b3c4d5e6f)         │  ← the file and version, when they changed
+   ▎ │ The cleanup thread erases the entry ...       │  ← the note
+     ╰──────────────────────────────────────────────╯
+88 ▎   cache.erase(key);
+   ▎ ╶─ → next 4 · c.cpp:10: the reader uses `it` again  ← below l2: where ]w goes, and why (--via)
 ```
 
-- **Source.** The source of a step is the step given with `--from N`, else the step before it. The
-  "from" line is shown for a `--via` or a `--from` link, or when the buffer (the file, or its
-  version) is different from the step before it in the tour (the code the user saw last; also when
-  `--from` names another step). The location is `line N` in the same buffer, else `path:N` (with
-  ` @ref`, or ` · working tree` when the other step is the same file at a ref). `from N` has the colour
-  `NvtourSign<Role>` of the source step, the location `NvtourViaLoc`, the text `NvtourVia` (with
-  `` `code` `` and `**bold**` as in notes).
-- **Where.** The `◇` line is shown when the buffer is different from the step before: the file
+- **Source.** The source of a step is the step given with `--from N`, else the step before it.
+- **Where.** The `◇` line is shown when the buffer is different from the step before it in the tour
+  (the code the user saw last, also when `--from` names another step): the file
   name (`NvtourViaLoc`) and the version (`NvtourVersion`): ` @ref` for a step at a git ref, with the
   first 12 characters of the commit in `()` when the ref is not itself that commit, or
   ` · working tree` when the step before was at a git ref. The first step has no `◇` line.
-- **Next.** The "next" line is shown when the next step is in another buffer, or its `--via` link
-  comes from this step. It shows the `--via` text of that link, else the label of the next step.
+- **Next.** The "next" line is shown when the next step is in another buffer or has a `--via` link.
+  The location is `line N` in the same buffer, else `path:N` (with ` @ref`, or ` · working tree` when
+  this step is the same file at a ref), then ` (from N)` when the link of the next step comes from
+  another step, then the `--via` text (`NvtourVia`, with `` `code` `` and `**bold**` as in notes), else
+  the label of the next step. `next N` has the colour `NvtourSign<Role>` of the next step. The
+  `--via` text is not shown again on the arrival at the step: the same text twice is noise.
 - Each link line is wrapped to the note width; continuation lines are indented by 2 cells.
 - Only the current step shows link lines. Adding, editing or removing a step renders all steps
   again, so the steps next to it show the new links.
 
-### Band
+### Frame and band
 
-All virtual lines of a step (link lines, the note, the collapsed note) are a band, so they do not look
-like code. Each line has `NvtourNoteBg` (a light tint, blended from `Normal`) over the full window
+All virtual lines of a step (link lines, the note, the collapsed note) must not look like code. Both
+styles start the lines in the gutter (`virt_lines_leftcol`) with blank cells up to the code column
+(`textoff`), so the text is in the column of the code, and in the current step the gutter has `▎` in
+`NvtourSign<Role>` in the column of the range bar, so one bar goes from the note through the range.
+The column is `textoff - number width - 1` (the second cell of a 2-cell sign column before the
+numbers; the number width as in nvim: `max('numberwidth', digits + 1)`); there is no bar with a
+`'statuscolumn'`, `signcolumn=no` or `signcolumn=number`. Both need a window: a step drawn without
+one gets plain lines, and is drawn again on `BufWinEnter` in the window that shows its buffer.
+
+**Frame** (the default). No background. The block above `l1` of the current step (the `◇` line and the
+note) is in a frame `╭─╮ │ │ ╰─╯` in `NvtourFrame<Role>` (the role accent blended 75 % over `Normal`
+bg), from the code column to the right edge of the window; the note has no `╭ │ ╰ ▸` prefixes in it.
+The "next" line gets a lead `╶─ ` in `NvtourFrame<Role>`, a collapsed note a lead `╶─ ` in
+`NvtourNoteBorder` (instead of `╶ `); continuation lines are indented by 3 cells. The frame costs 2
+screen lines per block; `scroll_to` counts them.
+
+**Band** (`vim.g.nvtour_note_style = "band"`). Each line has `NvtourNoteBg` (a light tint, blended from `Normal`) over the full window
 width: the chunks get `{ "NvtourNoteBg", group }` (so `NvtourNoteCode` keeps its own background), and
 blank padding goes to the window width. The lines start in the gutter (`virt_lines_leftcol`) with
 blank cells up to the code column (`textoff`), so the text is in the column of the code. In the
 current step the gutter has `▎` in `NvtourSign<Role>` in the column of the range bar, so one bar goes
-from the note through the range. The column is `textoff - number width - 1` (the second cell of a
-2-cell sign column before the numbers; the number width as in nvim: `max('numberwidth', digits + 1)`);
-there is no bar with a `'statuscolumn'`, `signcolumn=no` or `signcolumn=number`. The band needs a
-window: a step drawn without one gets only the tint on its text, and is drawn again on `BufWinEnter`
-in the window that shows its buffer.
+from the note through the range.
 
 ## 7. Panel
 
