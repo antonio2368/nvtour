@@ -745,7 +745,7 @@ def test_expect_text_is_marked_in_the_current_step(cli, nv):
     assert [m[1] for m in step_marks(nv, "a.txt") if m[3].get("hl_group") == "NvtourMarkInfo"] == [8]
     assert not [m for m in step_marks(nv, "a.txt") if m[3].get("hl_group") == "NvtourMarkFault"]
     data = json.loads(ok(cli("--json", "status")))
-    assert [s.get("expect") for s in data["steps"]] == [None, "line"]
+    assert [s.get("expect") for s in data["steps"]] == [None, ["line"]]
 
 
 def view(nv):
@@ -1123,3 +1123,89 @@ def test_virtual_lines_are_framed(cli, nv):
         assert "".join(c[0] for c in content(collapsed[0])) == "Third note."
     finally:
         nv.command("set nonumber signcolumn=auto")
+
+
+def test_expect_can_mark_several_texts(cli, nv):
+    ok(cli("start", "Marks"))
+    ok(cli("step", "a.txt:5-6", "--role", "fault", "--expect", "line 5", "--expect", "of a"))
+
+    def marked():
+        return sorted((m[1], m[2], m[3]["end_col"]) for m in step_marks(nv, "a.txt")
+                      if m[3].get("hl_group") == "NvtourMarkFault")
+
+    # "line 5" once, "of a" on both lines ("line 5 of a": bytes 0-6 and 7-11)
+    assert marked() == [(4, 0, 6), (4, 7, 11), (5, 7, 11)]
+    r = cli("step", "a.txt:5-6", "--expect", "line 5", "--expect", "nope")
+    assert r.returncode == 6 and '--expect "nope" not found in a.txt:5-6' in r.stderr
+    assert json.loads(ok(cli("--json", "status")))["total"] == 1  # nothing was added
+    ok(cli("edit", "1", "--expect", "line 6"))  # the new list replaces the old one
+    assert marked() == [(5, 0, 6)]
+    assert cli("edit", "1", "--expect", "line 6", "--expect", "nope").returncode == 6
+    assert marked() == [(5, 0, 6)]  # a failed edit changes nothing
+    ok(cli("edit", "1", "--expect", ""))
+    assert marked() == []
+    assert json.loads(ok(cli("--json", "status")))["steps"][0].get("expect") is None
+
+
+def below_rows(nv, suffix, row):
+    """Text of the virtual lines below buffer row `row` (0-based), without the gutter."""
+    for m in step_marks(nv, suffix):
+        d = m[3]
+        if m[1] == row and d.get("virt_lines") and not d.get("virt_lines_above"):
+            return d["virt_lines"]
+    return []
+
+
+def test_suggest_shows_the_proposed_code(cli, nv):
+    ok(cli("start", "Suggest"))
+    ok(cli("step", "a.txt:5-6", "--role", "fix", "--suggest", "        new five\n\tnew six\n"))
+    win = nv.current.window
+    width = nv.call("getwininfo", win.handle)[0]["width"]
+    rows = below_rows(nv, "a.txt", 5)
+    texts = ["".join(t for t, _ in line) for line in rows]
+    assert len(rows) == 4 and " suggested " in texts[0] and texts[-1].strip().startswith("╰")
+    # Up to 4 cells of the common indentation go: the new code is in the column of the old code.
+    assert [content(line) for line in rows[1:3]] == [
+        [["+ ", "NvtourSignFix"], ["    new five", "NvtourSuggest"]],
+        [["+ ", "NvtourSignFix"], ["    new six", "NvtourSuggest"]]]  # the tab is 8 spaces
+    assert all(sum(nv.call("strdisplaywidth", t) for t, _ in line) == width for line in rows)
+    strike = sorted((m[1], m[2], m[3]["end_col"]) for m in step_marks(nv, "a.txt")
+                    if m[3].get("hl_group") == "NvtourStrike")
+    assert strike == [(4, 0, 11), (5, 0, 11)]  # the replaced lines, from the first non-blank character
+    data = json.loads(ok(cli("--json", "status")))
+    assert data["steps"][0]["suggest"] == ["        new five", "\tnew six"]
+    assert "       + suggested: 2 lines" in ok(cli("status")).splitlines()
+    # Another step is current: one line, and no strikethrough.
+    ok(cli("step", "a.txt:9", "--jump"))
+    rows = below_rows(nv, "a.txt", 5)
+    assert ["".join(c[0] for c in content(line)) for line in rows] == ["suggested: 2 lines"]
+    assert not [m for m in step_marks(nv, "a.txt") if m[3].get("hl_group") == "NvtourStrike"]
+    # A line wider than the frame is cut with "…"; stdin works; '' removes the suggestion.
+    ok(cli("edit", "1", "--suggest", "-", stdin="x" * 300 + "\n"))
+    ok(cli("goto", "1"))
+    rows = below_rows(nv, "a.txt", 5)
+    assert any(t.endswith("…") for line in rows for t, _ in line)
+    assert all(sum(nv.call("strdisplaywidth", t) for t, _ in line) == width for line in rows)
+    ok(cli("edit", "1", "--suggest", ""))
+    assert below_rows(nv, "a.txt", 5) == []
+    assert not [m for m in step_marks(nv, "a.txt") if m[3].get("hl_group") == "NvtourStrike"]
+    r = cli("step", "a.txt:3", "--note", "-", "--suggest", "-", stdin="x\n")
+    assert r.returncode == 2 and "only one of --note and --suggest" in r.stderr
+
+
+def test_suggest_has_syntax_colours(cli, nv, sandbox):
+    if not nv.exec_lua("return vim.treesitter.query.get('lua', 'highlights') ~= nil"):
+        pytest.skip("no lua highlights query")
+    f = sandbox.ws / "fix.lua"
+    f.write_text("local x = 1\nreturn x\n")
+    try:
+        ok(cli("start", "Colours"))
+        ok(cli("step", "fix.lua:1", "--role", "fix", "--suggest", "local y = 2 -- note\n"))
+        line = content(below_rows(nv, "fix.lua", 0)[1])
+        groups = {t: g for t, g in line}
+        assert groups["local"].startswith("@keyword") and groups["2"].startswith("@number")
+        assert groups["-- note"].startswith("@comment")
+    finally:
+        ok(cli("clear"))
+        nv.command("silent! bwipeout! fix.lua")
+        f.unlink()

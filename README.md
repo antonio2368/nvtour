@@ -31,6 +31,7 @@ Neovim in parallel. You step through the tour with `]w` / `[w`.
 | 📋 **Step panel** | A side panel lists the steps by file, with a markdown summary. |
 | 🔍 **Focus** | Folds or dims all code that is not related to the tour. |
 | 🕰️ **Old code as a step** | `--ref GITREF` puts a step on a file as it is at a git ref, also a deleted file. |
+| ✏️ **Suggested fix** | `--suggest` shows the code that would replace a range, below it, with syntax colours. The file does not change. |
 | 🔀 **Read-only diffs** | Shows a file against a git ref, another file or stdin. |
 | ✅ **Self-checking ranges** | `--expect TEXT` stops a wrong line number before it shows the wrong code. |
 
@@ -122,7 +123,8 @@ How the steps behave:
   step 1. `step --jump` forces a jump; `--no-jump` suppresses it for the first step too.
 - **Each step prints the first highlighted line** so the agent can check it.
 - **`--expect TEXT`** fails with exit 6 when `TEXT` is not in the range. In the current step, each occurrence
-  of `TEXT` in the range is underlined in the role colour.
+  of `TEXT` in the range is underlined in the role colour. Give it more than one time to mark several parts
+  (`--expect 'refresh(key)' --expect 'it->second'`); each text must be in the range.
 - **Notes are wrapped** to the window width. Two inline markdown forms are shown: `` `code` `` and
   `**bold**` (the markers are hidden).
 - **A jump scrolls** so that the note and the range are in view: centred when they fit, else the note at the
@@ -151,6 +153,35 @@ there, and where you are. The current step shows both:
   `--via` link. You know where `]w` goes, and why, before you press it.
 - **In the panel,** each link is a line `↓ [from N: ]text` before the step, so the panel reads as a chain.
 - **Jumplist:** each jump adds the previous position to the jumplist, so `<C-o>` goes back.
+
+### Suggested fix
+
+`--suggest TEXT|-` shows the code that would replace the range of a step. Use it on a `fix` step:
+
+```sh
+nvtour step src/cache.cpp:19-20 --role fix --label "update in place" --suggest - <<'EOF'
+        it->second.expires_at += ttl;
+        return it->second.value;
+EOF
+```
+
+```
+19 ▎     r̶e̶f̶r̶e̶s̶h̶(̶k̶e̶y̶)̶;̶                 ← the lines that the suggestion replaces: struck through
+20 ▎     r̶e̶t̶u̶r̶n̶ ̶i̶t̶-̶>̶s̶e̶c̶o̶n̶d̶.̶v̶a̶l̶u̶e̶;̶
+   ▎ ╭ suggested ─────────────────────────────╮
+   ▎ │ +   it->second.expires_at += ttl;        │  ← the new code, in the column of the old code
+   ▎ │ +   return it->second.value;             │
+   ▎ ╰──────────────────────────────────────────╯
+```
+
+- **Only virtual lines.** The file and the buffer do not change.
+- **Syntax colours** come from treesitter, in the language of the file. Without a parser the code is plain.
+- **The indentation** is the indentation of the file. Up to 4 cells of it go, so the new code is in the
+  column of the code that it replaces. A line wider than the window is cut with `…`.
+- **The other steps** show only one line: `╶─ suggested: 2 lines`.
+- `edit N --suggest TEXT|-` changes it, `--suggest ''` removes it. Only one of `--note` and `--suggest` can
+  read stdin.
+- For a change that is larger than one range, use `nvtour diff`.
 
 ### Old code as a step
 
@@ -186,8 +217,8 @@ nvtour step src/cache.cpp:16-21 --role fix --label "check end() first"
 | command | what it does |
 |---|---|
 | `start [TITLE]` | start a new tour (keeps an open panel) |
-| `step FILE:L1[-L2] [--ref GITREF] [--note TEXT\|-] [--label] [--role] [--expect TEXT] [--via TEXT] [--from N] [--at N] [--jump\|--no-jump]` | add a step (`--ref`: on the file at that git ref; `--via`: why the tour goes there from the step before, or from step `--from N`) |
-| `edit N [FILE:L1[-L2] [--ref GITREF]] [--note] [--label] [--role] [--expect] [--via] [--from N] [--jump]` | change a step (`''` removes a label, note or link text; `--from 0` links from the step before again; a new location without `--ref` is on the working tree) |
+| `step FILE:L1[-L2] [--ref GITREF] [--note TEXT\|-] [--label] [--role] [--expect TEXT]... [--via TEXT] [--from N] [--suggest TEXT\|-] [--at N] [--jump\|--no-jump]` | add a step (`--ref`: on the file at that git ref; `--via`: why the tour goes there from the step before, or from step `--from N`; `--suggest`: the code that would replace the range) |
+| `edit N [FILE:L1[-L2] [--ref GITREF]] [--note] [--label] [--role] [--expect] [--via] [--from N] [--suggest] [--jump]` | change a step (`''` removes a label, note, link text, suggestion or the `--expect` texts; a new `--expect` list replaces the old one; `--from 0` links from the step before again; a new location without `--ref` is on the working tree) |
 | `remove N` | remove a step |
 | `panel [TEXT\|-\|--file PATH] [--toggle] [--clear]` | side panel text |
 
@@ -272,7 +303,8 @@ In the names below, `{...}` is one of `Fault`, `Flow`, `Fix`, `Context`, `Info`.
 | `NvtourNumber{...}` | line numbers of the range |
 | `NvtourSign{...}` | the bar, the step number in the end-of-line marker, the panel and the winbar |
 | `NvtourLabel{...}` | end-of-line label |
-| `NvtourMark{...}` | the `--expect` text |
+| `NvtourMark{...}` | the `--expect` texts |
+| `NvtourStrike`, `NvtourSuggest` | the lines that a suggestion replaces, suggested code without a syntax group |
 | `NvtourNote`, `NvtourNoteCode`, `NvtourNoteBold` | the note of the current step |
 | `NvtourNoteCollapsed` | one-line note of the other steps |
 | `NvtourNoteBorder` | note border |

@@ -103,8 +103,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--note", metavar="TEXT", help="note text, or - to read stdin")
     p.add_argument("--label")
     p.add_argument("--role", choices=ROLES, default="info")
-    p.add_argument("--expect", metavar="TEXT", help="fail (exit 6) unless TEXT occurs in the range; TEXT is underlined in the current step")
+    p.add_argument("--expect", metavar="TEXT", action="append",
+                   help="fail (exit 6) unless TEXT occurs in the range; TEXT is underlined in the current step "
+                        "(repeat it for more texts)")
     p.add_argument("--via", metavar="TEXT", help="why the tour goes to this step from the step before it (or from --from N)")
+    p.add_argument("--suggest", metavar="TEXT", help="code that would replace the range, shown below it (read-only), "
+                   "or - to read stdin")
     p.add_argument("--from", dest="from_", type=positive_int, metavar="N", help="the link (--via) comes from step N, not from the step before")
     p.add_argument("--at", type=int, metavar="N", help="insert as step N instead of appending")
     g = p.add_mutually_exclusive_group()
@@ -118,8 +122,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--note", metavar="TEXT", help="new note, - to read stdin, '' to remove")
     p.add_argument("--label", help="new label, '' to remove")
     p.add_argument("--role", choices=ROLES)
-    p.add_argument("--expect", metavar="TEXT", help="fail (exit 6) unless TEXT occurs in the range; TEXT is underlined in the current step ('' removes it)")
+    p.add_argument("--expect", metavar="TEXT", action="append",
+                   help="fail (exit 6) unless TEXT occurs in the range; TEXT is underlined in the current step "
+                        "(repeat it for more texts; the list replaces the old one; '' removes it)")
     p.add_argument("--via", metavar="TEXT", help="new link text, '' to remove")
+    p.add_argument("--suggest", metavar="TEXT", help="new suggested code, - to read stdin, '' to remove")
     p.add_argument("--from", dest="from_", type=non_negative_int, metavar="N", help="the link comes from step N (0: the step before it)")
     p.add_argument("--jump", action="store_true", help="jump to the step")
 
@@ -251,15 +258,18 @@ def build_request(args: argparse.Namespace, workspace: str) -> tuple[str, dict[s
     """Translate parsed CLI arguments into a (command, Lua args) pair."""
     c = args.command
     base: dict[str, Any] = {"workspace": workspace}
+    if c in ("step", "edit") and args.note == "-" and args.suggest == "-":
+        raise NvtourError(EXIT_USAGE, f"{c}: only one of --note and --suggest can read stdin (-)")
     if c == "start":
         return "start", {**base, "title": args.title or None}
     if c == "step":
         return "step", {**base, **location(args.spec, args.ref), "note": read_text_arg(args.note, "--note -"),
                         "label": args.label, "role": args.role, "expect": args.expect, "via": args.via,
-                        "from": args.from_, "at": args.at, "jump": args.jump or None, "no_jump": args.no_jump or None}
+                        "suggest": read_text_arg(args.suggest, "--suggest -"), "from": args.from_, "at": args.at, "jump": args.jump or None, "no_jump": args.no_jump or None}
     if c == "edit":
         req: dict[str, Any] = {**base, "n": args.n, "note": read_text_arg(args.note, "--note -"), "label": args.label,
                                "role": args.role, "expect": args.expect, "via": args.via, "from": args.from_,
+                               "suggest": read_text_arg(args.suggest, "--suggest -"),
                                "jump": args.jump or None}
         if args.spec:
             req.update(location(args.spec, args.ref))
@@ -360,6 +370,9 @@ def format_status(res: dict[str, Any], workspace: str) -> str:
             src = f"from {s['from']}" if s.get("from") else ""
             via = " ".join((s.get("via") or "").split())
             out.append(f"       ↓ {src}{': ' if src and via else ''}{via}")
+        if s.get("suggest"):
+            n = len(s["suggest"])
+            out.append(f"       + suggested: {n} line{'' if n == 1 else 's'}")
     for f in res.get("focus") or []:
         rs = " ".join(fmt_range(a, b) for a, b in f["ranges"])
         out.append(f"focus: {display_path(f['file'], workspace)} {rs} ({f['mode']})")

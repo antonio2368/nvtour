@@ -117,6 +117,8 @@ local function define_highlights(force)
   set("NvtourVia", { fg = blend(fg, bg, 0.65) })
   set("NvtourViaLoc", { fg = blend(hl_attr("Directory", "fg") or fg, bg, 0.85) })
   set("NvtourVersion", { fg = hl_attr("Special", "fg") or fg, bold = true })
+  set("NvtourSuggest", { fg = fg }) -- suggested code without a syntax group
+  set("NvtourStrike", { strikethrough = true }) -- the lines that a suggestion replaces (no fg: syntax stays)
   set("NvtourDim", { fg = blend(fg, bg, 0.35) })
   set("NvtourFlash", { bg = blend(fg, bg, 0.25) })
   set("NvtourPanelCurrent", { bg = blend(fg, bg, 0.12), bold = true })
@@ -387,6 +389,21 @@ end
 local function explicit_from(step)
   local f = step.from
   return f ~= nil and f ~= step and S.tour.steps[f.n] == f
+end
+
+--- The --expect texts as a list without empty texts, or nil when there are none. Takes a list (from
+--- the CLI) or one string (a step made by an older runtime).
+local function expect_list(v)
+  if v == nil then
+    return nil
+  end
+  local out = {}
+  for _, t in ipairs(type(v) == "table" and v or { v }) do
+    if type(t) == "string" and t ~= "" then
+      out[#out + 1] = t
+    end
+  end
+  return #out > 0 and out or nil
 end
 
 local render_step -- forward declaration
@@ -1104,6 +1121,119 @@ local function bar_col(win, textoff)
   return col >= 1 and col or nil
 end
 
+---------------------------------------------------------------------------
+-- Suggested code (--suggest)
+---------------------------------------------------------------------------
+
+--- `line` with its tabs expanded to spaces for 'tabstop' `ts`.
+local function expand_tabs(line, ts)
+  if not line:find("\t", 1, true) then
+    return line
+  end
+  local out, col = {}, 0
+  for ch in line:gmatch("[%z\1-\127\194-\244][\128-\191]*") do
+    if ch == "\t" then
+      local n = ts - col % ts
+      out[#out + 1] = (" "):rep(n)
+      col = col + n
+    else
+      out[#out + 1] = ch
+      col = col + vim.fn.strdisplaywidth(ch)
+    end
+  end
+  return table.concat(out)
+end
+
+--- `lines` of code as virt_text chunks with the treesitter highlight groups of the language of
+--- `buf`, one chunk list per line. Without a parser or a highlights query the text is NvtourSuggest.
+local function code_chunks(lines, buf)
+  local groups = {} -- [row (0-based)][byte (0-based)] = highlight group
+  local text = table.concat(lines, "\n")
+  local ok, lang = pcall(vim.treesitter.language.get_lang, vim.bo[buf].filetype)
+  if ok and lang and text ~= "" then
+    pcall(function()
+      local query = vim.treesitter.query.get(lang, "highlights")
+      if not query then
+        return
+      end
+      local tree = vim.treesitter.get_string_parser(text, lang):parse()[1]
+      for id, node in query:iter_captures(tree:root(), text, 0, -1) do
+        local name = query.captures[id]
+        if not name:match("^_") and name ~= "spell" and name ~= "nospell" and name ~= "conceal" then
+          local group = "@" .. name .. "." .. lang -- falls back to "@" .. name, as in the buffer
+          local sr, sc, er, ec = node:range()
+          for r = sr, er do
+            local row = groups[r] or {}
+            groups[r] = row
+            for b = (r == sr and sc or 0), (r == er and ec or #(lines[r + 1] or "")) - 1 do
+              row[b] = group -- inner nodes come later and win, as in the treesitter highlighter
+            end
+          end
+        end
+      end
+    end)
+  end
+  local out = {}
+  for i, line in ipairs(lines) do
+    local row, chunks, from = groups[i - 1] or {}, {}, 1
+    for b = 1, #line do
+      local g = row[b - 1] or "NvtourSuggest"
+      if b == #line or (row[b] or "NvtourSuggest") ~= g then
+        chunks[#chunks + 1] = { line:sub(from, b), g }
+        from = b + 1
+      end
+    end
+    out[i] = chunks
+  end
+  return out
+end
+
+--- Cut `chunks` to `width` display cells; a cut line ends with "…". Returns the chunks and their width.
+local function clip_chunks(chunks, width)
+  local out, w = {}, 0
+  for _, c in ipairs(chunks) do
+    local cw = vim.fn.strdisplaywidth(c[1])
+    if w + cw > width then
+      local room, text = width - w - 1, ""
+      for i = 0, vim.fn.strchars(c[1]) - 1 do
+        local ch = vim.fn.strcharpart(c[1], i, 1)
+        local chw = vim.fn.strdisplaywidth(ch)
+        if chw > room then
+          break
+        end
+        text, room = text .. ch, room - chw
+      end
+      out[#out + 1] = { text .. "…", c[2] }
+      return out, width - room
+    end
+    out[#out + 1] = c
+    w = w + cw
+  end
+  return out, w
+end
+
+--- The suggested lines of `step` as chunk lines: tabs expanded, syntax colours, "+ " in front.
+--- `shift` cells of the common indentation are removed (at most): the cells that the frame and the
+--- "+ " take before the code, so the new code is in the column of the code that it replaces.
+local function suggest_lines(step, shift)
+  local ts = vim.bo[step.buf].tabstop
+  local lines, common = {}, shift
+  for _, l in ipairs(step.suggest) do
+    lines[#lines + 1] = expand_tabs(l, ts)
+    if lines[#lines]:find("%S") then
+      common = math.min(common, #lines[#lines]:match("^ *"))
+    end
+  end
+  for i, l in ipairs(lines) do
+    lines[i] = l:sub(math.min(common, #l:match("^ *")) + 1)
+  end
+  local out = {}
+  for i, chunks in ipairs(code_chunks(lines, step.buf)) do
+    out[i] = vim.list_extend({ { "+ ", "NvtourSign" .. cap(step.role) } }, chunks)
+  end
+  return out
+end
+
 --- The style of the virtual lines of a step: "frame" (the default) or "band" (vim.g.nvtour_note_style).
 local function note_style()
   return vim.g.nvtour_note_style == "band" and "band" or "frame"
@@ -1128,7 +1258,8 @@ end
 
 --- Make the virtual lines of a step stand out from the code with a border, without a background.
 --- `kind` is "block" (the links and the note of the current step: a frame ╭─╮ │ │ ╰─╯ in the role
---- colour), "next" (the line below the range: a "╶─" lead) or "collapsed" (the one-line note of
+--- colour), "suggest" (the suggested code: the same frame with the title "suggested"), "next" (the
+--- line below the range: a "╶─" lead) or "collapsed" (a one-line note or the suggestion line of
 --- another step: a grey "╶─" lead). Like the band, the lines start in the gutter.
 local function frame(lines, win, role, current, kind)
   if not valid_win(win) then
@@ -1143,17 +1274,20 @@ local function frame(lines, win, role, current, kind)
     return vim.list_extend(gutter_chunks(off, col, role, plain_hl), chunks)
   end
   local out = {}
-  if kind == "block" then
-    out[1] = row({ { "╭" .. ("─"):rep(inner - 2) .. "╮", B } })
+  if kind == "block" or kind == "suggest" then
+    -- The suggestion has a title in its top border: "╭ suggested ───╮".
+    local title = kind == "suggest" and " suggested " or ""
+    out[1] = row({
+      { "╭", B },
+      { title, "NvtourLabel" .. cap(role) },
+      { ("─"):rep(math.max(0, inner - 2 - vim.fn.strdisplaywidth(title))) .. "╮", B },
+    })
     for _, line in ipairs(lines) do
-      local w = 0
-      for _, c in ipairs(line) do
-        w = w + vim.fn.strdisplaywidth(c[1])
-      end
-      local chunks = { { "│ ", B } }
-      vim.list_extend(chunks, line)
-      chunks[#chunks + 1] = { (" "):rep(math.max(0, inner - 4 - w)) .. " │", B }
-      out[#out + 1] = row(chunks)
+      local chunks, w = clip_chunks(line, inner - 4) -- code does not wrap: a long line is cut
+      local cells = { { "│ ", B } }
+      vim.list_extend(cells, chunks)
+      cells[#cells + 1] = { (" "):rep(math.max(0, inner - 4 - w)) .. " │", B }
+      out[#out + 1] = row(cells)
     end
     out[#out + 1] = row({ { "╰" .. ("─"):rep(inner - 2) .. "╯", B } })
   else
@@ -1243,25 +1377,55 @@ render_step = function(step, win)
       or band(above, win, step.role, current)
     add(step.l1 - 1, vim.tbl_extend("force", opts, { virt_lines_above = true }))
   end
-  local below = current and next_lines(step, width) or {}
-  if #below > 0 then
-    local opts = framed and frame(below, win, step.role, current, "next") or band(below, win, step.role, current)
-    step.below = #opts.virt_lines -- nvim_win_text_height counts these with the next row: scroll_to adds them
-    add(step.l2 - 1, opts)
-  else
-    step.below = 0
+  -- Below the range: the suggested code, then the "next" line. Other steps: one suggestion line.
+  local below = { virt_lines = {} }
+  local function put(opts)
+    vim.list_extend(below.virt_lines, opts.virt_lines)
+    below.virt_lines_leftcol = below.virt_lines_leftcol or opts.virt_lines_leftcol
   end
-  if current and step.expect and step.expect ~= "" then
+  if step.suggest and current then
+    if framed then
+      put(frame(suggest_lines(step, 4), win, step.role, current, "suggest")) -- "│ " and "+ "
+    else
+      put(band(vim.list_extend({ { { "suggested", "NvtourLabel" .. R } } }, suggest_lines(step, 2)), win, step.role, current))
+    end
+  elseif step.suggest then
+    local n = #step.suggest
+    local line = { { ("suggested: %d line%s"):format(n, n == 1 and "" or "s"), "NvtourNoteCollapsed" } }
+    put(framed and frame({ line }, win, step.role, current, "collapsed") or band({ line }, win, step.role, current))
+  end
+  local nxt = current and next_lines(step, width) or {}
+  if #nxt > 0 then
+    put(framed and frame(nxt, win, step.role, current, "next") or band(nxt, win, step.role, current))
+  end
+  -- nvim_win_text_height counts the lines below l2 with the next row: scroll_to adds them.
+  step.below = current and #below.virt_lines or 0
+  if #below.virt_lines > 0 then
+    add(step.l2 - 1, below)
+  end
+  if step.suggest and current then
+    -- The lines that the suggestion replaces are struck through (from the first non-blank character).
+    for i, line in ipairs(api.nvim_buf_get_lines(buf, step.l1 - 1, step.l2, false)) do
+      local first = line:find("%S")
+      if first then
+        add(step.l1 + i - 2, { end_col = #line, hl_group = "NvtourStrike", priority = 140 }, first - 1)
+      end
+    end
+  end
+  local expects = current and expect_list(step.expect) or {}
+  if #expects > 0 then
     local lines = api.nvim_buf_get_lines(buf, step.l1 - 1, step.l2, false)
-    for i, line in ipairs(lines) do
-      local from = 1
-      while true do
-        local s, e = line:find(step.expect, from, true)
-        if not s then
-          break
+    for _, text in ipairs(expects) do
+      for i, line in ipairs(lines) do
+        local from = 1
+        while true do
+          local s, e = line:find(text, from, true)
+          if not s then
+            break
+          end
+          add(step.l1 + i - 2, { end_col = e, hl_group = "NvtourMark" .. R, priority = 150 }, s - 1)
+          from = e + 1
         end
-        add(step.l1 + i - 2, { end_col = e, hl_group = "NvtourMark" .. R, priority = 150 }, s - 1)
-        from = e + 1
       end
     end
   end
@@ -1768,8 +1932,8 @@ local function rerender_all()
   end
 end
 
---- Load the buffer of location `a` and check that l1-l2 exists and (with `expect`) contains the
---- expected text.
+--- Load the buffer of location `a` and check that l1-l2 exists and (with `expect`, a list) contains
+--- each expected text.
 local function checked_range(a, l1, l2, expect)
   local buf = loc_buf(a)
   local count = api.nvim_buf_line_count(buf)
@@ -1779,9 +1943,10 @@ local function checked_range(a, l1, l2, expect)
   if l2 > count then
     fail(("range %d-%d is beyond end of file (%d lines): %s"):format(l1, l2, count, doc_name(a)), 6)
   end
-  if expect and expect ~= "" then
+  local lines = api.nvim_buf_get_lines(buf, l1 - 1, l2, false)
+  for _, expect in ipairs(expect_list(expect) or {}) do
     local found = false
-    for _, line in ipairs(api.nvim_buf_get_lines(buf, l1 - 1, l2, false)) do
+    for _, line in ipairs(lines) do
       if line:find(expect, 1, true) then
         found = true
         break
@@ -1835,8 +2000,9 @@ H.step = function(a)
     label = a.label,
     note = a.note,
     via = (a.via ~= "" and a.via) or nil,
+    suggest = (a.suggest and a.suggest ~= "") and split_lines(a.suggest) or nil,
     from = from,
-    expect = (a.expect ~= "" and a.expect) or nil,
+    expect = expect_list(a.expect),
     extmark_ids = {},
   }
   -- The step is added only after it rendered (and jumped); a failure leaves no half step behind.
@@ -1906,10 +2072,13 @@ H.edit = function(a)
     step.note = a.note ~= "" and a.note or nil
   end
   if a.expect ~= nil then
-    step.expect = a.expect ~= "" and a.expect or nil
+    step.expect = expect_list(a.expect) -- the new list replaces the old one; '' removes it
   end
   if a.via ~= nil then
     step.via = a.via ~= "" and a.via or nil
+  end
+  if a.suggest ~= nil then
+    step.suggest = a.suggest ~= "" and split_lines(a.suggest) or nil
   end
   if a.from == 0 then
     step.from = nil
@@ -2146,7 +2315,8 @@ H.status = function()
       note = s.note,
       via = s.via,
       from = explicit_from(s) and s.from.n or nil,
-      expect = s.expect,
+      expect = expect_list(s.expect),
+      suggest = s.suggest,
     }
   end
   local focus = {}

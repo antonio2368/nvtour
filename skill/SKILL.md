@@ -41,6 +41,7 @@ Use this when the user asks about code ("this", "here", "this chunk") but gives 
 - Get line numbers from `rg -n` or `sed -n 'A,Bp'` output, not from memory.
 - Each `step` prints the first highlighted line (`  412| ...`). Check it.
 - Add `--expect TEXT` (a substring of the range) to make a wrong range fail with exit 6 instead of highlighting the wrong code. The user sees `TEXT` underlined, so pick the exact expression the note is about (for example `it->second`).
+- When the note names more than one part of the range, give `--expect` for each one (at most 3): `--expect 'refresh(key)' --expect 'it->second'`. Each text must be in the range.
 - `FILE:L:COL` (compiler and `rg --column` output) is accepted; the column is ignored.
 
 ## Fixing a tour
@@ -89,9 +90,24 @@ Use this when the user asks about code ("this", "here", "this chunk") but gives 
 - The file does not have to exist in the working tree.
 - `nvtour edit N FILE:L1-L2` without `--ref` moves the step to the working tree. Add `--ref` to keep it on the old version.
 
+## Suggested fix
+
+- A `fix` step with a concrete change gives `--suggest`: the code that would replace the range. nvim shows it below the range, with syntax colours, and strikes through the old lines.
+- `--suggest` replaces the whole range: give all the new lines for it, not only the changed line. To delete a line, leave it out. Use the indentation of the file.
+- Multi-line code: `--suggest -` with a heredoc. Only one of `--note -` and `--suggest -` can read stdin; give the note inline then.
+
+  ```
+  nvtour step f.cpp:19-20 --role fix --label "update in place" --note 'Change the expiry through `it`.' --suggest - <<'EOF'
+          it->second.expires_at += ttl;
+          return it->second.value;
+  EOF
+  ```
+
+- `nvtour edit N --suggest ''` removes it.
+
 ## Diff
 
-- Before/after a fix that is not applied: `nvtour diff FILE --stdin` with the proposed version.
+- Before/after a fix that is larger than one range: `nvtour diff FILE --stdin` with the proposed version.
 - Compare full files: `nvtour diff FILE --ref origin/master`.
 - Read-only. `nvtour diff-close` closes it.
 

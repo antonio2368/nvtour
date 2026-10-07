@@ -139,9 +139,10 @@ nvtour attach [PID|SOCKET] [--clear]
 nvtour where
 nvtour start [TITLE]
 nvtour step FILE:L1[-L2] [--ref GITREF] [--note TEXT | --note -] [--label TEXT] [--role ROLE]
-            [--expect TEXT] [--via TEXT] [--from N] [--at N] [--jump | --no-jump]
+            [--expect TEXT]... [--via TEXT] [--from N] [--suggest TEXT | --suggest -] [--at N]
+            [--jump | --no-jump]
 nvtour edit N [FILE:L1[-L2] [--ref GITREF]] [--note TEXT | --note -] [--label TEXT] [--role ROLE]
-            [--expect TEXT] [--via TEXT] [--from N] [--jump]
+            [--expect TEXT]... [--via TEXT] [--from N] [--suggest TEXT | --suggest -] [--jump]
 nvtour remove N
 nvtour goto N | nvtour next | nvtour prev | nvtour first | nvtour last
 nvtour status
@@ -177,13 +178,17 @@ more ranges; extra bare `L3-L4` arguments apply to the same file.
 - **step** — appends a step (see §6), or inserts it with `--at N`. Only the first step of a tour
   jumps (so a finished tour is at step 1); `--jump` forces a jump, `--no-jump` suppresses it for the
   first step. Prints `step N/N: file:L1-L2 [role] label` and the first highlighted line
-  (`  L1| text`). `--expect TEXT` fails with exit 6 unless `TEXT` occurs in the range. `--note -`
+  (`  L1| text`). `--expect TEXT` fails with exit 6 unless `TEXT` occurs in the range; it can be
+  given more than one time, then each text must occur (the error names the first one that does not;
+  in `edit` the new list replaces the old one, `''` removes it). `--note -`
   reads the note from stdin (lets agents pass multi-line text with a heredoc). A step is added only
   after it rendered (and jumped); on an error nothing of it remains. `--ref GITREF` puts the step on
   the file as it is at that git ref, not on the working tree (§6, "Steps at a git ref"); the output
   then shows the location as `file:L1-L2 @GITREF`. `--via TEXT` is the link to the step: why the
   tour goes there from the step before it, or from step N with `--from N` (§6, "Links between
-  steps"). `--from N` with a step number that does not exist is exit 6.
+  steps"). `--from N` with a step number that does not exist is exit 6. `--suggest TEXT|-` is the
+  code that would replace the range (§6, "Suggested code"); `--note -` and `--suggest -` together
+  is exit 2 (only one can read stdin).
 - **edit / remove** — change or delete step N; all steps are renumbered and rendered again. A new
   location replaces the old one completely: `FILE:L1[-L2]` alone puts the step on the working tree,
   `FILE:L1[-L2] --ref GITREF` on that ref. `--ref` without a location is a usage error (exit 2).
@@ -231,7 +236,8 @@ M.state = {
 }
 ```
 
-Each step: `{ n, file, buf, l1, l2, role, label, note, expect, via, from, ref, sha, extmark_ids = {} }`.
+Each step: `{ n, file, buf, l1, l2, role, label, note, expect, via, from, suggest, ref, sha, extmark_ids = {} }`.
+`suggest` is a list of lines (nil when there is no suggestion).
 `ref` and `sha` are nil for a step on the working tree. `from` is the step table of a `--from N`
 link (not a number, so it stays correct when steps are inserted or removed); a link to a removed
 step falls back to the step before. `below` is the number of link lines below the range, and
@@ -306,7 +312,8 @@ For a step at `l1..l2` in buffer `buf` (0-based rows internally):
    `NvtourNoteCollapsed`, with ` …` when the note is longer. Notes are wrapped again on
    `WinResized`. For the current step, the link lines ("Links between steps" below) come before
    the note in the same block, and the "next" line is a virtual line **below** `l2`.
-3. **Expect marks** (current step only) — every occurrence of `expect` in `l1..l2`:
+3. **Expect marks** (current step only) — every occurrence of each text of `expect` (a list; a
+   single string from an older runtime is read as a list of one) in `l1..l2`:
    `hl_group = NvtourMark<Role>`, `priority = 150`.
 4. **Marker** — on `l1`, for every step: `virt_text = { {"  ← ", NvtourLabel<Role>}, {n,
    NvtourSign<Role>}, {" " .. label, NvtourLabel<Role>} }` (no label: `← n`), `virt_text_pos = "eol"`.
@@ -451,6 +458,26 @@ blank padding goes to the window width. The lines start in the gutter (`virt_lin
 blank cells up to the code column (`textoff`), so the text is in the column of the code. In the
 current step the gutter has `▎` in `NvtourSign<Role>` in the column of the range bar, so one bar goes
 from the note through the range.
+
+### Suggested code
+
+`--suggest` gives the lines that would replace `l1..l2`. They are only virtual lines: the buffer and
+the file do not change.
+
+- **Current step.** Below `l2`, before the "next" line: a frame like the note block, with the title
+  ` suggested ` in `NvtourLabel<Role>` in its top border; each line is `+ ` in `NvtourSign<Role>` and
+  the code. The lines `l1..l2` get `hl_group = NvtourStrike` (strikethrough only, so the syntax colour
+  stays) from the first non-blank character to the end of the line, `priority = 140`. Band style: a
+  `suggested` line and the `+ ` lines in the band.
+- **Code.** Tabs are expanded with the `'tabstop'` of the buffer. Up to 4 cells (band: 2) of the
+  common indentation are removed, the cells of `│ ` and `+ `, so the new code is in the column of the
+  code that it replaces. Colours: the language of the buffer's filetype
+  (`vim.treesitter.language.get_lang`), `vim.treesitter.get_string_parser` on the text, and the
+  captures of its `highlights` query as `@capture.lang` (inner captures win; `_*`, `spell`, `nospell`
+  and `conceal` are skipped). Without a parser or a query the code is `NvtourSuggest`. A line wider
+  than the frame is cut with `…` (code does not wrap).
+- **Other steps.** One line `suggested: N lines` in `NvtourNoteCollapsed`, with the grey `╶─ ` lead.
+- `scroll_to` counts the suggestion with the other lines below `l2`.
 
 ## 7. Panel
 
