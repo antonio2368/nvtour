@@ -31,6 +31,9 @@ FONT_SETS = [
     ("JetBrainsMono-{}.ttf", {"regular": "Regular", "bold": "Bold", "italic": "Italic", "bold_italic": "BoldItalic"}),
     ("DejaVuSansMono{}.ttf", {"regular": "", "bold": "-Bold", "italic": "-Oblique", "bold_italic": "-BoldOblique"}),
 ]
+# Treesitter parsers and queries for the colours of suggested code (--suggest), when they are installed.
+# Only the suggestion uses them: the buffer keeps the built-in syntax highlighting.
+TS_DIRS = [Path.home() / ".local/share/nvim/site", Path.home() / ".local/share/nvim/lazy/nvim-treesitter/runtime"]
 FONT_DIRS = [Path.home() / ".local/share/fonts", Path("/usr/share/fonts/truetype/jetbrains-mono"),
              Path("/usr/share/fonts/truetype/dejavu")]
 
@@ -118,6 +121,9 @@ def draw(screen: Screen, fonts: dict[str, ImageFont.FreeTypeFont], pad: int) -> 
             if a.get("underline") or a.get("undercurl"):
                 uy = y + asc + 3
                 d.line([x, uy, x + cw - 1, uy], fill=rgb(a.get("special", fg)), width=max(1, cw // 9))
+            if a.get("strikethrough"):
+                sy = y + 1 + (asc * 2) // 3
+                d.line([x, sy, x + cw - 1, sy], fill=rgb(fg), width=max(1, cw // 9))
     return img
 
 
@@ -140,6 +146,9 @@ class Demo:
             vim.o.shortmess = vim.o.shortmess .. "I"
             vim.g.nvtour_flash = 0
         """)
+        for d in TS_DIRS:
+            if d.is_dir():
+                self.nv.exec_lua("vim.opt.rtp:append(...)", str(d))
         if setup_lua:
             self.nv.exec_lua(setup_lua)
         self.nv.command("edit " + file)
@@ -174,8 +183,9 @@ TOUR = [
      "--via", "`get()` calls `refresh()` while it holds `it`", "--note", "`extract()` unlinks the node. Iterators to it are invalidated, "
                "and `insert()` does **not** make them valid again."),
     ("step", f"{DEMO}:19", "--role", "fix", "--label", "update in place",
-     "--via", "back in `get()`, where `refresh()` is called", "--note", "Change the expiry in place: `it->second.expires_at += ttl;`. "
-               "Then `it` stays valid and `refresh()` can go."),
+     "--via", "back in `get()`, where `refresh()` is called",
+     "--note", "Change the expiry through `it`. Then `it` stays valid and `refresh()` can go.",
+     "--suggest", "        it->second.expires_at += ttl;"),
 ]
 SUMMARY = """**Cause**: `get()` keeps `it` across `refresh()`, which re-inserts the node.
 
