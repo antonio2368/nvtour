@@ -14,7 +14,7 @@ It is **not** a code editing or review tool. It never writes to a file buffer or
 - No edits, no accept/reject diffs, no diagnostics, no LSP.
 - No spawning of nvim. If there is no suitable instance, the CLI says so and the agent asks the
   user to open one.
-- No images in v1 (the user's terminal is alacritty, no kitty graphics protocol). See §13.
+- No images in v1 (the user's terminal is alacritty, no kitty graphics protocol). Text diagrams are in §10; images are in §14.
 - No MCP server in v1. The CLI is the product; MCP is a thin wrapper later.
 
 ## 2. Architecture
@@ -141,8 +141,10 @@ nvtour start [TITLE]
 nvtour step FILE:L1[-L2] [--ref GITREF] [--note TEXT | --note -] [--label TEXT] [--role ROLE]
             [--expect TEXT]... [--via TEXT] [--from N] [--suggest TEXT | --suggest -] [--at N]
             [--jump | --no-jump]
-nvtour edit N [FILE:L1[-L2] [--ref GITREF]] [--note TEXT | --note -] [--label TEXT] [--role ROLE]
-            [--expect TEXT]... [--via TEXT] [--from N] [--suggest TEXT | --suggest -] [--jump]
+nvtour step L1[-L2] --diagram NAME [the same options]
+nvtour edit N [FILE:L1[-L2] [--ref GITREF] | L1[-L2] --diagram NAME] [--note TEXT | --note -]
+            [--label TEXT] [--role ROLE] [--expect TEXT]... [--via TEXT] [--from N]
+            [--suggest TEXT | --suggest -] [--jump]
 nvtour remove N
 nvtour goto N | nvtour next | nvtour prev | nvtour first | nvtour last
 nvtour status
@@ -150,6 +152,8 @@ nvtour focus FILE:L1-L2 [L3-L4 ...] [--context N] [--dim]
 nvtour unfocus [FILE]
 nvtour diff FILE (--ref GITREF | --file PATH | --stdin) [--title TEXT]
 nvtour diff-close
+nvtour diagram NAME [FILE|-] [--format mermaid|dot|easy|text] [--link TEXT=FILE:L1[-L2]]... [--ascii]
+               [--no-show]
 nvtour panel [TEXT | --file PATH | -] [--toggle] [--clear]
 nvtour clear [--keep-buffers]
 nvtour doctor
@@ -198,6 +202,8 @@ more ranges; extra bare `L3-L4` arguments apply to the same file.
 - **status** — the tour (title, steps, current), focus, panel, diff tabs and installed keys. Read only.
 - **focus / unfocus** — §8.
 - **diff / diff-close** — §9.
+- **diagram** — renders a diagram into a read-only buffer that steps can point to (`step --diagram`);
+  §10.
 - **panel** — §7. `TEXT`, `--file`, or `-` replaces the free markdown section. `--toggle`
   shows/hides the window. `--clear` empties the free section.
 - **clear** — removes everything nvtour created: extmarks, signs, folds (restoring fold options),
@@ -233,10 +239,13 @@ M.state = {
   flash = { buf = bufnr, seq = n },  -- the last flash; a newer one cancels its timer
   winbars = { [winid] = the window's own local 'winbar' },  -- restored by clear
   refs = { [sha .. ":" .. file] = { buf, file, rel, ref, sha, lines } },  -- ref step buffers
+  ns_diagram = nvim_create_namespace("nvtour_diagram"),  -- the colours of diagram lines and links
+  diagrams = { [name] = { name, file, buf, lines, links = { { text, file, l1, l2 } } } },  -- §10
 }
 ```
 
-Each step: `{ n, file, buf, l1, l2, role, label, note, expect, via, from, suggest, ref, sha, extmark_ids = {} }`.
+Each step: `{ n, file, buf, l1, l2, role, label, note, expect, via, from, suggest, ref, sha, diagram, extmark_ids = {} }`.
+`diagram` is the name of the diagram of a step on a diagram (§10), else nil.
 `suggest` is a list of lines (nil when there is no suggestion).
 `ref` and `sha` are nil for a step on the working tree. `from` is the step table of a `--from N`
 link (not a number, so it stays correct when steps are inserted or removed); a link to a removed
@@ -573,7 +582,75 @@ set lines, set `filetype` from `vim.filetype.match({ filename = path })`, `modif
 done by `clear`. The real buffer is never written; `diffthis` is window-local and disappears with
 the tab.
 
-## 10. Keymaps and user commands
+## 10. Diagrams
+
+`diagram NAME [FILE|-] [--format mermaid|dot|easy|text] [--link TEXT=FILE:L1[-L2]]... [--ascii] [--no-show]`
+
+A concept is often easier to see as a picture: a sequence of messages, a graph of components. The
+terminal cannot show images (§1), so a diagram is text: Unicode box drawing in a read-only buffer.
+A diagram is a document like a file, so tour steps can point to its lines, and `]w` goes from the
+diagram to the code and back.
+
+**Python: rendering** (`nvtour/diagram.py`).
+- `NAME`: letters, digits, `.`, `_`, `-` (else exit 2). The source is `FILE` or stdin (default `-`).
+- Format: `--format`, else from the extension (`.mmd`/`.mermaid` mermaid, `.dot`/`.gv` dot, `.txt`
+  text), else mermaid.
+- Renderers, found on `PATH` or given as a command (with arguments, `shlex` split) in an environment
+  variable: mermaid → `mermaid-ascii -f -` (`$NVTOUR_MERMAID_ASCII`; flowcharts and sequence
+  diagrams); dot → `graph-easy --from=dot --as=boxart`, easy (Graph::Easy syntax) →
+  `graph-easy --from=txt --as=boxart` (`$NVTOUR_GRAPH_EASY`); text → the source as it is (a diagram
+  drawn by hand). `--ascii` asks the renderer for `+-|` lines (`--ascii`, `--as=ascii`). The source
+  goes to the renderer on stdin; timeout 30 s.
+- Errors: no renderer, or it cannot run → exit 2 with an install hint; a renderer that fails, prints
+  nothing, or times out → exit 6 with its stderr.
+- The output is cleaned: colour escape codes removed (they would show as raw text in a buffer), tabs
+  expanded, trailing blanks and blank first and last lines removed. An empty diagram is exit 6.
+- `--link TEXT=FILE:L1[-L2]` (split at the last `=`, so TEXT can contain `=`): TEXT must occur in the
+  rendered lines and the range must exist in FILE, else exit 6 (the same idea as `--expect`).
+- Sent to Lua: `name`, `lines`, `links` (`{ text, file, l1, l2 }`), `show`. The output is
+  `diagram NAME: N lines, W columns, K link(s), shown|not shown`, then every line numbered (`  7| ...`),
+  so the agent can pick the lines of a step. `--json` adds `lines`.
+- `doctor` reports both renderers (optional checks).
+
+**Lua: the diagram buffer.** One buffer per name, in `state.diagrams[name] = { name, file, buf,
+lines, links }`, named `nvtour://diagram/NAME`, created like a ref buffer (§6): listed scratch,
+`buftype = nofile`, `bufhidden = hide`, no swap file, then `modifiable = false`, `readonly = true`;
+`filetype = nvtourdiagram`; `vim.b.nvtour_diagram = NAME` marks it. Colours in `ns_diagram`: runs
+of box drawing, block, shape and arrow characters (U+2190–21FF, U+2500–25FF, `∧`, `∨`) get
+`NvtourDiagramLine` (blended from `Normal`), so the labels stand out; each occurrence of a link text
+gets `NvtourDiagramLink` (fg of `Directory`, underlined). Like a ref buffer, a wiped or unloaded
+diagram buffer is made again from `lines` on the next use, and its steps move to the new buffer.
+
+**`diagram` again with the same name** replaces the lines in the same buffer. A step on the diagram
+that is beyond the new last line makes it exit 6, and nothing changes. The steps on it are drawn
+again.
+
+**The diagram window.** A split **above** the tour window (the code stays below it, the panel on
+the right), `height = min(lines + 1, 60 % of that window)` (the `+ 1` is the winbar), at least 3
+rows; `wrap` off (a wrapped diagram falls apart) and `winfixheight` on, both window-local. `diagram`
+shows it unless `--no-show`; the focus does not move. A window of the current tab that shows a
+diagram is reused (it then shows the new one). `tour_win(buf)` gives a diagram buffer this window;
+for a file it never chooses a window that shows a diagram (such a window is not a file window), so a
+code step goes below the diagram, never into it. `S.tour_win` is set only by code steps.
+
+**Steps on a diagram.** `step --diagram NAME L1[-L2]` (`--ref` with it is exit 2; an unknown name is
+exit 6). The CLI sends `diagram = NAME` and `file = nvtour://diagram/NAME`. Everything else is as
+on a file: range, note, roles, `--expect` (exit 6 names `diagram NAME:L`), `--via`, links, panel,
+quickfix (`bufnr`), winbar, jump and scroll. Where a step shows its file, a diagram step shows
+`diagram NAME` (`doc_path`): the panel file name line, the `◇` line, the "next" line and the winbar
+(` nvtour 2/5 flow · diagram NAME · <label>`). `edit N L1[-L2] --diagram NAME` moves a step onto a
+diagram; `edit N FILE:L1[-L2]` moves it back. `step`, `status` print `diagram NAME:L1-L2`; `--json`
+adds `diagram`. `status` also lists the diagrams (`diagram: NAME (N lines, K link(s))`).
+
+**Links.** `<CR>` in a diagram buffer (buffer-local map, through `_G.nvtour.dispatch("diagram_link")`
+so it survives an upgrade): on a link text, show FILE in the tour window (after `normal! m'`, so
+`<C-o>` goes back), make it the current window, cursor on `L1`, `zvzz`, and flash `L1..L2`. Not on a
+link: the usual `<CR>` (`normal! +`). A link whose file is now shorter is a warning.
+
+**Lifetime.** `clear` and `start` delete the diagram buffers (every `nvtour://` buffer), which also
+closes their windows, and empty `state.diagrams`. So `diagram` comes after `start`.
+
+## 11. Keymaps and user commands
 
 Installed by `start`/first `step`, removed by `clear`. Global normal-mode maps, each set **only if
 `vim.fn.maparg(lhs, "n") == ""`**; otherwise `vim.notify` a warning once, return it in `warnings`,
@@ -591,7 +668,7 @@ User commands (defined on load, always available): `:NvtourNext`, `:NvtourPrev`,
 The quickfix list also works (`:cnext`, `:cprev`, `:copen`); it moves the cursor only, not the
 current step.
 
-## 11. Safety rules (enforce in code and tests)
+## 12. Safety rules (enforce in code and tests)
 
 1. Never call `nvim_buf_set_lines`/`nvim_buf_set_text` on a buffer that is not an `nvtour://`
    scratch buffer. Never `:w`, `:edit!`, `:bd!`, `:qa`.
@@ -608,7 +685,7 @@ current step.
    a temp dir and start their own `nvim --headless --clean` there (nvim then creates its socket in
    that dir, so discovery is exercised end to end).
 
-## 12. Packaging, install, skill
+## 13. Packaging, install, skill
 
 ```
 ~/projects/nvtour/
@@ -621,6 +698,7 @@ current step.
   nvtour/client.py        # pynvim attach with timeout, ensure_lua_loaded, call(cmd, args)
   nvtour/ranges.py        # FILE:L1-L2 parsing, path resolution
   nvtour/gitutil.py       # toplevel, git show
+  nvtour/diagram.py       # diagram renderers, output cleaning, --link targets
   nvtour/lua/nvtour.lua   # the runtime (package data)
   skill/SKILL.md          # symlinked to ~/.claude/skills/nvtour and ~/.codex/skills/nvtour
   tests/                  # pytest: unit + headless integration
@@ -636,7 +714,7 @@ Install: `pip install --user --break-system-packages -e ~/projects/nvtour` → `
 ```
 ---
 name: nvtour
-description: Give a visual, read-only walkthrough of code inside the user's running Neovim while explaining a bug or a concept in chat — jump, highlight, annotate with virtual-text notes, fold to the relevant parts, show read-only diffs, keep a step panel. Use when the user explicitly asks to explain, walk through, show, or visualize something "in nvim" / "in the editor". Also use it, without asking first, when the user asks about code ("this chunk", "this function", "here", "what does this do"), gives no file, line or pasted code, and "this" does not point to something earlier in the chat: read their nvim cursor or selection to find the location and answer in chat. Never edits files.
+description: Give a visual, read-only walkthrough of code inside the user's running Neovim while explaining a bug or a concept in chat — jump, highlight, annotate with virtual-text notes, fold to the relevant parts, show read-only diffs and text diagrams (Mermaid/Graphviz) linked to the code, keep a step panel. Use when the user explicitly asks to explain, walk through, show, or visualize something "in nvim" / "in the editor". Also use it, without asking first, when the user asks about code ("this chunk", "this function", "here", "what does this do"), gives no file, line or pasted code, and "this" does not point to something earlier in the chat: read their nvim cursor or selection to find the location and answer in chat. Never edits files.
 ---
 ```
 
@@ -648,7 +726,7 @@ numbers right (`rg -n`, the echoed line, `--expect`), fixing a tour (`edit`, `re
 `status`), note style and roles, focus and its manual-fold caveat, diffs, and what to do on each
 exit code.
 
-## 13. Future
+## 14. Future
 
 - Images: render a PNG (graphviz/mermaid) and show it with `snacks.image` when the terminal
   supports the kitty graphics protocol. Not for alacritty.

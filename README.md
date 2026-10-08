@@ -35,6 +35,7 @@ Neovim in parallel. You step through the tour with `]w` / `[w`.
 | 🕰️ **Old code as a step** | `--ref GITREF` puts a step on a file as it is at a git ref, also a deleted file. |
 | ✏️ **Suggested fix** | `--suggest` shows the code that would replace a range, below it, with syntax colours. The file does not change. |
 | 🔀 **Read-only diffs** | Shows a file against a git ref, another file or stdin. |
+| 🗺️ **Diagrams as steps** | Renders Mermaid or Graphviz to Unicode text above the code. Steps can point to its lines, and `<CR>` on a label opens the code. |
 | ✅ **Self-checking ranges** | `--expect TEXT` stops a wrong line number before it shows the wrong code. |
 
 > [!IMPORTANT]
@@ -58,6 +59,8 @@ nvtour doctor
 ```
 
 **Requirements:** Python ≥ 3.11, [`pynvim`](https://github.com/neovim/pynvim), Neovim ≥ 0.10.
+Optional, for `nvtour diagram`: [`mermaid-ascii`](https://github.com/AlexanderGrooff/mermaid-ascii/releases)
+(Mermaid) and `graph-easy` (`sudo apt install libgraph-easy-perl`, for Graphviz DOT).
 
 **No nvim plugin is needed.** The Lua runtime is sent over RPC the first time a command runs, and again when
 its version changes.
@@ -202,6 +205,55 @@ nvtour step src/cache.cpp:16-21 --role fix --label "check end() first"
 - The winbar shows `@origin/master`, and the panel groups the step under `src/cache.cpp @origin/master`.
 - The buffer has `b:nvtour_ref` (`{ ref, sha, file }`). `clear` deletes it.
 
+### Diagrams
+
+A concept is often easier to see as a picture. The terminal cannot show images, so `nvtour diagram` renders
+the diagram to Unicode text in a read-only buffer, in a split above the code. Steps can point to its lines:
+
+```sh
+nvtour diagram read --link 'get=src/cache.cpp:12-20' --link 'load=src/cache.cpp:31-38' <<'EOF'
+sequenceDiagram
+    participant C as Client
+    participant K as Cache
+    participant S as Store
+    C->>K: get
+    K->>S: load
+    S-->>K: value
+    K-->>C: value
+EOF
+nvtour step --diagram read 8-9 --role flow --label "load on a miss" --expect load
+nvtour step src/cache.cpp:31-38 --label "load from the store" --via 'a miss calls `load()`'
+```
+
+```
+┌────────┐     ┌───────┐     ┌───────┐
+│ Client │     │ Cache │     │ Store │
+└────┬───┘     └───┬───┘     └───┬───┘
+     │             │             │
+     │ get         │             │
+     ├────────────►│             │
+     │             │             │
+     │             │ load        │
+     │             ├────────────►│
+     │             │             │
+     │             │ value       │
+     │             │◄┈┈┈┈┈┈┈┈┈┈┈┈┤
+```
+
+- **Formats:** `mermaid` (flowcharts and sequence diagrams, through `mermaid-ascii`), `dot` and `easy`
+  (Graphviz DOT and Graph::Easy syntax, through `graph-easy`), and `text` (a diagram drawn by hand). The
+  default comes from the file extension (`.mmd`, `.dot`, `.gv`, `.txt`), else mermaid. `--ascii` draws
+  `+-|` lines. `$NVTOUR_MERMAID_ASCII` and `$NVTOUR_GRAPH_EASY` can give the renderer command.
+- **The output** names the size and prints every line with its number, so the agent can pick the lines of
+  a step.
+- **Steps on a diagram** (`step --diagram NAME L1[-L2]`) work as on a file: notes, roles, `--expect`,
+  `--via`, the panel and the keys. `]w` goes from the diagram to the code and back. Code steps never use
+  the diagram window, so the diagram stays in view above the code.
+- **Links:** `--link TEXT=FILE:L1[-L2]` underlines TEXT. `<CR>` on it opens the range in the code window;
+  `<C-o>` goes back. TEXT must be in the diagram and the range in the file, else exit 6.
+- `diagram` again with the same name replaces the lines. `--no-show` does not open the window. `clear` and
+  `start` delete the diagrams, so make them after `start`.
+
 ---
 
 ## 📖 Command reference
@@ -221,6 +273,7 @@ nvtour step src/cache.cpp:16-21 --role fix --label "check end() first"
 | `start [TITLE]` | start a new tour (keeps an open panel) |
 | `step FILE:L1[-L2] [--ref GITREF] [--note TEXT\|-] [--label] [--role] [--expect TEXT]... [--via TEXT] [--from N] [--suggest TEXT\|-] [--at N] [--jump\|--no-jump]` | add a step (`--ref`: on the file at that git ref; `--via`: why the tour goes there from the step before, or from step `--from N`; `--suggest`: the code that would replace the range) |
 | `edit N [FILE:L1[-L2] [--ref GITREF]] [--note] [--label] [--role] [--expect] [--via] [--from N] [--suggest] [--jump]` | change a step (`''` removes a label, note, link text, suggestion or the `--expect` texts; a new `--expect` list replaces the old one; `--from 0` links from the step before again; a new location without `--ref` is on the working tree) |
+| `step L1[-L2] --diagram NAME [...]`, `edit N L1[-L2] --diagram NAME` | a step on lines of a diagram |
 | `remove N` | remove a step |
 | `panel [TEXT\|-\|--file PATH] [--toggle] [--clear]` | side panel text |
 
@@ -238,6 +291,7 @@ nvtour step src/cache.cpp:16-21 --role fix --label "check end() first"
 |---|---|
 | `focus FILE:L1-L2 [L3-L4 ...] [--context N] [--dim]`, `unfocus [FILE]` | fold or dim the rest of a file |
 | `diff FILE (--ref REF\|--file PATH\|--stdin) [--title]`, `diff-close` | read-only diff tab |
+| `diagram NAME [FILE\|-] [--format mermaid\|dot\|easy\|text] [--link TEXT=FILE:L1[-L2]]... [--ascii] [--no-show]` | render a diagram above the code (see [Diagrams](#diagrams)) |
 | `clear [--keep-buffers]` | remove everything nvtour created |
 
 **Ranges:** `FILE:L1`, `FILE:L1-L2`, `FILE:L1,L2` and `FILE:L:COL` (the column is ignored, so compiler and
@@ -262,6 +316,8 @@ is skipped.
 
 **In the panel:** `<CR>` jumps to the step under the cursor (on a file name or a link line: the step after it), `q` closes the
 panel.
+
+**In a diagram:** `<CR>` on an underlined link text opens its code; elsewhere it moves down as usual.
 
 **Commands:** `:NvtourNext`, `:NvtourPrev`, `:NvtourFirst`, `:NvtourLast`, `:NvtourGoto N`, `:NvtourPanel`,
 `:NvtourClear`.

@@ -11,7 +11,7 @@ import subprocess
 import sys
 from typing import Any, Mapping, NoReturn
 
-from . import __version__, discover, gitutil, ranges
+from . import __version__, diagram, discover, gitutil, ranges
 from .client import Client, lua_version
 from .errors import (
     EXIT_BAD_FILE,
@@ -98,8 +98,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("title", nargs="?", default="")
 
     p = cmd("step", "add a step (only the first step of a tour jumps to it)")
-    p.add_argument("spec", metavar="FILE:L1[-L2]")
+    p.add_argument("spec", metavar="FILE:L1[-L2]", help="the location; L1[-L2] with --diagram")
     p.add_argument("--ref", metavar="GITREF", help="show FILE as it is at GITREF (read-only), not the working tree")
+    p.add_argument("--diagram", metavar="NAME", help="put the step on lines L1[-L2] of diagram NAME")
     p.add_argument("--note", metavar="TEXT", help="note text, or - to read stdin")
     p.add_argument("--label")
     p.add_argument("--role", choices=ROLES, default="info")
@@ -117,8 +118,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = cmd("edit", "change step N (location, note, label or role)")
     p.add_argument("n", type=int)
-    p.add_argument("spec", nargs="?", metavar="FILE:L1[-L2]", help="new location (on the working tree unless --ref)")
+    p.add_argument("spec", nargs="?", metavar="FILE:L1[-L2]",
+                   help="new location (on the working tree unless --ref; L1[-L2] with --diagram)")
     p.add_argument("--ref", metavar="GITREF", help="the new location is FILE at GITREF (needs FILE:L1[-L2])")
+    p.add_argument("--diagram", metavar="NAME", help="the new location is lines L1[-L2] of diagram NAME")
     p.add_argument("--note", metavar="TEXT", help="new note, - to read stdin, '' to remove")
     p.add_argument("--label", help="new label, '' to remove")
     p.add_argument("--role", choices=ROLES)
@@ -160,6 +163,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--title")
 
     cmd("diff-close", "close nvtour diff tabs")
+
+    p = cmd("diagram", "render a diagram into a read-only buffer that steps can point to")
+    p.add_argument("name")
+    p.add_argument("source", nargs="?", default="-", metavar="FILE|-", help="the diagram source (default: stdin)")
+    p.add_argument("--format", choices=diagram.FORMATS,
+                   help="source format (default: from the file extension, else mermaid)")
+    p.add_argument("--link", metavar="TEXT=FILE:L1[-L2]", action="append",
+                   help="<CR> on TEXT in the diagram opens the range (repeat it for more links)")
+    p.add_argument("--ascii", action="store_true", help="plain ASCII lines instead of Unicode box drawing")
+    p.add_argument("--no-show", action="store_true", help="do not open the diagram window")
 
     p = cmd("panel", "show or update the side panel")
     p.add_argument("text", nargs="?", metavar="TEXT|-")
@@ -212,7 +225,9 @@ def fmt_range(l1: int, l2: int) -> str:
 
 
 def fmt_loc(s: Mapping[str, Any], workspace: str) -> str:
-    """``path:L1-L2``, with `` @REF`` for a step at a git ref."""
+    """``path:L1-L2``, with `` @REF`` for a step at a git ref; ``diagram NAME:L1-L2`` on a diagram."""
+    if s.get("diagram"):
+        return f"diagram {s['diagram']}:{fmt_range(s['l1'], s['l2'])}"
     loc = f"{display_path(s['file'], workspace)}:{fmt_range(s['l1'], s['l2'])}"
     return f"{loc} @{s['ref']}" if s.get("ref") else loc
 
@@ -237,8 +252,15 @@ def text_lines(text: str) -> list[str]:
     return lines
 
 
-def location(spec: str, ref: str | None) -> dict[str, Any]:
-    """Lua args for a step location: ``FILE:L1[-L2]`` on the working tree, or at ``ref``."""
+def location(spec: str, ref: str | None, diagram_name: str | None = None) -> dict[str, Any]:
+    """Lua args for a step location: ``FILE:L1[-L2]`` on the working tree or at ``ref``, or
+    ``L1[-L2]`` of a diagram."""
+    if diagram_name is not None:
+        if ref is not None:
+            raise NvtourError(EXIT_USAGE, "--ref and --diagram cannot be used together")
+        l1, l2 = ranges.parse_range(spec)
+        name = diagram.check_name(diagram_name)
+        return {"diagram": name, "file": diagram.buffer_name(name), "l1": l1, "l2": l2}
     path, l1, l2 = ranges.parse_file_range(spec)
     loc: dict[str, Any] = {"file": path, "l1": l1, "l2": l2}
     if ref is None:
@@ -263,7 +285,7 @@ def build_request(args: argparse.Namespace, workspace: str) -> tuple[str, dict[s
     if c == "start":
         return "start", {**base, "title": args.title or None}
     if c == "step":
-        return "step", {**base, **location(args.spec, args.ref), "note": read_text_arg(args.note, "--note -"),
+        return "step", {**base, **location(args.spec, args.ref, args.diagram), "note": read_text_arg(args.note, "--note -"),
                         "label": args.label, "role": args.role, "expect": args.expect, "via": args.via,
                         "suggest": read_text_arg(args.suggest, "--suggest -"), "from": args.from_, "at": args.at, "jump": args.jump or None, "no_jump": args.no_jump or None}
     if c == "edit":
@@ -272,10 +294,24 @@ def build_request(args: argparse.Namespace, workspace: str) -> tuple[str, dict[s
                                "suggest": read_text_arg(args.suggest, "--suggest -"),
                                "jump": args.jump or None}
         if args.spec:
-            req.update(location(args.spec, args.ref))
+            req.update(location(args.spec, args.ref, args.diagram))
         elif args.ref is not None:
             raise NvtourError(EXIT_USAGE, "edit: --ref needs a location FILE:L1[-L2]")
+        elif args.diagram is not None:
+            raise NvtourError(EXIT_USAGE, "edit: --diagram needs a location L1[-L2]")
         return "edit", req
+    if c == "diagram":
+        name = diagram.check_name(args.name)
+        if args.source == "-":
+            source, fmt = read_stdin("diagram -"), args.format or "mermaid"
+        else:
+            path = ranges.resolve_path(args.source)
+            ranges.require_file(path)
+            with open(path, encoding="utf-8", errors="replace") as fh:
+                source, fmt = fh.read(), args.format or diagram.guess_format(path)
+        lines = diagram.render(source, fmt, args.ascii)
+        links = [diagram.parse_link(spec, lines) for spec in args.link or []]
+        return "diagram", {**base, "name": name, "lines": lines, "links": links, "show": not args.no_show}
     if c == "remove":
         return "remove", {"n": args.n}
     if c == "goto":
@@ -344,6 +380,8 @@ def format_result(args: argparse.Namespace, res: dict[str, Any], workspace: str)
         return f"diff: {res['title']} <-> {res['base']}"
     if c == "diff-close":
         return f"diff closed ({res.get('closed', 0)} tab(s))"
+    if c == "diagram":
+        return format_diagram(res)
     if c == "panel":
         return f"panel: {res['status']}"
     if c == "clear":
@@ -376,9 +414,22 @@ def format_status(res: dict[str, Any], workspace: str) -> str:
     for f in res.get("focus") or []:
         rs = " ".join(fmt_range(a, b) for a, b in f["ranges"])
         out.append(f"focus: {display_path(f['file'], workspace)} {rs} ({f['mode']})")
+    for d in res.get("diagrams") or []:
+        out.append(f"diagram: {d['name']} ({d['count']} lines, {d['links']} link(s))")
     panel = res.get("panel") or {}
     out.append(f"panel: {'open' if panel.get('open') else 'closed'}   diff tabs: {res.get('diff_tabs', 0)}")
     out.append(f"keys: {format_keys(res.get('keys'))}")
+    return "\n".join(out)
+
+
+def format_diagram(res: dict[str, Any]) -> str:
+    """The size of the diagram, then its numbered lines, so steps can name them."""
+    lines = res.get("lines") or []
+    width = max((len(line) for line in lines), default=0)
+    shown = "shown" if res.get("shown") else "not shown"
+    out = [f"diagram {res['name']}: {len(lines)} lines, {width} columns, {res.get('links', 0)} link(s), {shown}"]
+    digits = len(str(len(lines)))
+    out.extend(f"{i:>{digits}}| {line}" for i, line in enumerate(lines, 1))
     return "\n".join(out)
 
 
@@ -431,6 +482,8 @@ def run_remote(args: argparse.Namespace, workspace: str, env: Mapping[str, str])
         client.close()
     if not res.get("ok"):
         raise NvtourError(int(res.get("code") or EXIT_RPC), str(res.get("error", "unknown error")))
+    if cmd == "diagram":
+        res["lines"] = payload["lines"]  # the agent picks step ranges from them
     emit(args, res, format_result(args, res, workspace), sock)
     if not args.json:
         for w in res.get("warnings") or []:
@@ -547,6 +600,8 @@ def run_doctor(args: argparse.Namespace, workspace: str, env: Mapping[str, str])
     except ImportError as exc:
         add(False, "pynvim importable", f"{exc}; install with: pip install pynvim", EXIT_RPC)
         return report()
+    for program, command in diagram.tool_status():
+        add(True if command else None, f"{program} (diagrams)", command or "not found (optional; needed for 'nvtour diagram')")
     add(True, "workspace", workspace)
     add(True, "runtime dirs scanned", ", ".join(discover.runtime_dirs(env)) or "(none)")
     insts = discover.inspect_all(workspace, env)

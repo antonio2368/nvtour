@@ -1,6 +1,6 @@
 ---
 name: nvtour
-description: Give a visual, read-only walkthrough of code inside the user's running Neovim while explaining a bug or a concept in chat — jump, highlight, annotate with virtual-text notes, fold to the relevant parts, show read-only diffs, keep a step panel. Use when the user explicitly asks to explain, walk through, show, or visualize something "in nvim" / "in the editor". Also use it, without asking first, when the user asks about code ("this chunk", "this function", "here", "what does this do"), gives no file, line or pasted code, and "this" does not point to something earlier in the chat: read their nvim cursor or selection to find the location and answer in chat. Never edits files.
+description: Give a visual, read-only walkthrough of code inside the user's running Neovim while explaining a bug or a concept in chat — jump, highlight, annotate with virtual-text notes, fold to the relevant parts, show read-only diffs and text diagrams (Mermaid/Graphviz) linked to the code, keep a step panel. Use when the user explicitly asks to explain, walk through, show, or visualize something "in nvim" / "in the editor". Also use it, without asking first, when the user asks about code ("this chunk", "this function", "here", "what does this do"), gives no file, line or pasted code, and "this" does not point to something earlier in the chat: read their nvim cursor or selection to find the location and answer in chat. Never edits files.
 ---
 
 # nvtour
@@ -104,6 +104,17 @@ Use this when the user asks about code ("this", "here", "this chunk") but gives 
   ```
 
 - `nvtour edit N --suggest ''` removes it.
+
+## Diagrams
+
+- Use a diagram when the point is a protocol, a sequence of messages, or how components connect, and code alone does not show it. Do not draw a diagram for one function.
+- Make it after `nvtour start` (`start` and `clear` delete diagrams): `nvtour diagram NAME --link 'TEXT=FILE:L1-L2' <<'EOF'` with Mermaid source on stdin. The terminal shows no images: it is text in a split above the code.
+- Formats: Mermaid `sequenceDiagram` for messages over time, `graph LR` / `graph TD` for components (default; needs `mermaid-ascii`). `--format dot` for Graphviz DOT (needs `graph-easy`). `--format text` for a small diagram you draw yourself. Keep it to about 6 participants or 20 nodes: wide diagrams do not fit.
+- The output prints every rendered line with its number. Take step ranges from it, not from the source.
+- `nvtour step --diagram NAME L1[-L2] --note ...` puts a step on diagram lines (for example one message). Give `--expect` with the label text. Then step into the code with `--via`, and back to the diagram for the next message.
+- `--link TEXT=FILE:L1-L2` lets the user press `<CR>` on TEXT to open that code. Link each label that has one clear code location. TEXT must be in the rendered diagram (exit 6 otherwise).
+- Exit 2 with `not found`: the renderer is missing. Tell the user, or draw the diagram by hand with `--format text`.
+- Never state a message or an edge that you did not verify in the code or the docs.
 
 ## Diff
 

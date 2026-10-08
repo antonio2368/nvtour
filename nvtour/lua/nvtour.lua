@@ -22,6 +22,7 @@ local function new_state()
     ns_focus = api.nvim_create_namespace("nvtour_focus"),
     ns_panel = api.nvim_create_namespace("nvtour_panel"),
     ns_flash = api.nvim_create_namespace("nvtour_flash"),
+    ns_diagram = api.nvim_create_namespace("nvtour_diagram"),
     flash = { buf = nil, seq = 0 },
     winbars = {}, -- [winid] = the window's own local 'winbar', restored by clear
     panel = { buf = nil, win = nil, text = {}, user_closed = false, line_map = {} },
@@ -36,6 +37,7 @@ local function new_state()
     pending_folds = {},
     added_bufs = {},
     refs = {}, -- [sha .. ":" .. file] = { buf, file, rel, ref, sha, lines }: buffers of steps at a git ref
+    diagrams = {}, -- [name] = { name, file, buf, lines, links = { { text, file, l1, l2 } } }
   }
 end
 
@@ -122,6 +124,8 @@ local function define_highlights(force)
   set("NvtourDim", { fg = blend(fg, bg, 0.35) })
   set("NvtourFlash", { bg = blend(fg, bg, 0.25) })
   set("NvtourPanelCurrent", { bg = blend(fg, bg, 0.12), bold = true })
+  set("NvtourDiagramLine", { fg = blend(fg, bg, 0.55) }) -- the box and arrow characters of a diagram
+  set("NvtourDiagramLink", { fg = hl_attr("Directory", "fg") or fg, underline = true })
   set("NvtourPanelFile", { link = "Directory" })
   set("NvtourPanelProgress", { link = "Comment" })
   -- Lets init.lua re-apply overrides after a reload or colorscheme change:
@@ -204,10 +208,21 @@ local function usable_tour_win(w)
   return file_win(w) and not is_diff_tab(api.nvim_win_get_tabpage(w))
 end
 
+--- True for the read-only buffer of a diagram.
+local function is_diagram_buf(b)
+  return vim.b[b].nvtour_diagram ~= nil
+end
+
+local diagram_win -- forward declaration
+
 --- Window where files are shown (see DESIGN.md section 5). With `buf`, a usable window of the
 --- current tab that already shows it wins. Returns nil when no window is usable, unless `create`
 --- is set: then a split is opened for `buf` next to the first normal window of the current tab.
+--- A diagram buffer goes to the diagram window instead.
 local function tour_win(buf, create)
+  if buf and valid_buf(buf) and is_diagram_buf(buf) then
+    return diagram_win(buf, create)
+  end
   local tab = api.nvim_get_current_tabpage()
   if buf and valid_buf(buf) then
     for _, w in ipairs(vim.fn.win_findbuf(buf)) do
@@ -253,6 +268,52 @@ local function tour_win(buf, create)
     end
   end
   return api.nvim_open_win(buf, false, { split = "left", win = anchor })
+end
+
+--- Window for the diagram buffer `buf`: a window of the current tab that shows it, else one that
+--- shows another diagram, else (with `create`) a split above the tour window, as high as the diagram
+--- (at most 60 % of that window). Code steps never use it. Without `create`, a window of another
+--- tab that shows `buf` (for the note width), or nil.
+diagram_win = function(buf, create)
+  local tab = api.nvim_get_current_tabpage()
+  local other, elsewhere
+  for _, w in ipairs(api.nvim_tabpage_list_wins(tab)) do
+    if is_normal_win(w) and w ~= S.panel.win and is_diagram_buf(api.nvim_win_get_buf(w)) then
+      if api.nvim_win_get_buf(w) == buf then
+        return w
+      end
+      other = other or w
+    end
+  end
+  if other then
+    return other
+  end
+  if not create then
+    for _, w in ipairs(vim.fn.win_findbuf(buf)) do
+      if is_normal_win(w) then
+        elsewhere = elsewhere or w
+      end
+    end
+    return elsewhere
+  end
+  local anchor = tour_win()
+  if anchor and api.nvim_win_get_tabpage(anchor) ~= tab then
+    anchor = nil
+  end
+  if not anchor then
+    for _, w in ipairs(api.nvim_tabpage_list_wins(tab)) do
+      if is_normal_win(w) and w ~= S.panel.win then
+        anchor = w
+        break
+      end
+    end
+  end
+  local room = anchor and api.nvim_win_get_height(anchor) or vim.o.lines
+  local height = math.max(3, math.min(api.nvim_buf_line_count(buf) + 1, math.floor(room * 0.6)))
+  local win = api.nvim_open_win(buf, false, { split = "above", win = anchor or -1, height = height })
+  api.nvim_set_option_value("wrap", false, { scope = "local", win = win }) -- a wrapped diagram falls apart
+  api.nvim_set_option_value("winfixheight", true, { scope = "local", win = win })
+  return win
 end
 
 --- Make `win` current. By default the user's terminal window keeps the focus
@@ -364,9 +425,14 @@ local function unique_name(base, buf)
   fail("too many nvtour buffers named " .. base, 5)
 end
 
+--- "path" of the file of step `s`, or "diagram NAME" for a step on a diagram.
+local function doc_path(s)
+  return s.diagram and ("diagram " .. s.diagram) or relpath(s.file)
+end
+
 --- "path" for a step on the working tree, "path @ref" for a step at a git ref.
 local function doc_name(s)
-  return relpath(s.file) .. (s.ref and (" @" .. s.ref) or "")
+  return doc_path(s) .. (s.ref and (" @" .. s.ref) or "")
 end
 
 --- True when two steps are in the same buffer: the same file, at the same commit (or both on the
@@ -445,8 +511,113 @@ local function ensure_ref_buf(r)
   return buf
 end
 
---- Buffer for a location `a` ({ file, ref, sha, rel, lines }): the file, or its version at a commit.
+--- True for the first byte sequence of a box drawing, block, shape or arrow character (U+2190-21FF,
+--- U+2500-25FF), or the "∧" and "∨" that graph-easy draws as arrow heads.
+local function is_line_char(ch)
+  local b1, b2 = ch:byte(1, 2)
+  if b1 ~= 0xE2 then
+    return false
+  end
+  return (b2 >= 0x94 and b2 <= 0x97) or b2 == 0x86 or b2 == 0x87 or ch == "∧" or ch == "∨"
+end
+
+--- Colour the lines and arrows of diagram `d` in NvtourDiagramLine and its link texts in
+--- NvtourDiagramLink.
+local function highlight_diagram(d)
+  local buf, ns = d.buf, S.ns_diagram
+  api.nvim_buf_clear_namespace(buf, ns, 0, -1)
+  for row, line in ipairs(d.lines) do
+    local run_start, run_end
+    for pos, ch in line:gmatch("()([%z\1-\127\194-\244][\128-\191]*)") do
+      if is_line_char(ch) then
+        run_start = run_start or pos
+        run_end = pos + #ch
+      elseif run_start then
+        api.nvim_buf_set_extmark(buf, ns, row - 1, run_start - 1, { end_col = run_end - 1, hl_group = "NvtourDiagramLine", priority = 90 })
+        run_start = nil
+      end
+    end
+    if run_start then
+      api.nvim_buf_set_extmark(buf, ns, row - 1, run_start - 1, { end_col = run_end - 1, hl_group = "NvtourDiagramLine", priority = 90 })
+    end
+    for _, link in ipairs(d.links) do
+      local from = 1
+      while true do
+        local s, e = line:find(link.text, from, true)
+        if not s then
+          break
+        end
+        api.nvim_buf_set_extmark(buf, ns, row - 1, s - 1, { end_col = e, hl_group = "NvtourDiagramLink", priority = 95 })
+        from = e + 1
+      end
+    end
+  end
+end
+
+--- Buffer-local diagram keys; they call through _G so they survive a runtime upgrade.
+local function map_diagram_keys(buf)
+  vim.keymap.set("n", "<CR>", function()
+    local res = _G.nvtour.dispatch("diagram_link", {})
+    if not res.ok then
+      notify(res.error, vim.log.levels.WARN)
+    elseif not res.followed then
+      vim.cmd("normal! +") -- no link under the cursor: the usual <CR>
+    end
+  end, { buffer = buf, nowait = true, silent = true, desc = "nvtour: open the link under the cursor" })
+end
+
+--- The read-only buffer of diagram `d` (an entry of S.diagrams), created when it does not exist.
+--- With `reload`, the lines are set again from d.lines. A buffer made again (the user wiped or
+--- unloaded it) takes the steps on the diagram, which are drawn again.
+local function ensure_diagram_buf(d, reload)
+  local fresh = not (valid_buf(d.buf) and api.nvim_buf_is_loaded(d.buf))
+  if fresh then
+    if valid_buf(d.buf) then
+      pcall(api.nvim_buf_delete, d.buf, { force = true })
+    end
+    local buf = api.nvim_create_buf(true, true)
+    unique_name(d.file, buf)
+    local bo = vim.bo[buf]
+    bo.buftype = "nofile"
+    bo.bufhidden = "hide" -- the extmarks of its steps must stay when it is not shown
+    bo.swapfile = false
+    vim.b[buf].nvtour_diagram = d.name
+    bo.filetype = "nvtourdiagram"
+    map_diagram_keys(buf)
+    d.buf = buf
+  end
+  if fresh or reload then
+    local bo = vim.bo[d.buf]
+    bo.modifiable = true
+    bo.readonly = false
+    api.nvim_buf_set_lines(d.buf, 0, -1, false, d.lines)
+    bo.modifiable = false
+    bo.readonly = true
+    bo.modified = false
+    highlight_diagram(d)
+  end
+  if fresh then
+    for _, s in ipairs(S.tour.steps) do
+      if s.diagram == d.name and s.buf ~= d.buf then
+        s.buf = d.buf
+        s.extmark_ids = {}
+        render_step(s, tour_win(d.buf))
+      end
+    end
+  end
+  return d.buf
+end
+
+--- Buffer for a location `a` ({ file, ref, sha, rel, lines } or { diagram }): the file, its version
+--- at a commit, or a diagram.
 local function loc_buf(a)
+  if a.diagram then
+    local d = S.diagrams[a.diagram]
+    if not d then
+      fail(("no diagram %q; make it with 'nvtour diagram %s'"):format(a.diagram, a.diagram), 6)
+    end
+    return ensure_diagram_buf(d)
+  end
   if not a.sha then
     return load_buf(a.file)
   end
@@ -461,7 +632,7 @@ end
 
 --- The buffer of `step`, loaded (and made again if the user wiped it).
 local function step_buf(step)
-  if step.sha then
+  if step.sha or step.diagram then
     step.buf = loc_buf(step)
   elseif not valid_buf(step.buf) or not api.nvim_buf_is_loaded(step.buf) then
     step.buf = load_buf(step.file)
@@ -1008,7 +1179,7 @@ local function link_loc(s, here)
   if here and same_doc(s, here) then
     return "line " .. s.l1
   end
-  local loc = relpath(s.file) .. ":" .. s.l1
+  local loc = doc_path(s) .. ":" .. s.l1
   if s.ref then
     return loc .. " @" .. s.ref
   end
@@ -1019,7 +1190,7 @@ end
 --- itself the commit ("@origin/master (1a2b3c4d5e6f)"); "working tree" when the step before was at
 --- a git ref.
 local function version_segs(step, prev)
-  local segs = { { relpath(step.file), "NvtourViaLoc" } }
+  local segs = { { doc_path(step), "NvtourViaLoc" } }
   if step.ref then
     segs[#segs + 1] = { " @" .. step.ref, "NvtourVersion" }
     if step.sha:sub(1, #step.ref) ~= step.ref then
@@ -1461,11 +1632,11 @@ local function update_qf(idx)
   for _, s in ipairs(S.tour.steps) do
     local text = step_title(s)
     if text == "" then
-      text = relpath(s.file) .. ":" .. s.l1
+      text = doc_path(s) .. ":" .. s.l1
     end
     local item = { lnum = s.l1, end_lnum = s.l2, text = ("[%s] %s"):format(s.role, text) }
-    if s.sha then
-      item.bufnr = step_buf(s) -- the read-only version, not the file on disk
+    if s.sha or s.diagram then
+      item.bufnr = step_buf(s) -- the read-only version or the diagram, not a file on disk
     else
       item.filename = s.file
     end
@@ -1498,7 +1669,7 @@ function M.winbar()
     return #steps > 0 and (" nvtour · %d step(s)"):format(#steps) or ""
   end
   local pos = ("%d/%d %s"):format(n, #steps, step.role)
-  local at = step.ref and (" @" .. step.ref) or ""
+  local at = step.ref and (" @" .. step.ref) or (step.diagram and (" · " .. doc_path(step))) or ""
   local label = (step.label and step.label ~= "") and (" · " .. step.label) or ""
   -- In a %{} item the window of the bar is the current window (g:statusline_winid is not set).
   local width = api.nvim_win_get_width(api.nvim_get_current_win())
@@ -1513,8 +1684,9 @@ function M.winbar()
     local key = "next" .. (S.keys.next and (" " .. S.keys.next) or "") .. ": "
     local nat = nxt.ref and (" @" .. nxt.ref) or ""
     local same = same_doc(nxt, step)
-    local loc = same and ("line " .. nxt.l1) or (relpath(nxt.file) .. ":" .. nxt.l1 .. nat)
-    local short = same and loc or (vim.fn.fnamemodify(nxt.file, ":t") .. ":" .. nxt.l1 .. nat)
+    local loc = same and ("line " .. nxt.l1) or (doc_path(nxt) .. ":" .. nxt.l1 .. nat)
+    local base = nxt.diagram and doc_path(nxt) or vim.fn.fnamemodify(nxt.file, ":t")
+    local short = same and loc or (base .. ":" .. nxt.l1 .. nat)
     rights = { key .. loc, key .. short, "" }
     if nxt.label and nxt.label ~= "" then
       table.insert(rights, 1, key .. short .. " " .. nxt.label)
@@ -1790,6 +1962,7 @@ local function reset(keep_panel)
   -- The list is reused by the next tour, so the 10-deep quickfix stack does not fill up.
   S.tour = { title = "", steps = {}, current = 0, qf_id = qf_id }
   S.refs = {} -- their buffers are deleted below with the other nvtour:// buffers
+  S.diagrams = {} -- the same
   S.panel.text = {}
   if keep_panel then
     render_panel()
@@ -1851,6 +2024,7 @@ local function step_result(step, extra)
     from = explicit_from(step) and step.from.n or nil,
     ref = step.ref,
     sha = step.sha,
+    diagram = step.diagram,
     text = step_text(step),
     keys = installed_keys(),
   }
@@ -1868,7 +2042,9 @@ local function jump(step)
     vim.cmd("normal! m'")
   end)
   win = show_buf(win, step.buf)
-  S.tour_win = win
+  if not step.diagram then
+    S.tour_win = win -- the diagram window is never a window for code
+  end
   enter_win(win)
   local old = S.tour.steps[S.tour.current]
   S.tour.current = step.n
@@ -1884,7 +2060,7 @@ end
 local function announce(step)
   local total = #S.tour.steps
   local at = step.ref and (" @" .. step.ref) or ""
-  notify(("nvtour %d/%d: %s"):format(step.n, total, step.label or (relpath(step.file) .. ":" .. step.l1 .. at)))
+  notify(("nvtour %d/%d: %s"):format(step.n, total, step.label or (doc_path(step) .. ":" .. step.l1 .. at)))
 end
 
 step_goto = function(n)
@@ -1956,7 +2132,7 @@ local function checked_range(a, l1, l2, expect)
       local first = api.nvim_buf_get_lines(buf, l1 - 1, l1, false)[1] or ""
       local range = l1 == l2 and tostring(l1) or (l1 .. "-" .. l2)
       local at = a.ref and (" @" .. a.ref) or ""
-      fail(("--expect %q not found in %s:%s%s; line %d is %q"):format(expect, relpath(a.file), range, at, l1, first), 6)
+      fail(("--expect %q not found in %s:%s%s; line %d is %q"):format(expect, doc_path(a), range, at, l1, first), 6)
     end
   end
   return buf
@@ -1993,6 +2169,7 @@ H.step = function(a)
     file = a.file,
     ref = a.sha and a.ref or nil,
     sha = a.sha,
+    diagram = a.diagram,
     buf = buf,
     l1 = l1,
     l2 = l2,
@@ -2057,11 +2234,13 @@ H.edit = function(a)
     fail("unknown role: " .. tostring(a.role), 2)
   end
   -- A new location replaces the old one completely: without a ref it is on the working tree.
-  local loc = a.file and { file = a.file, ref = a.sha and a.ref or nil, sha = a.sha, rel = a.rel, lines = a.lines }
-    or { file = step.file, ref = step.ref, sha = step.sha }
+  local loc = a.file
+      and { file = a.file, ref = a.sha and a.ref or nil, sha = a.sha, rel = a.rel, lines = a.lines, diagram = a.diagram }
+    or { file = step.file, ref = step.ref, sha = step.sha, diagram = step.diagram }
   local l1, l2 = a.l1 or step.l1, a.l2 or a.l1 or step.l2
   local buf = checked_range(loc, l1, l2, a.expect)
-  step.file, step.ref, step.sha, step.buf, step.l1, step.l2 = loc.file, loc.ref, loc.sha, buf, l1, l2
+  step.file, step.ref, step.sha, step.diagram, step.buf = loc.file, loc.ref, loc.sha, loc.diagram, buf
+  step.l1, step.l2 = l1, l2
   if a.role then
     step.role = a.role
   end
@@ -2269,6 +2448,94 @@ H.diff_close = function()
 end
 
 ---------------------------------------------------------------------------
+-- Diagrams
+---------------------------------------------------------------------------
+
+local DIAGRAM_PREFIX = "nvtour://diagram/" -- the CLI names the file of a diagram step the same way
+
+--- Make diagram `a.name` from the rendered `a.lines`, or replace its lines. Steps on it stay;
+--- a step beyond the new last line is an error.
+H.diagram = function(a)
+  S.workspace = a.workspace or S.workspace
+  local lines = a.lines or {}
+  if #lines == 0 then
+    fail("the diagram is empty", 6)
+  end
+  local d = S.diagrams[a.name]
+  for _, s in ipairs(S.tour.steps) do
+    if s.diagram == a.name and s.l2 > #lines then
+      fail(("step %d (lines %s) is beyond the new diagram (%d lines); edit or remove it first"):format(s.n, fmt_range(s), #lines), 6)
+    end
+  end
+  if not d then
+    d = { name = a.name, file = DIAGRAM_PREFIX .. a.name }
+    S.diagrams[a.name] = d
+  end
+  d.lines, d.links = lines, a.links or {}
+  local buf = ensure_diagram_buf(d, true)
+  local shown = false
+  if a.show then
+    local win = show_buf(diagram_win(buf, true), buf)
+    local current = S.tour.steps[S.tour.current]
+    if not (current and current.diagram == d.name) then
+      api.nvim_win_call(win, function()
+        api.nvim_win_set_cursor(win, { 1, 0 })
+        vim.fn.winrestview({ topline = 1, topfill = 0 })
+      end)
+    end
+    shown = true
+  end
+  rerender_all() -- set_lines moved the marks of the steps on it
+  return { ok = true, name = d.name, count = #lines, links = #d.links, shown = shown }
+end
+
+--- Open the link under the cursor of a diagram window: the range in the tour window, which
+--- becomes the current window. followed = false when there is no link under the cursor.
+H.diagram_link = function()
+  local win = api.nvim_get_current_win()
+  local name = vim.b[api.nvim_win_get_buf(win)].nvtour_diagram
+  local d = name and S.diagrams[name]
+  if not d then
+    return { ok = true, followed = false }
+  end
+  local row, col = unpack(api.nvim_win_get_cursor(win))
+  local line = d.lines[row] or ""
+  local target
+  for _, link in ipairs(d.links) do
+    local from = 1
+    while not target do
+      local s, e = line:find(link.text, from, true)
+      if not s then
+        break
+      end
+      if col >= s - 1 and col < e then
+        target = link
+      end
+      from = e + 1
+    end
+  end
+  if not target then
+    return { ok = true, followed = false }
+  end
+  local buf = load_buf(target.file)
+  local count = api.nvim_buf_line_count(buf)
+  if target.l2 > count then
+    fail(("link %q: range %d-%d is beyond end of file (%d lines): %s"):format(target.text, target.l1, target.l2, count, relpath(target.file)), 6)
+  end
+  local code = tour_win(buf, true)
+  pcall(api.nvim_win_call, code, function()
+    vim.cmd("normal! m'")
+  end)
+  code = show_buf(code, buf)
+  S.tour_win = code
+  api.nvim_set_current_win(code)
+  api.nvim_win_set_cursor(code, { target.l1, 0 })
+  vim.cmd("normal! zvzz")
+  flash({ buf = buf, l1 = target.l1, l2 = target.l2 })
+  return { ok = true, followed = true, file = target.file, l1 = target.l1, l2 = target.l2 }
+end
+
+---------------------------------------------------------------------------
 -- Panel / clear / where
 ---------------------------------------------------------------------------
 
@@ -2308,6 +2575,7 @@ H.status = function()
       file = s.file,
       ref = s.ref,
       sha = s.sha,
+      diagram = s.diagram,
       l1 = s.l1,
       l2 = s.l2,
       role = s.role,
@@ -2329,6 +2597,13 @@ H.status = function()
       diffs = diffs + 1
     end
   end
+  local diagrams = {}
+  for _, d in pairs(S.diagrams) do
+    diagrams[#diagrams + 1] = { name = d.name, count = #d.lines, links = #d.links }
+  end
+  table.sort(diagrams, function(left, right)
+    return left.name < right.name
+  end)
   return {
     ok = true,
     title = S.tour.title,
@@ -2336,6 +2611,7 @@ H.status = function()
     total = #S.tour.steps,
     steps = steps,
     focus = focus,
+    diagrams = diagrams,
     diff_tabs = diffs,
     panel = { open = panel_shown(), user_closed = S.panel.user_closed },
     keys = installed_keys(),
@@ -2551,6 +2827,11 @@ if PREV_VERSION ~= nil and PREV_VERSION ~= M.VERSION then
   end
   if valid_buf(S.panel.buf) then
     map_panel_keys(S.panel.buf)
+  end
+  for _, d in pairs(S.diagrams) do
+    if valid_buf(d.buf) then
+      map_diagram_keys(d.buf)
+    end
   end
   pcall(rerender_all) -- marks drawn by the old version may differ (for example the old line tint)
   pcall(render_panel)
