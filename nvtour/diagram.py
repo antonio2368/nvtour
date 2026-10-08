@@ -18,6 +18,7 @@ BUFFER_PREFIX = "nvtour://diagram/"
 RENDER_TIMEOUT = 30.0
 
 _NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+_SEQUENCE_RE = re.compile(r"^sequenceDiagram\b")
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 _EXTENSIONS = {".mmd": "mermaid", ".mermaid": "mermaid", ".dot": "dot", ".gv": "dot", ".txt": "text"}
 # format -> (program, environment variable that overrides it, install hint)
@@ -102,6 +103,24 @@ def render(source: str, fmt: str, ascii_only: bool) -> list[str]:
     if not lines:
         raise NvtourError(EXIT_BAD_FILE, "the diagram is empty")
     return lines
+
+
+def header_row(source: str, fmt: str, lines: list[str]) -> int:
+    """Line of the participant names in a rendered Mermaid sequence diagram, else 0.
+
+    The diagram window shows this line in its winbar when it scrolls out of view."""
+    if fmt != "mermaid":
+        return 0
+    body = [line.strip() for line in source.splitlines()]
+    body = [line for line in body if line and not line.startswith("%%")]
+    if body and body[0] == "---":  # front matter (configuration) before the diagram type
+        end = body.index("---", 1) if "---" in body[1:] else len(body)
+        body = body[end + 1:]
+    if not (body and _SEQUENCE_RE.match(body[0])):
+        return 0
+    if len(lines) >= 3 and lines[0].lstrip()[:1] in ("┌", "+") and lines[1].lstrip()[:1] in ("│", "|"):
+        return 2
+    return 0
 
 
 def parse_link(spec: str, lines: list[str]) -> dict[str, Any]:

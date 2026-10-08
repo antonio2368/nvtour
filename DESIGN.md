@@ -153,7 +153,7 @@ nvtour unfocus [FILE]
 nvtour diff FILE (--ref GITREF | --file PATH | --stdin) [--title TEXT]
 nvtour diff-close
 nvtour diagram NAME [FILE|-] [--format mermaid|dot|easy|text] [--link TEXT=FILE:L1[-L2]]... [--ascii]
-               [--no-show]
+               [--header N] [--split above|below|left|right] [--no-show]
 nvtour panel [TEXT | --file PATH | -] [--toggle] [--clear]
 nvtour clear [--keep-buffers]
 nvtour doctor
@@ -240,7 +240,8 @@ M.state = {
   winbars = { [winid] = the window's own local 'winbar' },  -- restored by clear
   refs = { [sha .. ":" .. file] = { buf, file, rel, ref, sha, lines } },  -- ref step buffers
   ns_diagram = nvim_create_namespace("nvtour_diagram"),  -- the colours of diagram lines and links
-  diagrams = { [name] = { name, file, buf, lines, links = { { text, file, l1, l2 } } } },  -- §10
+  diagrams = { [name] = { name, file, buf, lines, header, links = { { text, file, l1, l2 } } } },  -- §10
+  diagram_split = nil,  -- the last `diagram --split` (§10)
 }
 ```
 
@@ -584,7 +585,7 @@ the tab.
 
 ## 10. Diagrams
 
-`diagram NAME [FILE|-] [--format mermaid|dot|easy|text] [--link TEXT=FILE:L1[-L2]]... [--ascii] [--no-show]`
+`diagram NAME [FILE|-] [--format mermaid|dot|easy|text] [--link TEXT=FILE:L1[-L2]]... [--ascii] [--header N] [--split above|below|left|right] [--no-show]`
 
 A concept is often easier to see as a picture: a sequence of messages, a graph of components. The
 terminal cannot show images (§1), so a diagram is text: Unicode box drawing in a read-only buffer.
@@ -607,13 +608,18 @@ diagram to the code and back.
   expanded, trailing blanks and blank first and last lines removed. An empty diagram is exit 6.
 - `--link TEXT=FILE:L1[-L2]` (split at the last `=`, so TEXT can contain `=`): TEXT must occur in the
   rendered lines and the range must exist in FILE, else exit 6 (the same idea as `--expect`).
-- Sent to Lua: `name`, `lines`, `links` (`{ text, file, l1, l2 }`), `show`. The output is
-  `diagram NAME: N lines, W columns, K link(s), shown|not shown`, then every line numbered (`  7| ...`),
+- `--header N`: line N is the header line (§10, header line); 0 is none. Without it, a Mermaid
+  `sequenceDiagram` (after `%%` comments and `---` front matter) whose first rendered line starts
+  with `┌` or `+` and the second with `│` or `|` has header line 2, the participant names; other
+  diagrams have none. N outside 0..lines is exit 6.
+- Sent to Lua: `name`, `lines`, `links` (`{ text, file, l1, l2 }`), `header`, `split` (nil when not
+  given), `show`. The output is
+  `diagram NAME: N lines, W columns, K link(s), [header line H, ]shown|not shown`, then every line numbered (`  7| ...`),
   so the agent can pick the lines of a step. `--json` adds `lines`.
 - `doctor` reports both renderers (optional checks).
 
 **Lua: the diagram buffer.** One buffer per name, in `state.diagrams[name] = { name, file, buf,
-lines, links }`, named `nvtour://diagram/NAME`, created like a ref buffer (§6): listed scratch,
+lines, header, links }`, named `nvtour://diagram/NAME`, created like a ref buffer (§6): listed scratch,
 `buftype = nofile`, `bufhidden = hide`, no swap file, then `modifiable = false`, `readonly = true`;
 `filetype = nvtourdiagram`; `vim.b.nvtour_diagram = NAME` marks it. Colours in `ns_diagram`: runs
 of box drawing, block, shape and arrow characters (U+2190–21FF, U+2500–25FF, `∧`, `∨`) get
@@ -625,13 +631,36 @@ diagram buffer is made again from `lines` on the next use, and its steps move to
 that is beyond the new last line makes it exit 6, and nothing changes. The steps on it are drawn
 again.
 
-**The diagram window.** A split **above** the tour window (the code stays below it, the panel on
-the right), `height = min(lines + 1, 60 % of that window)` (the `+ 1` is the winbar), at least 3
-rows; `wrap` off (a wrapped diagram falls apart) and `winfixheight` on, both window-local. `diagram`
+**The diagram window.** A split **above** the tour window by default (the code stays below it, the
+panel on the right), `height = min(lines + 1, 60 % of that window)` (the `+ 1` is the winbar), at
+least 3 rows, `winfixheight` on. `--split above|below|left|right` gives the side of the tour window;
+left or right, half of the width of that window and no `winfixwidth`: `panel_open` and `panel_close`
+call `balance_side_diagram()`, which gives the tour window and the diagram window the same width
+again (the panel has `winfixwidth`, so otherwise the code window alone would give or take the columns,
+and a fixed-width diagram could leave it 1 column wide). `wrap` is off (a wrapped diagram falls
+apart); the options are window-local. `w:nvtour_diagram_split` marks the side; `diagram --split` closes
+a diagram window of the current tab on another side and opens a new one. `state.diagram_split`
+keeps the last `--split`, so a window that is made later (a jump to a diagram step after the user
+closed it) is on the same side; `start` and `clear` forget it. Without `--split`, an existing diagram
+window is used where it is. `diagram`
 shows it unless `--no-show`; the focus does not move. A window of the current tab that shows a
 diagram is reused (it then shows the new one). `tour_win(buf)` gives a diagram buffer this window;
 for a file it never chooses a window that shows a diagram (such a window is not a file window), so a
 code step goes below the diagram, never into it. `S.tour_win` is set only by code steps.
+
+**Header line.** A buffer cannot keep lines at the top while it scrolls, so the participant names of
+a sequence diagram leave the view, and the lifelines below have no names. `diagram` sets the tour
+winbar (§6, Winbar) in the diagram window when it shows it, and `M.winbar()` first checks for a header:
+when the window shows a diagram with `header > 0` and `topline > header`, the winbar is that line
+instead of the tour position. It starts with `textoff` blanks (sign, number and fold columns) and is
+cut at `leftcol` and at the text width by display cells (a wide character cut in two becomes
+blanks), so each name stays above its lifeline also when the window scrolls sideways. Line
+characters are in `NvtourDiagramLine`, as in the buffer. The code window keeps the tour position.
+A diagram with a header gets the winbar also when `vim.g.nvtour_winbar` is false; the winbar is then
+empty until the header line scrolls out. Scrolling a window that is not current (the mouse) does
+not redraw its winbar, so `WinScrolled` redraws the winbar of each scrolled diagram window that has
+a header (`nvim__redraw`, else `redrawstatus!`). One line only: a float with the full box would
+cover diagram lines, and needs its own lifetime.
 
 **Steps on a diagram.** `step --diagram NAME L1[-L2]` (`--ref` with it is exit 2; an unknown name is
 exit 6). The CLI sends `diagram = NAME` and `file = nvtour://diagram/NAME`. Everything else is as

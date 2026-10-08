@@ -37,7 +37,8 @@ local function new_state()
     pending_folds = {},
     added_bufs = {},
     refs = {}, -- [sha .. ":" .. file] = { buf, file, rel, ref, sha, lines }: buffers of steps at a git ref
-    diagrams = {}, -- [name] = { name, file, buf, lines, links = { { text, file, l1, l2 } } }
+    diagrams = {}, -- [name] = { name, file, buf, lines, header, links = { { text, file, l1, l2 } } }
+    diagram_split = nil, -- the side of a new diagram window from the last 'diagram --split' (default "above")
   }
 end
 
@@ -270,19 +271,26 @@ local function tour_win(buf, create)
   return api.nvim_open_win(buf, false, { split = "left", win = anchor })
 end
 
+local DIAGRAM_SPLITS = { above = true, below = true, left = true, right = true }
+
 --- Window for the diagram buffer `buf`: a window of the current tab that shows it, else one that
---- shows another diagram, else (with `create`) a split above the tour window, as high as the diagram
---- (at most 60 % of that window). Code steps never use it. Without `create`, a window of another
---- tab that shows `buf` (for the note width), or nil.
-diagram_win = function(buf, create)
+--- shows another diagram, else (with `create`) a split next to the tour window. `split` is the side
+--- of the tour window ("above" by default, "below", "left", "right"); a diagram window on another
+--- side is closed first. Above or below it is as high as the diagram (at most 60 % of that window),
+--- left or right it takes half of the width of that window. Code steps never use it. Without `create`, a window of
+--- another tab that shows `buf` (for the note width), or nil.
+diagram_win = function(buf, create, split)
   local tab = api.nvim_get_current_tabpage()
   local other, elsewhere
   for _, w in ipairs(api.nvim_tabpage_list_wins(tab)) do
     if is_normal_win(w) and w ~= S.panel.win and is_diagram_buf(api.nvim_win_get_buf(w)) then
-      if api.nvim_win_get_buf(w) == buf then
+      if split and (vim.w[w].nvtour_diagram_split or "above") ~= split then
+        pcall(api.nvim_win_close, w, false) -- the user asked for another side
+      elseif api.nvim_win_get_buf(w) == buf then
         return w
+      else
+        other = other or w
       end
-      other = other or w
     end
   end
   if other then
@@ -308,11 +316,20 @@ diagram_win = function(buf, create)
       end
     end
   end
-  local room = anchor and api.nvim_win_get_height(anchor) or vim.o.lines
-  local height = math.max(3, math.min(api.nvim_buf_line_count(buf) + 1, math.floor(room * 0.6)))
-  local win = api.nvim_open_win(buf, false, { split = "above", win = anchor or -1, height = height })
+  split = split or S.diagram_split or "above"
+  local win
+  if split == "left" or split == "right" then
+    -- No 'winfixwidth': when the panel opens or closes, the code and the diagram share the width.
+    local room = anchor and api.nvim_win_get_width(anchor) or vim.o.columns
+    win = api.nvim_open_win(buf, false, { split = split, win = anchor or -1, width = math.floor(room / 2) })
+  else
+    local room = anchor and api.nvim_win_get_height(anchor) or vim.o.lines
+    local height = math.max(3, math.min(api.nvim_buf_line_count(buf) + 1, math.floor(room * 0.6)))
+    win = api.nvim_open_win(buf, false, { split = split, win = anchor or -1, height = height })
+    api.nvim_set_option_value("winfixheight", true, { scope = "local", win = win })
+  end
   api.nvim_set_option_value("wrap", false, { scope = "local", win = win }) -- a wrapped diagram falls apart
-  api.nvim_set_option_value("winfixheight", true, { scope = "local", win = win })
+  vim.w[win].nvtour_diagram_split = split
   return win
 end
 
@@ -805,6 +822,23 @@ local function panel_shown()
   return valid_win(w) and valid_buf(S.panel.buf) and api.nvim_win_get_buf(w) == S.panel.buf
 end
 
+--- Give the code window and a diagram window beside it (split left or right) the same width, after
+--- the panel took or gave back columns.
+local function balance_side_diagram()
+  local code = tour_win()
+  if not code then
+    return
+  end
+  for _, w in ipairs(api.nvim_tabpage_list_wins(api.nvim_win_get_tabpage(code))) do
+    local side = vim.w[w].nvtour_diagram_split
+    if (side == "left" or side == "right") and is_diagram_buf(api.nvim_win_get_buf(w)) then
+      local total = api.nvim_win_get_width(w) + api.nvim_win_get_width(code)
+      pcall(api.nvim_win_set_width, w, math.floor(total / 2))
+      return
+    end
+  end
+end
+
 local function panel_close(user)
   if panel_shown() then
     local w = S.panel.win
@@ -816,6 +850,7 @@ local function panel_close(user)
     end
     if others > 0 or #api.nvim_list_tabpages() > 1 then
       pcall(api.nvim_win_close, w, true)
+      balance_side_diagram()
     end
   end
   S.panel.win = nil
@@ -1000,6 +1035,7 @@ local function panel_open()
   wo.list = false
   map_panel_keys(buf)
   render_panel()
+  balance_side_diagram()
 end
 
 ---------------------------------------------------------------------------
@@ -1661,8 +1697,57 @@ local function sl_escape(s)
   return (s:gsub("%%", "%%%%"))
 end
 
---- Winbar text: "nvtour 2/5 fault · label" and, on the right, where the next key goes.
+--- The diagram shown in `win` when it has a header line (the participant names), else nil.
+local function header_diagram(win)
+  local name = vim.b[api.nvim_win_get_buf(win)].nvtour_diagram
+  local d = name and S.diagrams[name]
+  return d and (d.header or 0) > 0 and d.lines[d.header] and d or nil
+end
+
+--- Header line of the diagram in the current window, when it is scrolled out of view: cut at
+--- 'leftcol' and moved right by the gutter, so the names stay above their lifelines.
+local function diagram_header()
+  local win = api.nvim_get_current_win()
+  local d = header_diagram(win)
+  if not d then
+    return nil
+  end
+  local view = vim.fn.winsaveview()
+  if view.topline <= d.header then
+    return nil
+  end
+  local textoff = vim.fn.getwininfo(win)[1].textoff
+  local room = api.nvim_win_get_width(win) - textoff
+  local out, col, run = { string.rep(" ", textoff) }, 0, nil
+  for ch in d.lines[d.header]:gmatch("[%z\1-\127\194-\244][\128-\191]*") do
+    local w = vim.fn.strdisplaywidth(ch)
+    local from, to = col, col + w
+    col = to
+    if to > view.leftcol and from - view.leftcol < room then
+      if from < view.leftcol or to - view.leftcol > room then
+        ch = string.rep(" ", math.min(to, view.leftcol + room) - math.max(from, view.leftcol)) -- a wide character cut in two
+      end
+      local line = is_line_char(ch)
+      if line ~= run then
+        out[#out + 1] = line and "%#NvtourDiagramLine#" or "%*"
+        run = line
+      end
+      out[#out + 1] = sl_escape(ch)
+    end
+  end
+  return table.concat(out) .. "%*"
+end
+
+--- Winbar text: "nvtour 2/5 fault · label" and, on the right, where the next key goes. In a
+--- diagram window whose header line is scrolled out of view: that line.
 function M.winbar()
+  local header = diagram_header()
+  if header then
+    return header
+  end
+  if vim.g.nvtour_winbar == false then
+    return "" -- a diagram window with a header line, which has the winbar for the header only
+  end
   local steps, n = S.tour.steps, S.tour.current
   local step = steps[n]
   if not step then
@@ -1708,9 +1793,9 @@ function M.winbar()
 end
 
 --- Show the tour winbar in `win`, unless it has a winbar of its own (from the user or a plugin)
---- or vim.g.nvtour_winbar is false.
+--- or vim.g.nvtour_winbar is false. A diagram with a header line gets it also when it is false.
 local function set_winbar(win)
-  if vim.g.nvtour_winbar == false or not valid_win(win) then
+  if not valid_win(win) or (vim.g.nvtour_winbar == false and not header_diagram(win)) then
     return
   end
   local own = api.nvim_get_option_value("winbar", { win = win })
@@ -1963,6 +2048,7 @@ local function reset(keep_panel)
   S.tour = { title = "", steps = {}, current = 0, qf_id = qf_id }
   S.refs = {} -- their buffers are deleted below with the other nvtour:// buffers
   S.diagrams = {} -- the same
+  S.diagram_split = nil
   S.panel.text = {}
   if keep_panel then
     render_panel()
@@ -2461,6 +2547,9 @@ H.diagram = function(a)
   if #lines == 0 then
     fail("the diagram is empty", 6)
   end
+  if a.split and not DIAGRAM_SPLITS[a.split] then
+    fail(("bad split %q: use above, below, left or right"):format(a.split), 2)
+  end
   local d = S.diagrams[a.name]
   for _, s in ipairs(S.tour.steps) do
     if s.diagram == a.name and s.l2 > #lines then
@@ -2471,11 +2560,13 @@ H.diagram = function(a)
     d = { name = a.name, file = DIAGRAM_PREFIX .. a.name }
     S.diagrams[a.name] = d
   end
-  d.lines, d.links = lines, a.links or {}
+  S.diagram_split = a.split or S.diagram_split
+  d.lines, d.links, d.header = lines, a.links or {}, a.header or 0
   local buf = ensure_diagram_buf(d, true)
   local shown = false
   if a.show then
-    local win = show_buf(diagram_win(buf, true), buf)
+    local win = show_buf(diagram_win(buf, true, a.split), buf)
+    set_winbar(win) -- the header line of the diagram is shown there when it scrolls out of view
     local current = S.tour.steps[S.tour.current]
     if not (current and current.diagram == d.name) then
       api.nvim_win_call(win, function()
@@ -2486,7 +2577,7 @@ H.diagram = function(a)
     shown = true
   end
   rerender_all() -- set_lines moved the marks of the steps on it
-  return { ok = true, name = d.name, count = #lines, links = #d.links, shown = shown }
+  return { ok = true, name = d.name, count = #lines, links = #d.links, header = d.header, shown = shown }
 end
 
 --- Open the link under the cursor of a diagram window: the range in the tour window, which
@@ -2755,6 +2846,22 @@ api.nvim_create_autocmd("BufWinEnter", {
     for _, s in ipairs(S.tour.steps) do
       if s.buf == ev.buf and s.drawn_win ~= win and valid_buf(s.buf) and api.nvim_buf_is_loaded(s.buf) then
         pcall(render_step, s, win)
+      end
+    end
+  end,
+})
+
+-- The header line of a diagram comes and goes in the winbar as the diagram scrolls. Scrolling a
+-- window that is not the current one (with the mouse) does not redraw its winbar by itself.
+api.nvim_create_autocmd("WinScrolled", {
+  group = aug,
+  callback = function()
+    for id in pairs(vim.v.event) do
+      local w = tonumber(id)
+      if w and valid_win(w) and header_diagram(w) then
+        if not pcall(api.nvim__redraw, { win = w, winbar = true }) then
+          vim.cmd("redrawstatus!")
+        end
       end
     end
   end,

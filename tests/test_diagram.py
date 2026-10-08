@@ -74,6 +74,18 @@ def test_parse_link(sandbox):
         assert exc.value.code == code, spec
 
 
+def test_header_row():
+    seq = ["┌─────┐     ┌─────┐", "│ get │     │ map │", "└──┬──┘     └──┬──┘", "   │           │"]
+    assert diagram.header_row("sequenceDiagram\n  A->>B: x", "mermaid", seq) == 2
+    assert diagram.header_row("%% note\n\n  sequenceDiagram", "mermaid", seq) == 2
+    assert diagram.header_row("---\nconfig:\n  x: 1\n---\nsequenceDiagram", "mermaid", seq) == 2
+    asc = ["+-----+", "| get |", "+--+--+", "   |"]
+    assert diagram.header_row("sequenceDiagram", "mermaid", asc) == 2
+    assert diagram.header_row("graph LR\nA-->B", "mermaid", seq) == 0
+    assert diagram.header_row("sequenceDiagram", "dot", seq) == 0
+    assert diagram.header_row("sequenceDiagram", "mermaid", ["A ─► B"]) == 0
+
+
 # ---------------------------------------------------------------------------
 # The diagram buffer and window
 # ---------------------------------------------------------------------------
@@ -308,4 +320,131 @@ def test_real_mermaid_sequence_diagram(cli, nv):
                  env_extra={"NVTOUR_MERMAID_ASCII": real_mermaid_ascii()}))
     text = "\n".join(lines_of(nv, diagram_buf(nv, "seq").handle))
     assert "Server" in text and "fetch" in text and "►" in text
-    assert ", 1 link(s), shown" in out.splitlines()[0]
+    assert out.splitlines()[0].endswith(", 1 link(s), header line 2, shown")
+    assert "│ Server │" in out.splitlines()[2]
+
+
+# ---------------------------------------------------------------------------
+# Header line
+# ---------------------------------------------------------------------------
+
+SEQUENCE = "┌────────┐     ┌───────┐\n│ Client │     │ Store │\n└────┬───┘     └───┬───┘\n" + \
+    "     │ get         │\n     ├────────────►│\n" * 10
+
+
+def diagram_winbar(nv, win):
+    """The winbar of ``win`` as text, evaluated with ``win`` as the current window."""
+    return nv.exec_lua("""
+        local win = ...
+        return vim.api.nvim_win_call(win, function()
+          return vim.api.nvim_eval_statusline(vim.wo[win].winbar, { winid = win, use_winbar = true, maxwidth = 200 }).str
+        end)""", win)
+
+
+def scroll(nv, win, topline, leftcol=0):
+    nv.exec_lua("""
+        local win, top, left = ...
+        vim.api.nvim_win_call(win, function() vim.fn.winrestview({ topline = top, leftcol = left }) end)""",
+                win, topline, leftcol)
+
+
+def test_header_line_stays_in_the_winbar(cli, nv):
+    ok(cli("start", "Header"))
+    ok(cli("step", "a.txt:3", "--label", "code"))
+    out = ok(cli("diagram", "seq", "--format", "text", "--header", "2", stdin=SEQUENCE))
+    assert out.splitlines()[0] == "diagram seq: 23 lines, 24 columns, 0 link(s), header line 2, shown"
+    assert "seq (23 lines" in ok(cli("status"))
+    (win,) = wins_of(nv, diagram_buf(nv, "seq"))
+    assert nv.api.get_option_value("winbar", {"win": win, "scope": "local"}) == "%{%v:lua.nvtour.winbar()%}"
+    assert diagram_winbar(nv, win).startswith(" nvtour 1/1")  # the header line is in view
+    scroll(nv, win, 2)
+    assert diagram_winbar(nv, win).startswith(" nvtour 1/1")  # line 2 is the top line
+    pad = " " * nv.call("getwininfo", win)[0]["textoff"]
+    scroll(nv, win, 3)
+    assert diagram_winbar(nv, win) == pad + "│ Client │     │ Store │"
+    scroll(nv, win, 3, leftcol=5)
+    assert diagram_winbar(nv, win) == pad + "ent │     │ Store │"  # cut at 'leftcol', as the lines below
+    scroll(nv, win, 1)
+    assert diagram_winbar(nv, win).startswith(" nvtour 1/1")
+    nv.api.set_option_value("number", True, {"win": win})  # a gutter: the header moves right with the text
+    scroll(nv, win, 3)
+    textoff = nv.call("getwininfo", win)[0]["textoff"]
+    assert textoff > 0 and diagram_winbar(nv, win) == " " * textoff + "│ Client │     │ Store │"
+
+
+def test_header_line_without_the_tour_winbar(cli, nv):
+    ok(cli("start", "No bar"))
+    nv.vars["nvtour_winbar"] = False
+    try:
+        ok(cli("diagram", "plain", "--format", "text", stdin=SEQUENCE))  # no header: no winbar
+        (win,) = wins_of(nv, diagram_buf(nv, "plain"))
+        assert nv.api.get_option_value("winbar", {"win": win, "scope": "local"}) == ""
+        ok(cli("diagram", "seq", "--format", "text", "--header", "2", stdin=SEQUENCE))
+        assert nv.api.get_option_value("winbar", {"win": win, "scope": "local"}) == "%{%v:lua.nvtour.winbar()%}"
+        assert diagram_winbar(nv, win) == ""
+        scroll(nv, win, 5)
+        assert diagram_winbar(nv, win).strip() == "│ Client │     │ Store │"
+    finally:
+        nv.vars["nvtour_winbar"] = None
+
+
+def test_header_errors(cli, nv):
+    ok(cli("start", "Header errors"))
+    for n in ("24", "-1"):
+        r = cli("diagram", "seq", "--format", "text", "--header", n, stdin=SEQUENCE)
+        assert r.returncode == 6 and f"--header {n} is not a line of the diagram (1-23, or 0)" in r.stderr
+    out = ok(cli("diagram", "seq", "--format", "text", "--header", "0", "--no-show", stdin=SEQUENCE))
+    assert "header" not in out.splitlines()[0]
+
+
+# ---------------------------------------------------------------------------
+# Side of the diagram window
+# ---------------------------------------------------------------------------
+
+
+def test_split_puts_the_diagram_beside_the_code(cli, nv):
+    columns = nv.options["columns"]
+    nv.options["columns"] = 160
+    try:
+        split_checks(cli, nv)
+    finally:
+        nv.options["columns"] = columns
+
+
+def split_checks(cli, nv):
+    ok(cli("start", "Split"))
+    ok(cli("step", "b.txt:3", "--label", "code"))
+    code_win = nv.current.window
+    room = code_win.width
+    ok(cli("diagram", "flow", "--format", "text", "--split", "right", stdin=DIAGRAM))
+    (win,) = wins_of(nv, diagram_buf(nv, "flow"))
+    assert nv.call("win_screenpos", win)[0] == nv.call("win_screenpos", code_win.handle)[0]  # the same row
+    assert nv.call("win_screenpos", win)[1] > nv.call("win_screenpos", code_win.handle)[1]  # on the right
+    assert abs(nv.api.win_get_width(win) - code_win.width) <= 1  # half of the code window each
+    assert nv.api.win_get_width(win) + code_win.width + 1 == room  # and the separator
+    assert nv.api.get_option_value("winfixwidth", {"win": win}) is False
+    for _ in range(2):  # the panel opens, then closes: the code and the diagram share the width again
+        ok(cli("panel", "--toggle"))
+        assert abs(nv.api.win_get_width(win) - code_win.width) <= 1
+    assert nv.api.get_option_value("wrap", {"win": win}) is False
+    assert nv.current.window == code_win
+    ok(cli("diagram", "flow", "--format", "text", "--split", "left", stdin=DIAGRAM))  # moved to the left
+    (left,) = wins_of(nv, diagram_buf(nv, "flow"))
+    assert left != win and nv.call("win_screenpos", left)[1] < nv.call("win_screenpos", code_win.handle)[1]
+    ok(cli("diagram", "flow", "--format", "text", stdin=DIAGRAM))  # no --split: the window stays
+    assert wins_of(nv, diagram_buf(nv, "flow")) == [left]
+    ok(cli("step", "--diagram", "flow", "2", "--label", "client", "--no-jump"))
+    nv.api.win_close(left, True)
+    ok(cli("goto", "2"))  # the window is made again on the side of the last --split
+    (again,) = wins_of(nv, diagram_buf(nv, "flow"))
+    assert nv.call("win_screenpos", again)[1] < nv.call("win_screenpos", code_win.handle)[1]
+    ok(cli("diagram", "flow", "--format", "text", "--split", "below", stdin=DIAGRAM))
+    (below,) = wins_of(nv, diagram_buf(nv, "flow"))
+    assert nv.call("win_screenpos", below)[0] > nv.call("win_screenpos", code_win.handle)[0]
+    assert nv.api.win_get_height(below) == 9 and nv.api.get_option_value("winfixheight", {"win": below}) is True
+    ok(cli("start", "Again"))  # start forgets the side
+    ok(cli("diagram", "flow", "--format", "text", stdin=DIAGRAM))
+    (top,) = wins_of(nv, diagram_buf(nv, "flow"))
+    assert nv.call("win_screenpos", top)[0] < nv.call("win_screenpos", code_win.handle)[0]
+    r = cli("diagram", "flow", "--format", "text", "--split", "up", stdin=DIAGRAM)
+    assert r.returncode == 2

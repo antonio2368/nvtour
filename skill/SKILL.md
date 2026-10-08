@@ -108,8 +108,10 @@ Use this when the user asks about code ("this", "here", "this chunk") but gives 
 ## Diagrams
 
 - Use a diagram when the point is a protocol, a sequence of messages, or how components connect, and code alone does not show it. Do not draw a diagram for one function.
-- Make it after `nvtour start` (`start` and `clear` delete diagrams): `nvtour diagram NAME --link 'TEXT=FILE:L1-L2' <<'EOF'` with Mermaid source on stdin. The terminal shows no images: it is text in a split above the code.
+- Make it after `nvtour start` (`start` and `clear` delete diagrams): `nvtour diagram NAME --link 'TEXT=FILE:L1-L2' <<'EOF'` with Mermaid source on stdin. The terminal shows no images: it is text in a split next to the code.
+- Before the first `nvtour diagram` in a conversation, ask the user where to put the diagram: above the code (horizontal split, good for wide diagrams), or beside it (vertical split, good for tall diagrams such as a long `sequenceDiagram`), and on which side. Do not ask again in the same conversation unless the user wants to change it. Give the answer as `--split above|below|left|right` on every `nvtour diagram`.
 - Formats: Mermaid `sequenceDiagram` for messages over time, `graph LR` / `graph TD` for components (default; needs `mermaid-ascii`). `--format dot` for Graphviz DOT (needs `graph-easy`). `--format text` for a small diagram you draw yourself. Keep it to about 6 participants or 20 nodes: wide diagrams do not fit.
+- The participant names of a `sequenceDiagram` stay in the winbar when the user scrolls; nothing to do. For a long `--format text` diagram with a row of names or columns at the top, give `--header N` (the line of the names).
 - The output prints every rendered line with its number. Take step ranges from it, not from the source.
 - `nvtour step --diagram NAME L1[-L2] --note ...` puts a step on diagram lines (for example one message). Give `--expect` with the label text. Then step into the code with `--via`, and back to the diagram for the next message.
 - `--link TEXT=FILE:L1-L2` lets the user press `<CR>` on TEXT to open that code. Link each label that has one clear code location. TEXT must be in the rendered diagram (exit 6 otherwise).

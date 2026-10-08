@@ -251,6 +251,14 @@ nvtour step src/cache.cpp:31-38 --label "load from the store" --via 'a miss call
   the diagram window, so the diagram stays in view above the code.
 - **Links:** `--link TEXT=FILE:L1[-L2]` underlines TEXT. `<CR>` on it opens the range in the code window;
   `<C-o>` goes back. TEXT must be in the diagram and the range in the file, else exit 6.
+- **Window:** by default a split above the code, as high as the diagram (at most 60 % of the code
+  window). `--split above|below|left|right` puts it on another side; left or right, the code and the
+  diagram share the width equally, also when the panel opens or closes. A diagram window on another side moves. Later diagram windows, also
+  the one that `]w` opens again, use the last `--split` until `start` or `clear`.
+- **Header line:** the participant names of a Mermaid sequence diagram stay in the winbar of the
+  diagram window when they scroll out of view, above their lifelines, also when you scroll sideways.
+  `--header N` makes line N the header line of any diagram, `--header 0` turns it off. The code window
+  keeps the tour position in its winbar.
 - `diagram` again with the same name replaces the lines. `--no-show` does not open the window. `clear` and
   `start` delete the diagrams, so make them after `start`.
 
@@ -291,7 +299,7 @@ nvtour step src/cache.cpp:31-38 --label "load from the store" --via 'a miss call
 |---|---|
 | `focus FILE:L1-L2 [L3-L4 ...] [--context N] [--dim]`, `unfocus [FILE]` | fold or dim the rest of a file |
 | `diff FILE (--ref REF\|--file PATH\|--stdin) [--title]`, `diff-close` | read-only diff tab |
-| `diagram NAME [FILE\|-] [--format mermaid\|dot\|easy\|text] [--link TEXT=FILE:L1[-L2]]... [--ascii] [--no-show]` | render a diagram above the code (see [Diagrams](#diagrams)) |
+| `diagram NAME [FILE\|-] [--format mermaid\|dot\|easy\|text] [--link TEXT=FILE:L1[-L2]]... [--ascii] [--header N] [--split SIDE] [--no-show]` | render a diagram above the code (see [Diagrams](#diagrams)) |
 | `clear [--keep-buffers]` | remove everything nvtour created |
 
 **Ranges:** `FILE:L1`, `FILE:L1-L2`, `FILE:L1,L2` and `FILE:L:COL` (the column is ignored, so compiler and

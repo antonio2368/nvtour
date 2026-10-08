@@ -172,6 +172,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--link", metavar="TEXT=FILE:L1[-L2]", action="append",
                    help="<CR> on TEXT in the diagram opens the range (repeat it for more links)")
     p.add_argument("--ascii", action="store_true", help="plain ASCII lines instead of Unicode box drawing")
+    p.add_argument("--header", type=int, metavar="N",
+                   help="line N stays in view in the winbar when it scrolls out (0: none; "
+                        "default: the participant names of a Mermaid sequence diagram)")
+    p.add_argument("--split", choices=["above", "below", "left", "right"],
+                   help="side of the code window for a new diagram window (default: above; "
+                        "a diagram window on another side is moved)")
     p.add_argument("--no-show", action="store_true", help="do not open the diagram window")
 
     p = cmd("panel", "show or update the side panel")
@@ -311,7 +317,11 @@ def build_request(args: argparse.Namespace, workspace: str) -> tuple[str, dict[s
                 source, fmt = fh.read(), args.format or diagram.guess_format(path)
         lines = diagram.render(source, fmt, args.ascii)
         links = [diagram.parse_link(spec, lines) for spec in args.link or []]
-        return "diagram", {**base, "name": name, "lines": lines, "links": links, "show": not args.no_show}
+        header = diagram.header_row(source, fmt, lines) if args.header is None else args.header
+        if not 0 <= header <= len(lines):
+            raise NvtourError(EXIT_BAD_FILE, f"--header {header} is not a line of the diagram (1-{len(lines)}, or 0)")
+        return "diagram", {**base, "name": name, "lines": lines, "links": links, "header": header,
+                           "split": args.split, "show": not args.no_show}
     if c == "remove":
         return "remove", {"n": args.n}
     if c == "goto":
@@ -427,7 +437,8 @@ def format_diagram(res: dict[str, Any]) -> str:
     lines = res.get("lines") or []
     width = max((len(line) for line in lines), default=0)
     shown = "shown" if res.get("shown") else "not shown"
-    out = [f"diagram {res['name']}: {len(lines)} lines, {width} columns, {res.get('links', 0)} link(s), {shown}"]
+    header = f"header line {res['header']}, " if res.get("header") else ""
+    out = [f"diagram {res['name']}: {len(lines)} lines, {width} columns, {res.get('links', 0)} link(s), {header}{shown}"]
     digits = len(str(len(lines)))
     out.extend(f"{i:>{digits}}| {line}" for i, line in enumerate(lines, 1))
     return "\n".join(out)
