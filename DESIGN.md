@@ -153,7 +153,7 @@ nvtour unfocus [FILE]
 nvtour diff FILE (--ref GITREF | --file PATH | --stdin) [--title TEXT]
 nvtour diff-close
 nvtour diagram NAME [FILE|-] [--format mermaid|dot|easy|text] [--link TEXT=FILE:L1[-L2]]... [--ascii]
-               [--header N] [--split above|below|left|right] [--no-show]
+               [--header N] [--split above|below|left|right|full] [--no-show]
 nvtour panel [TEXT | --file PATH | -] [--toggle] [--clear]
 nvtour clear [--keep-buffers]
 nvtour doctor
@@ -585,7 +585,7 @@ the tab.
 
 ## 10. Diagrams
 
-`diagram NAME [FILE|-] [--format mermaid|dot|easy|text] [--link TEXT=FILE:L1[-L2]]... [--ascii] [--header N] [--split above|below|left|right] [--no-show]`
+`diagram NAME [FILE|-] [--format mermaid|dot|easy|text] [--link TEXT=FILE:L1[-L2]]... [--ascii] [--header N] [--split above|below|left|right|full] [--no-show]`
 
 A concept is often easier to see as a picture: a sequence of messages, a graph of components. The
 terminal cannot show images (§1), so a diagram is text: Unicode box drawing in a read-only buffer.
@@ -639,7 +639,7 @@ call `balance_side_diagram()`, which gives the tour window and the diagram windo
 again (the panel has `winfixwidth`, so otherwise the code window alone would give or take the columns,
 and a fixed-width diagram could leave it 1 column wide). `wrap` is off (a wrapped diagram falls
 apart); the options are window-local. `w:nvtour_diagram_split` marks the side; `diagram --split` closes
-a diagram window of the current tab on another side and opens a new one. `state.diagram_split`
+a diagram window of the current tab on another side and opens a new one. `--split full` puts the diagram in a tab page of its own, after the current tab (`:tab sbuffer` with `switchbuf` empty for the call), so it fills the screen; the focus goes there through `enter_win` (a tab that is not current is not seen), so the user's terminal keeps the focus by default. Its window is found in any tab; a `--split` to a side closes it (and so its tab). Code steps and links still use the tour window, in its own tab, and `enter_win` switches to it. `state.diagram_split`
 keeps the last `--split`, so a window that is made later (a jump to a diagram step after the user
 closed it) is on the same side; `start` and `clear` forget it. Without `--split`, an existing diagram
 window is used where it is. `diagram`

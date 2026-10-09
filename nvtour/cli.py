@@ -175,9 +175,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--header", type=int, metavar="N",
                    help="line N stays in view in the winbar when it scrolls out (0: none; "
                         "default: the participant names of a Mermaid sequence diagram)")
-    p.add_argument("--split", choices=["above", "below", "left", "right"],
-                   help="side of the code window for a new diagram window (default: above; "
-                        "a diagram window on another side is moved)")
+    p.add_argument("--split", choices=["above", "below", "left", "right", "full"],
+                   help="side of the code window for a new diagram window, or full: a tab page of "
+                        "its own (default: above; a diagram window on another side is moved)")
     p.add_argument("--no-show", action="store_true", help="do not open the diagram window")
 
     p = cmd("panel", "show or update the side panel")

@@ -272,6 +272,36 @@ def test_enter_on_a_link_opens_the_code(cli, nv, sandbox):
     assert nv.current.window.handle == dwin and nv.current.window.cursor[0] == 2
 
 
+def test_split_full_puts_the_diagram_in_a_tab_of_its_own(cli, nv, sandbox):
+    ok(cli("start", "Full"))
+    ok(cli("step", "b.txt:3", "--label", "code"))
+    code_win = nv.current.window
+    tabs = len(nv.tabpages)
+    ok(cli("diagram", "flow", "--format", "text", "--split", "full", "--link", "Server=a.txt:20", stdin=DIAGRAM))
+    (win,) = wins_of(nv, diagram_buf(nv, "flow"))
+    assert len(nv.tabpages) == tabs + 1
+    assert nv.call("tabpagewinnr", nv.call("win_id2tabwin", win)[0], "$") == 1  # the only window of its tab
+    assert nv.current.window.handle == win  # the code window is not a terminal: the focus goes there
+    assert nv.api.get_option_value("wrap", {"win": win}) is False
+    ok(cli("diagram", "flow", "--format", "text", "--link", "Server=a.txt:20", stdin=DIAGRAM))  # the same window
+    assert wins_of(nv, diagram_buf(nv, "flow")) == [win] and len(nv.tabpages) == tabs + 1
+    server = DIAGRAM.splitlines()[1].encode().index(b"Server")
+    nv.api.win_set_cursor(win, [2, server])
+    nv.command('execute "normal \\<CR>"')  # the link opens the code in its own tab
+    assert nv.current.window == code_win and code_win.buffer.name == str(sandbox.ws / "a.txt")
+    ok(cli("step", "--diagram", "flow", "2", "--label", "client", "--no-jump"))
+    nv.api.win_close(win, True)  # the user closes the tab; the step makes it again
+    assert len(nv.tabpages) == tabs
+    ok(cli("goto", "2"))
+    (again,) = wins_of(nv, diagram_buf(nv, "flow"))
+    assert len(nv.tabpages) == tabs + 1 and nv.current.window.handle == again
+    ok(cli("goto", "1"))  # a code step goes back to the code tab
+    assert nv.current.window == code_win
+    ok(cli("diagram", "flow", "--format", "text", "--split", "right", stdin=DIAGRAM))  # a side closes the tab
+    (right,) = wins_of(nv, diagram_buf(nv, "flow"))
+    assert len(nv.tabpages) == tabs and nv.api.win_get_tabpage(right) == nv.api.win_get_tabpage(code_win.handle)
+
+
 # ---------------------------------------------------------------------------
 # Renderers
 # ---------------------------------------------------------------------------

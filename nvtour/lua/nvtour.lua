@@ -271,16 +271,46 @@ local function tour_win(buf, create)
   return api.nvim_open_win(buf, false, { split = "left", win = anchor })
 end
 
-local DIAGRAM_SPLITS = { above = true, below = true, left = true, right = true }
+local DIAGRAM_SPLITS = { above = true, below = true, left = true, right = true, full = true }
+
+--- The window of a full diagram (split "full"): the only normal window of its own tab page.
+local function full_diagram_win()
+  for _, w in ipairs(api.nvim_list_wins()) do
+    if is_normal_win(w) and vim.w[w].nvtour_diagram_split == "full" and is_diagram_buf(api.nvim_win_get_buf(w)) then
+      return w
+    end
+  end
+end
+
+--- Open `buf` in a new tab page after the current one and go back: the focus does not move.
+local function open_full_diagram_win(buf)
+  local cur = api.nvim_get_current_win()
+  local switchbuf = vim.o.switchbuf
+  vim.o.switchbuf = "" -- 'useopen' or 'usetab' would jump to a window that already shows buf
+  local ok, err = pcall(vim.cmd, ("tab sbuffer %d"):format(buf))
+  vim.o.switchbuf = switchbuf
+  if not ok then
+    fail(("could not open a tab page for the diagram: %s"):format(err), 5)
+  end
+  local win = api.nvim_get_current_win()
+  api.nvim_set_current_win(cur)
+  return win
+end
 
 --- Window for the diagram buffer `buf`: a window of the current tab that shows it, else one that
 --- shows another diagram, else (with `create`) a split next to the tour window. `split` is the side
---- of the tour window ("above" by default, "below", "left", "right"); a diagram window on another
---- side is closed first. Above or below it is as high as the diagram (at most 60 % of that window),
+--- of the tour window ("above" by default, "below", "left", "right"), or "full": a tab page of its
+--- own (any tab is searched for it); a diagram window on another side is closed first. Above or
+--- below it is as high as the diagram (at most 60 % of that window),
 --- left or right it takes half of the width of that window. Code steps never use it. Without `create`, a window of
 --- another tab that shows `buf` (for the note width), or nil.
 diagram_win = function(buf, create, split)
   local tab = api.nvim_get_current_tabpage()
+  local full = full_diagram_win()
+  if full and split and split ~= "full" then
+    pcall(api.nvim_win_close, full, false) -- the user asked for a side: the full tab closes
+    full = nil
+  end
   local other, elsewhere
   for _, w in ipairs(api.nvim_tabpage_list_wins(tab)) do
     if is_normal_win(w) and w ~= S.panel.win and is_diagram_buf(api.nvim_win_get_buf(w)) then
@@ -296,6 +326,9 @@ diagram_win = function(buf, create, split)
   if other then
     return other
   end
+  if full and valid_win(full) and (split or S.diagram_split) == "full" then
+    return full
+  end
   if not create then
     for _, w in ipairs(vim.fn.win_findbuf(buf)) do
       if is_normal_win(w) then
@@ -303,6 +336,13 @@ diagram_win = function(buf, create, split)
       end
     end
     return elsewhere
+  end
+  split = split or S.diagram_split or "above"
+  if split == "full" then
+    local win = open_full_diagram_win(buf)
+    api.nvim_set_option_value("wrap", false, { scope = "local", win = win })
+    vim.w[win].nvtour_diagram_split = split
+    return win
   end
   local anchor = tour_win()
   if anchor and api.nvim_win_get_tabpage(anchor) ~= tab then
@@ -316,7 +356,6 @@ diagram_win = function(buf, create, split)
       end
     end
   end
-  split = split or S.diagram_split or "above"
   local win
   if split == "left" or split == "right" then
     -- No 'winfixwidth': when the panel opens or closes, the code and the diagram share the width.
@@ -2548,7 +2587,7 @@ H.diagram = function(a)
     fail("the diagram is empty", 6)
   end
   if a.split and not DIAGRAM_SPLITS[a.split] then
-    fail(("bad split %q: use above, below, left or right"):format(a.split), 2)
+    fail(("bad split %q: use above, below, left, right or full"):format(a.split), 2)
   end
   local d = S.diagrams[a.name]
   for _, s in ipairs(S.tour.steps) do
@@ -2567,6 +2606,9 @@ H.diagram = function(a)
   if a.show then
     local win = show_buf(diagram_win(buf, true, a.split), buf)
     set_winbar(win) -- the header line of the diagram is shown there when it scrolls out of view
+    if vim.w[win].nvtour_diagram_split == "full" then
+      enter_win(win) -- a tab page of its own is seen only when it is current
+    end
     local current = S.tour.steps[S.tour.current]
     if not (current and current.diagram == d.name) then
       api.nvim_win_call(win, function()

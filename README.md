@@ -253,7 +253,7 @@ nvtour step src/cache.cpp:31-38 --label "load from the store" --via 'a miss call
   `<C-o>` goes back. TEXT must be in the diagram and the range in the file, else exit 6.
 - **Window:** by default a split above the code, as high as the diagram (at most 60 % of the code
   window). `--split above|below|left|right` puts it on another side; left or right, the code and the
-  diagram share the width equally, also when the panel opens or closes. A diagram window on another side moves. Later diagram windows, also
+  diagram share the width equally, also when the panel opens or closes. `--split full` opens the diagram in a tab page of its own, so it fills the screen; `<CR>` on a link and `]w` go back to the code tab. A diagram window on another side moves. Later diagram windows, also
   the one that `]w` opens again, use the last `--split` until `start` or `clear`.
 - **Header line:** the participant names of a Mermaid sequence diagram stay in the winbar of the
   diagram window when they scroll out of view, above their lifelines, also when you scroll sideways.
