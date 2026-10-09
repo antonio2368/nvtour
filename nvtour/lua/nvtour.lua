@@ -1507,6 +1507,14 @@ end
 --- colour), "suggest" (the suggested code: the same frame with the title "suggested"), "next" (the
 --- line below the range: a "╶─" lead) or "collapsed" (a one-line note or the suggestion line of
 --- another step: a grey "╶─" lead). Like the band, the lines start in the gutter.
+--- The cells a note may take (vim.g.nvtour_note_width), or nil for the window width.
+local function note_width_limit()
+  local limit = tonumber(vim.g.nvtour_note_width)
+  if limit and limit > 0 then
+    return math.max(30, limit)
+  end
+end
+
 local function frame(lines, win, role, current, kind)
   if not valid_win(win) then
     return { virt_lines = lines } -- drawn again in the window when the buffer is shown (BufWinEnter)
@@ -1516,6 +1524,10 @@ local function frame(lines, win, role, current, kind)
   local col = current and bar_col(win, off) or nil
   local B = current and ("NvtourFrame" .. cap(role)) or "NvtourNoteBorder"
   local inner = math.max(10, full - off) -- cells from the code column to the right edge
+  local limit = note_width_limit()
+  if limit then
+    inner = math.min(inner, limit + 4) -- the frame ends where the wrapped note ends
+  end
   local function row(chunks)
     return vim.list_extend(gutter_chunks(off, col, role, plain_hl), chunks)
   end
@@ -1613,6 +1625,10 @@ render_step = function(step, win)
     width = info.width - info.textoff
   end
   width = math.max(30, width - 4)
+  local limit = note_width_limit()
+  if limit then
+    width = math.min(width, limit)
+  end
   local framed = note_style() == "frame"
   local above = current and arrival_lines(step, width) or {}
   if step.note and step.note ~= "" then

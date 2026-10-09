@@ -570,6 +570,23 @@ def test_long_words_are_split_to_the_note_width(cli, nv):
     assert len(vl) > 3 and max(widths) <= nv.eval("winwidth(0)")
 
 
+def test_note_width_limits_the_wrap_and_the_frame(cli, nv):
+    columns = nv.options["columns"]
+    nv.options["columns"] = 300  # wide enough for the note and the panel
+    nv.vars["nvtour_note_width"] = 40
+    try:
+        ok(cli("step", "a.txt:2", "--note", " ".join(["word"] * 60)))
+        buf = find_buf(nv, "a.txt")
+        vl = [m[3]["virt_lines"] for m in ns_marks(nv, "nvtour_steps", buf.handle) if m[3].get("virt_lines")][0]
+        top = "".join(chunk[0] for chunk in vl[0])
+        texts = ["".join(chunk[0] for chunk in line if chunk[1] == "NvtourNote") for line in vl[1:-1]]
+        assert top.count("─") + 2 == 44  # the frame: the note width plus its border and padding
+        assert len(texts) > 4 and max(len(t) for t in texts) <= 40
+    finally:
+        del nv.vars["nvtour_note_width"]
+        nv.options["columns"] = columns
+
+
 def test_swap_file_does_not_prompt(cli, nv, sandbox, tmp_path):
     swapdir = tmp_path / "swap"
     swapdir.mkdir()

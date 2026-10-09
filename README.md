@@ -346,6 +346,7 @@ vim.g.nvtour_steal_focus = "unless_terminal"  -- "always" | "never"; default kee
 vim.g.nvtour_winbar = false                   -- do not show the tour position in the winbar of the tour window
 vim.g.nvtour_flash = 0                        -- ms the range flashes after a jump (default 300; 0 = off)
 vim.g.nvtour_note_style = "band"              -- a background band instead of the frame (default "frame")
+vim.g.nvtour_note_width = 160                 -- wrap notes at most this many cells wide (default: the window width)
 ```
 
 - **Winbar:** set only in a window that has no winbar of its own (from you or a plugin). `clear` removes it.

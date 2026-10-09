@@ -457,7 +457,7 @@ one gets plain lines, and is drawn again on `BufWinEnter` in the window that sho
 
 **Frame** (the default). No background. The block above `l1` of the current step (the `◇` line and the
 note) is in a frame `╭─╮ │ │ ╰─╯` in `NvtourFrame<Role>` (the role accent blended 75 % over `Normal`
-bg), from the code column to the right edge of the window; the note has no `╭ │ ╰ ▸` prefixes in it.
+bg), from the code column to the right edge of the window, or to `vim.g.nvtour_note_width` + 4 cells when that is set (notes then wrap at that width); the note has no `╭ │ ╰ ▸` prefixes in it.
 The "next" line gets a lead `╶─ ` in `NvtourFrame<Role>`, a collapsed note a lead `╶─ ` in
 `NvtourNoteBorder` (instead of `╶ `); continuation lines are indented by 3 cells. The frame costs 2
 screen lines per block; `scroll_to` counts them.
