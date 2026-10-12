@@ -475,6 +475,10 @@ so a step id is never read as a sheet id. `start --sheet SHEET` sets the sheet o
   `]w` starts one process, not one per step.
 - **Output.** The step line ends with `  ↔ sheet SHEET#STEP`; `status` and `--json` have `sheet`;
   the panel shows `  ↔ SHEET#STEP` after the step title (`NvtourVia`, muted).
+- **Sheet change.** When the current step is the first step of the tour with a link, or links to
+  another sheet than the last step before it in the tour that has a link (the sheet the user saw
+  last), the block above its note has the line `↔ sheet SHEET` (`NvtourVia`, the id in
+  `NvtourViaLoc`), after the `◇` line. Steps without a link between them do not count.
 - **Remote and environment.** The nvim process starts `sheet`, so by default its environment
   decides which viewer is used. The CLI of `step`, `edit --sheet` and `start --sheet` also records
   `SHEET_SOCKET` and `SHEET_HOME` from its own environment (only these two, only when set and not

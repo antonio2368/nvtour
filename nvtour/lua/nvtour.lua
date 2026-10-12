@@ -1314,16 +1314,37 @@ local function link_lines(prefix, segs, width)
   return out
 end
 
---- Line above the note of the current step, when the file or the version is different from the
---- step before it in the tour (the code the user saw last):
+--- Line above the note of the current step, when it is the first step of the tour with a sheet link,
+--- or its link names another sheet than the last linked step before it (the sheet the user saw last):
+---   ↔ sheet other
+local function sheet_arrival_lines(step, width)
+  if not step.sheet then
+    return {}
+  end
+  for i = step.n - 1, 1, -1 do
+    local s = S.tour.steps[i]
+    if s and s ~= step and s.sheet then
+      if s.sheet.sheet == step.sheet.sheet then
+        return {}
+      end
+      break
+    end
+  end
+  return link_lines("↔ ", { { "sheet ", "NvtourVia" }, { step.sheet.sheet, "NvtourViaLoc" } }, width)
+end
+
+--- Lines above the note of the current step. The "◇" line, when the file or the version is
+--- different from the step before it in the tour (the code the user saw last), then the sheet line:
 ---   ◇ a.cpp @origin/master (1a2b3c4d5e6f)
+---   ↔ sheet other
 --- The --via text is not repeated here: the "next" line of the step before shows it.
 local function arrival_lines(step, width)
   local prev = S.tour.steps[step.n - 1]
-  if not prev or prev == step or same_doc(prev, step) then
-    return {}
+  local out = {}
+  if prev and prev ~= step and not same_doc(prev, step) then
+    out = link_lines("◇ ", version_segs(step, prev), width)
   end
-  return link_lines("◇ ", version_segs(step, prev), width)
+  return vim.list_extend(out, sheet_arrival_lines(step, width))
 end
 
 --- Line below the range of the current step, about the next step: shown when the next step is in

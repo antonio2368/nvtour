@@ -783,6 +783,29 @@ def test_sheet_link_on_keys_and_panel(cli, nv, sheet):
     assert sheet.wait(2)[1:] == [f"{GOTO} arch s3"]
 
 
+def test_sheet_change_line_above_note(cli, nv, sheet):
+    ok(cli("start", "Change", "--sheet", "arch"))
+    ok(cli("step", "a.txt:1", "--sheet", "#intro", "--note", "First."))  # the first linked step
+    ok(cli("step", "a.txt:3", "--sheet", "#s2", "--note", "Same sheet."))
+    ok(cli("step", "a.txt:5"))  # no link: no line
+    ok(cli("step", "a.txt:7", "--sheet", "flow#1", "--note", "Other sheet."))
+    ok(cli("step", "b.txt:9", "--sheet", "arch#s3"))
+    ok(cli("goto", "1"))
+    assert link_texts(nv, "a.txt")[0] == ["↔ sheet arch", "First."]
+    ok(cli("goto", "2"))
+    assert link_texts(nv, "a.txt")[2] == ["Same sheet."]
+    ok(cli("goto", "3"))
+    assert 4 not in link_texts(nv, "a.txt")
+    ok(cli("goto", "4"))  # the last linked step (2) is in "arch"; step 3 has no link
+    assert link_texts(nv, "a.txt")[6] == ["↔ sheet flow", "Other sheet."]
+    line = [m[3]["virt_lines"] for m in step_marks(nv, "a.txt") if m[1] == 6 and m[3].get("virt_lines_above")][0]
+    assert ["flow", "NvtourViaLoc"] in [c for l in line for c in content(l)]
+    ok(cli("next"))  # another file and another sheet: both lines
+    assert link_texts(nv, "b.txt") == {8: ["◇ b.txt", "↔ sheet arch"]}
+    ok(cli("edit", "4", "--sheet", "arch#s9"))  # now the same sheet as the steps around it
+    assert link_texts(nv, "b.txt") == {8: ["◇ b.txt"]}
+
+
 def test_sheet_link_debounce_last_step_wins(cli, nv, sheet):
     ok(cli("start", "Quick"))
     ok(cli("step", "a.txt:1", "--sheet", "d#1"))

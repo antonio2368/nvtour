@@ -82,7 +82,7 @@ Use this when the user asks about code ("this", "here", "this chunk") but gives 
 - `--sheet SHEET#STEP` on `nvtour step` (or `edit`) links a tour step to a step of a sheet. When the user moves to that tour step, the viewer shows the sheet step. Example: ``nvtour step f.cpp:10-12 --sheet arch#evict``.
 - Prefer a step id for STEP (`arch#evict`): numbers change when the sheet changes. 0 is the overview.
 - `nvtour start TITLE --sheet SHEET` sets the sheet of the tour; then `--sheet '#evict'` is enough. `nvtour edit N --sheet ''` removes a link.
-- One tour can use several sheets: a full `SHEET#STEP` links a step to another sheet (`#STEP` keeps the tour's sheet), so the tour can go from `arch#overview` to `raft#append` and back.
+- One tour can use several sheets: a full `SHEET#STEP` links a step to another sheet (`#STEP` keeps the tour's sheet), so the tour can go from `arch#overview` to `raft#append` and back. The note of the first linked step and of each step where the sheet changes starts with `↔ sheet raft`, so you do not need to write that the sheet changed.
 - A value without `#` is exit 2. `#STEP` without `start --sheet` is exit 6.
 - Create the sheet before you link to it. If `sheet` is not installed or the viewer is not open, nothing happens and nvtour prints no error (`nvtour doctor` shows the `sheet command`).
 

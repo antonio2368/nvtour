@@ -178,6 +178,8 @@ nvtour edit 2 --sheet ''                                                        
   current (the last step wins, so holding `]w` runs one process). It never starts a viewer. When `sheet` is
   not on `PATH` (or `vim.g.nvtour_sheet_cmd` is not executable), nothing happens; `nvtour doctor` tells you.
 - The step line, `status` (`sheet` in `--json`) and the panel show `↔ sheet SHEET#STEP`.
+- The first linked step, and a step that goes to another sheet than the linked step before it, start their note
+  with `↔ sheet SHEET`, as the `◇` line does for another file.
 - `SHEET_SOCKET` and `SHEET_HOME` from the environment of the `nvtour` command are stored with the link and
   used for the `sheet` call, so a forward (`SHEET_SOCKET=tcp://127.0.0.1:PORT`) works even when Neovim was
   started without it. Without them, Neovim's own environment is used.
