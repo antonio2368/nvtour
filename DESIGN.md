@@ -178,7 +178,8 @@ more ranges; extra bare `L3-L4` arguments apply to the same file.
   give the exact text (`getregion()`); at most 200 lines and 64 KiB.
 - **start** — resets any existing tour (same as `clear` but keeps the panel if open), sets the
   title, creates a fresh quickfix list, installs keymaps. `step` without a prior `start` implicitly
-  starts an untitled tour.
+  starts an untitled tour. `--sheet SHEET` sets the sheet of the tour (§6, "Sheet link"); the id is
+  checked (exit 2) and the output ends with `  ↔ sheet SHEET`.
 - **step** — appends a step (see §6), or inserts it with `--at N`. Only the first step of a tour
   jumps (so a finished tour is at step 1); `--jump` forces a jump, `--no-jump` suppresses it for the
   first step. Prints `step N/N: file:L1-L2 [role] label` and the first highlighted line
@@ -192,14 +193,19 @@ more ranges; extra bare `L3-L4` arguments apply to the same file.
   tour goes there from the step before it, or from step N with `--from N` (§6, "Links between
   steps"). `--from N` with a step number that does not exist is exit 6. `--suggest TEXT|-` is the
   code that would replace the range (§6, "Suggested code"); `--note -` and `--suggest -` together
-  is exit 2 (only one can read stdin).
+  is exit 2 (only one can read stdin). `--sheet SHEET#STEP` links the step to a step of a `sheet`
+  canvas (§6, "Sheet link"); the output then ends with `  ↔ sheet SHEET#STEP`.
 - **edit / remove** — change or delete step N; all steps are renumbered and rendered again. A new
   location replaces the old one completely: `FILE:L1[-L2]` alone puts the step on the working tree,
   `FILE:L1[-L2] --ref GITREF` on that ref. `--ref` without a location is a usage error (exit 2).
+  `edit --sheet SHEET#STEP` changes the sheet link, `--sheet ''` removes it. Links stay with their
+  steps when the steps are renumbered; `edit` without `--sheet` keeps the link.
 - **goto / next / prev / first / last** — move the current step (wraps at ends is **not** desired;
   clamp and say `already at last step`). `prev` before any jump goes to step 1. Prints the same
   lines as `step`.
 - **status** — the tour (title, steps, current), focus, panel, diff tabs and installed keys. Read only.
+  A step with a sheet link has `sheet` (`SHEET#STEP`) in `--json` and `↔ sheet SHEET#STEP` in the text;
+  `tour_sheet` and the line `sheet: SHEET` show the sheet of the tour.
 - **focus / unfocus** — §8.
 - **diff / diff-close** — §9.
 - **diagram** — renders a diagram into a read-only buffer that steps can point to (`step --diagram`);
@@ -213,7 +219,8 @@ more ranges; extra bare `L3-L4` arguments apply to the same file.
 - **doctor** — checks: nvim on PATH (optional), pynvim importable, runtime dirs scanned,
   live/stale sockets, selected instance, version of that nvim ≥ 0.10, Lua runtime version loaded in
   it. The exit code is the code of the first failed required check (pynvim, selected instance,
-  nvim version, connection).
+  nvim version, connection). The check `sheet command` is informational (never fails the command):
+  it says whether `vim.g.nvtour_sheet_cmd` (default `sheet`) is executable in the selected nvim.
 
 `--json` makes every command print a single JSON object instead of text (the `dispatch` return
 table plus `socket`, `pid`, and `warnings` when there are any). Without `--json`, warnings are
@@ -444,6 +451,39 @@ The current step shows the "where" above its note, and the "why" of the next jum
 - Only the current step shows link lines. Adding, editing or removing a step renders all steps
   again, so the steps next to it show the new links.
 
+### Sheet link
+
+A step can go with a step of a canvas of the `sheet` tool (a live visual canvas that an agent
+drives from a CLI). `--sheet SHEET#STEP` on `step` and `edit` stores `{ sheet, step }` in the step.
+SHEET is a sheet id (`[A-Za-z0-9_][A-Za-z0-9_-]*`). STEP is a number (0 is the overview) or a step
+id (`[A-Za-z_][A-Za-z0-9_.-]*`). The Python CLI checks both (exit 2). A value without `#` is exit 2,
+so a step id is never read as a sheet id. `start --sheet SHEET` sets the sheet of the tour; then
+`--sheet '#STEP'` uses it, and `#STEP` without a sheet of the tour is exit 6. `--sheet ''` on
+`edit` removes the link.
+
+- **When.** Each time a step with a link becomes the current step: `goto`, `next`, `prev`, `first`,
+  `last`, the keymaps, `<CR>` in the panel, and the jump to the first step by `step`. The call is
+  in `jump()`, the one place where the current step changes (every navigation goes through it).
+  `edit` and a render do not call it, unless the link of the current step changed. `remove` does
+  not call it. `edit` and `remove` keep the links of the other steps. `clear` and `start` drop all
+  links and cancel a call that waits.
+- **How.** The Lua runtime runs `vim.system({ CMD, "goto", "-q", "--no-autostart", SHEET, STEP },
+  { detach = true })`, never waits for it, discards the output and ignores failures. CMD is
+  `vim.g.nvtour_sheet_cmd` or `sheet`. When CMD is not executable, nothing happens (no error).
+- **Debounce.** The call starts 150 ms after the step became current; a later step replaces it
+  (the last step wins). A step without a link also cancels the call of the step before it. Holding
+  `]w` starts one process, not one per step.
+- **Output.** The step line ends with `  ↔ sheet SHEET#STEP`; `status` and `--json` have `sheet`;
+  the panel shows `  ↔ SHEET#STEP` after the step title (`NvtourVia`, muted).
+- **Remote and environment.** The nvim process starts `sheet`, so by default its environment
+  decides which viewer is used. The CLI of `step`, `edit --sheet` and `start --sheet` also records
+  `SHEET_SOCKET` and `SHEET_HOME` from its own environment (only these two, only when set and not
+  empty) with the link. The runtime passes them in the `env` of `vim.system`, merged over the
+  environment of nvim; without them the call uses the environment of nvim. So a
+  `SHEET_SOCKET=tcp://127.0.0.1:PORT` forward works when nvim was started before the variable was
+  set. A `#STEP` link without variables in its own call uses the ones of `start --sheet`. When nvim
+  runs on a remote host, set the variable in the environment of the agent (or of nvim).
+
 ### Frame and band
 
 All virtual lines of a step (link lines, the note, the collapsed note) must not look like code. Both
@@ -504,7 +544,7 @@ Rendered content:
 # <title or "Walkthrough">                    2/3      ← progress: virt_text, NvtourPanelProgress
 
 src/a.cpp                                               ← NvtourPanelFile
-▶ 1. ✗ 412-415  dangling iterator
+▶ 1. ✗ 412-415  dangling iterator  ↔ arch#cache      ← sheet link (--sheet): NvtourVia
     ↓ the cleanup thread erases the entry               ← --via of step 2: NvtourVia
 src/b.cpp
   2. → 88       erase on cleanup thread
@@ -713,6 +753,10 @@ current step.
 6. Tests never connect to sockets under the real `$XDG_RUNTIME_DIR`; they set `XDG_RUNTIME_DIR` to
    a temp dir and start their own `nvim --headless --clean` there (nvim then creates its socket in
    that dir, so discovery is exercised end to end).
+7. The only other program that nvtour runs is `sheet goto -q --no-autostart SHEET STEP`, and only
+   for a step with a sheet link (§6, "Sheet link"): detached, without waiting, with `--no-autostart`
+   so nvtour never starts a viewer. No other `sheet` command, no shell. Tests use a fake `sheet`
+   script (`vim.g.nvtour_sheet_cmd`) that records its arguments.
 
 ## 13. Packaging, install, skill
 

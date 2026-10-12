@@ -6,6 +6,7 @@ import argparse
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -23,6 +24,9 @@ from .errors import (
 )
 
 ROLES = ["fault", "flow", "fix", "context", "info"]
+
+SHEET_ID_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_-]*\Z")  # the id rule of `sheet`
+SHEET_STEP_ID_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]*\Z")
 
 
 # ---------------------------------------------------------------------------
@@ -64,6 +68,41 @@ def positive_int(text: str) -> int:
     return value
 
 
+def check_sheet_id(text: str) -> str:
+    """A sheet id, as `sheet` writes it: letters, digits, ``_`` and ``-``, not starting with ``-``."""
+    if not SHEET_ID_RE.match(text):
+        raise NvtourError(EXIT_USAGE, f"--sheet: bad sheet id {text!r}; use letters, digits, _ and - (not - first)")
+    return text
+
+
+def parse_sheet_link(value: str) -> dict[str, str] | str:
+    """``--sheet`` of step and edit: ``SHEET#STEP``, ``#STEP`` (the sheet of the tour) or ``''`` (no link).
+
+    STEP is a number (0 is the overview) or a step id. Returns ``''`` or ``{"sheet": ID or "", "step": STEP}``;
+    the Lua side fills in the sheet of the tour and fails (exit 6) when there is none."""
+    if value == "":
+        return ""
+    sheet, sep, step = value.partition("#")
+    if not sep:
+        raise NvtourError(EXIT_USAGE, f"--sheet {value!r}: expected SHEET#STEP (or #STEP for the sheet of the tour)")
+    if sheet:
+        check_sheet_id(sheet)
+    if not step:
+        raise NvtourError(EXIT_USAGE, f"--sheet {value!r}: the step after # is missing (a number or a step id)")
+    if not (step.isascii() and step.isdigit()) and not SHEET_STEP_ID_RE.match(step):
+        raise NvtourError(EXIT_USAGE, f"--sheet {value!r}: bad step {step!r}; use a number (0: overview) or a step id")
+    return {"sheet": sheet, "step": step}
+
+
+SHEET_ENV_VARS = ("SHEET_SOCKET", "SHEET_HOME")
+
+
+def sheet_env() -> dict[str, str]:
+    """The variables of the viewer that the agent has set; they go with a sheet link to the runtime,
+    which passes them to ``sheet goto`` (a forward may be set after nvim was started)."""
+    return {k: os.environ[k] for k in SHEET_ENV_VARS if os.environ.get(k)}
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the argparse parser (global flags are accepted before or after the subcommand)."""
     sup = argparse.SUPPRESS
@@ -96,6 +135,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = cmd("start", "start a new tour")
     p.add_argument("title", nargs="?", default="")
+    p.add_argument("--sheet", metavar="SHEET", help="the sheet this tour goes with; '#STEP' links to it")
 
     p = cmd("step", "add a step (only the first step of a tour jumps to it)")
     p.add_argument("spec", metavar="FILE:L1[-L2]", help="the location; L1[-L2] with --diagram")
@@ -112,6 +152,8 @@ def build_parser() -> argparse.ArgumentParser:
                    "or - to read stdin")
     p.add_argument("--from", dest="from_", type=positive_int, metavar="N", help="the link (--via) comes from step N, not from the step before")
     p.add_argument("--at", type=int, metavar="N", help="insert as step N instead of appending")
+    p.add_argument("--sheet", metavar="SHEET#STEP", help="show STEP of the sheet SHEET (number or step id) when this "
+                   "step becomes current; #STEP uses the sheet of 'start --sheet'")
     g = p.add_mutually_exclusive_group()
     g.add_argument("--jump", action="store_true", help="jump to this step even if it is not the first")
     g.add_argument("--no-jump", action="store_true", help="do not jump, even for the first step")
@@ -131,6 +173,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--via", metavar="TEXT", help="new link text, '' to remove")
     p.add_argument("--suggest", metavar="TEXT", help="new suggested code, - to read stdin, '' to remove")
     p.add_argument("--from", dest="from_", type=non_negative_int, metavar="N", help="the link comes from step N (0: the step before it)")
+    p.add_argument("--sheet", metavar="SHEET#STEP", help="new sheet link, '' to remove")
     p.add_argument("--jump", action="store_true", help="jump to the step")
 
     p = cmd("remove", "remove step N")
@@ -289,16 +332,22 @@ def build_request(args: argparse.Namespace, workspace: str) -> tuple[str, dict[s
     if c in ("step", "edit") and args.note == "-" and args.suggest == "-":
         raise NvtourError(EXIT_USAGE, f"{c}: only one of --note and --suggest can read stdin (-)")
     if c == "start":
-        return "start", {**base, "title": args.title or None}
+        sheet = check_sheet_id(args.sheet) if args.sheet is not None else None
+        return "start", {**base, "title": args.title or None, "sheet": sheet,
+                         "sheet_env": sheet_env() if sheet else None}
     if c == "step":
         return "step", {**base, **location(args.spec, args.ref, args.diagram), "note": read_text_arg(args.note, "--note -"),
                         "label": args.label, "role": args.role, "expect": args.expect, "via": args.via,
-                        "suggest": read_text_arg(args.suggest, "--suggest -"), "from": args.from_, "at": args.at, "jump": args.jump or None, "no_jump": args.no_jump or None}
+                        "suggest": read_text_arg(args.suggest, "--suggest -"), "from": args.from_, "at": args.at, "jump": args.jump or None, "no_jump": args.no_jump or None,
+                        "sheet": parse_sheet_link(args.sheet) if args.sheet is not None else None,
+                        "sheet_env": sheet_env() if args.sheet else None}
     if c == "edit":
         req: dict[str, Any] = {**base, "n": args.n, "note": read_text_arg(args.note, "--note -"), "label": args.label,
                                "role": args.role, "expect": args.expect, "via": args.via, "from": args.from_,
                                "suggest": read_text_arg(args.suggest, "--suggest -"),
-                               "jump": args.jump or None}
+                               "jump": args.jump or None,
+                               "sheet": parse_sheet_link(args.sheet) if args.sheet is not None else None,
+                               "sheet_env": sheet_env() if args.sheet else None}
         if args.spec:
             req.update(location(args.spec, args.ref, args.diagram))
         elif args.ref is not None:
@@ -363,6 +412,11 @@ def build_request(args: argparse.Namespace, workspace: str) -> tuple[str, dict[s
     raise NvtourError(EXIT_USAGE, f"unknown command {c}")
 
 
+def fmt_sheet(res: Mapping[str, Any]) -> str:
+    """The sheet link at the end of a step line."""
+    return f"  ↔ sheet {res['sheet']}" if res.get("sheet") else ""
+
+
 def format_result(args: argparse.Namespace, res: dict[str, Any], workspace: str) -> str:
     """One-line (or short) human output for a successful command."""
     c = args.command
@@ -370,7 +424,7 @@ def format_result(args: argparse.Namespace, res: dict[str, Any], workspace: str)
         if res.get("message"):
             return str(res["message"])
         label = f" {res['label']}" if res.get("label") else ""
-        out = f"step {res['n']}/{res['total']}: {fmt_loc(res, workspace)} [{res['role']}]{label}"
+        out = f"step {res['n']}/{res['total']}: {fmt_loc(res, workspace)} [{res['role']}]{label}{fmt_sheet(res)}"
         if res.get("text") is not None:
             out += f"\n  {res['l1']}| {res['text']}"  # lets the agent see what it highlighted
         return out
@@ -379,7 +433,7 @@ def format_result(args: argparse.Namespace, res: dict[str, Any], workspace: str)
     if c == "status":
         return format_status(res, workspace)
     if c == "start":
-        return f"started: {res.get('title') or 'Walkthrough'}"
+        return f"started: {res.get('title') or 'Walkthrough'}{fmt_sheet(res)}"
     if c == "focus":
         rs = " ".join(fmt_range(a, b) for a, b in res["ranges"])
         later = "; applied when the file is shown" if res.get("deferred") else ""
@@ -410,10 +464,12 @@ def format_status(res: dict[str, Any], workspace: str) -> str:
     """Multi-line output for ``status``."""
     title = res.get("title") or "Walkthrough"
     out = [f"tour: {title} ({res['total']} step(s), current {res['current'] or '-'})"]
+    if res.get("tour_sheet"):
+        out.append(f"sheet: {res['tour_sheet']}")
     for s in res.get("steps") or []:
         mark = "▶" if s["n"] == res["current"] else " "
         label = f" {s['label']}" if s.get("label") else ""
-        out.append(f"  {mark} {s['n']}. {fmt_loc(s, workspace)} [{s['role']}]{label}")
+        out.append(f"  {mark} {s['n']}. {fmt_loc(s, workspace)} [{s['role']}]{label}{fmt_sheet(s)}")
         if s.get("via") or s.get("from"):
             src = f"from {s['from']}" if s.get("from") else ""
             via = " ".join((s.get("via") or "").split())
@@ -579,6 +635,11 @@ def version_tuple(v: str) -> tuple[int, ...]:
     return tuple(parts)
 
 
+SHEET_CMD_LUA = ("local c = vim.g.nvtour_sheet_cmd "
+                 "if type(c) ~= 'string' or c == '' then c = 'sheet' end "
+                 "return { c, vim.fn.executable(c) == 1 }")
+
+
 def run_doctor(args: argparse.Namespace, workspace: str, env: Mapping[str, str]) -> int:
     """Read-only environment checklist; the exit code is the first failed required check."""
     checks: list[dict[str, Any]] = []
@@ -641,6 +702,13 @@ def run_doctor(args: argparse.Namespace, workspace: str, env: Mapping[str, str])
             server = client.exec_lua("local v = vim.version() return { v.major, v.minor, v.patch }") or []
             sver = ".".join(str(x) for x in server)
             add(tuple(server) >= (0, 10), "nvim version", f"{sver} (need >= 0.10)", EXIT_RPC)
+            # The runtime starts the command inside that nvim, so its g:nvtour_sheet_cmd and PATH count.
+            sheet = client.exec_lua(SHEET_CMD_LUA) or []
+            if sheet and sheet[1]:
+                add(True, "sheet command", f"{sheet[0]} is executable (steps with --sheet are shown in the sheet)")
+            else:
+                add(None, "sheet command", f"{sheet[0] if sheet else 'sheet'} is not executable in the running nvim "
+                    "(optional; steps with --sheet then do nothing)")
             loaded, expected = client.loaded_version(), lua_version()
             if loaded == expected:
                 add(True, "Lua runtime", f"loaded version {loaded}")
@@ -652,6 +720,9 @@ def run_doctor(args: argparse.Namespace, workspace: str, env: Mapping[str, str])
             add(False, "Lua runtime", exc.message, exc.code)
         finally:
             client.close()
+    else:
+        found = shutil.which("sheet")
+        add(True if found else None, "sheet command", found or "not found on PATH (optional; steps with --sheet then do nothing)")
     return report()
 
 

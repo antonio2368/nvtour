@@ -159,6 +159,29 @@ there, and where you are. The current step shows both:
 - **In the panel,** each link is a line `↓ [from N: ]text` before the step, so the panel reads as a chain.
 - **Jumplist:** each jump adds the previous position to the jumplist, so `<C-o>` goes back.
 
+### Sheets
+
+When the agent also draws a canvas with [`sheet`](https://github.com/ClickHouse/agentsheet), a tour step can
+show a step of that sheet. The sheet moves when the step becomes the current step:
+
+```
+nvtour start "Cache bug" --sheet arch
+nvtour step cache.cpp:88 --note 'The entry is erased here.' --sheet '#evict'   # sheet "arch", step id "evict"
+nvtour step reader.cpp:10 --sheet other#3                                      # another sheet, step 3
+nvtour edit 2 --sheet ''                                                        # remove the link
+```
+
+- **`--sheet SHEET#STEP`** (on `step` and `edit`): STEP is a number (0 is the overview) or a step id. Prefer step
+  ids: numbers change when the sheet changes. `#STEP` uses the sheet of `start --sheet`. A value without `#` is
+  exit 2.
+- nvtour only runs `sheet goto -q --no-autostart SHEET STEP`, detached and 150 ms after the step became
+  current (the last step wins, so holding `]w` runs one process). It never starts a viewer. When `sheet` is
+  not on `PATH` (or `vim.g.nvtour_sheet_cmd` is not executable), nothing happens; `nvtour doctor` tells you.
+- The step line, `status` (`sheet` in `--json`) and the panel show `↔ sheet SHEET#STEP`.
+- `SHEET_SOCKET` and `SHEET_HOME` from the environment of the `nvtour` command are stored with the link and
+  used for the `sheet` call, so a forward (`SHEET_SOCKET=tcp://127.0.0.1:PORT`) works even when Neovim was
+  started without it. Without them, Neovim's own environment is used.
+
 ### Suggested fix
 
 `--suggest TEXT|-` shows the code that would replace the range of a step. Use it on a `fix` step:
@@ -278,9 +301,9 @@ nvtour step src/cache.cpp:31-38 --label "load from the store" --via 'a miss call
 
 | command | what it does |
 |---|---|
-| `start [TITLE]` | start a new tour (keeps an open panel) |
-| `step FILE:L1[-L2] [--ref GITREF] [--note TEXT\|-] [--label] [--role] [--expect TEXT]... [--via TEXT] [--from N] [--suggest TEXT\|-] [--at N] [--jump\|--no-jump]` | add a step (`--ref`: on the file at that git ref; `--via`: why the tour goes there from the step before, or from step `--from N`; `--suggest`: the code that would replace the range) |
-| `edit N [FILE:L1[-L2] [--ref GITREF]] [--note] [--label] [--role] [--expect] [--via] [--from N] [--suggest] [--jump]` | change a step (`''` removes a label, note, link text, suggestion or the `--expect` texts; a new `--expect` list replaces the old one; `--from 0` links from the step before again; a new location without `--ref` is on the working tree) |
+| `start [TITLE] [--sheet SHEET]` | start a new tour (keeps an open panel); `--sheet`: the sheet of the tour |
+| `step FILE:L1[-L2] [--ref GITREF] [--note TEXT\|-] [--label] [--role] [--expect TEXT]... [--via TEXT] [--from N] [--suggest TEXT\|-] [--at N] [--sheet SHEET#STEP] [--jump\|--no-jump]` | add a step (`--ref`: on the file at that git ref; `--via`: why the tour goes there from the step before, or from step `--from N`; `--suggest`: the code that would replace the range; `--sheet`: show that step of a [sheet](#sheets) when the step becomes current) |
+| `edit N [FILE:L1[-L2] [--ref GITREF]] [--note] [--label] [--role] [--expect] [--via] [--from N] [--suggest] [--sheet SHEET#STEP] [--jump]` | change a step (`''` removes a label, note, link text, suggestion, sheet link or the `--expect` texts; a new `--expect` list replaces the old one; `--from 0` links from the step before again; a new location without `--ref` is on the working tree) |
 | `step L1[-L2] --diagram NAME [...]`, `edit N L1[-L2] --diagram NAME` | a step on lines of a diagram |
 | `remove N` | remove a step |
 | `panel [TEXT\|-\|--file PATH] [--toggle] [--clear]` | side panel text |
@@ -347,6 +370,7 @@ vim.g.nvtour_winbar = false                   -- do not show the tour position i
 vim.g.nvtour_flash = 0                        -- ms the range flashes after a jump (default 300; 0 = off)
 vim.g.nvtour_note_style = "band"              -- a background band instead of the frame (default "frame")
 vim.g.nvtour_note_width = 160                 -- wrap notes at most this many cells wide (default: the window width)
+vim.g.nvtour_sheet_cmd = "sheet"              -- the command for steps with --sheet (default "sheet")
 ```
 
 - **Winbar:** set only in a window that has no winbar of its own (from you or a plugin). `clear` removes it.

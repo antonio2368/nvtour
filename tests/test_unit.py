@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 
 from nvtour import cli, discover
-from nvtour.errors import EXIT_BAD_FILE, NvtourError
+from nvtour.errors import EXIT_BAD_FILE, EXIT_USAGE, NvtourError
 from nvtour.ranges import parse_file_range, parse_range
 
 
@@ -183,3 +183,58 @@ def test_text_lines():
     assert cli.text_lines("a\nb\n") == ["a", "b"]
     assert cli.text_lines("a\nb") == ["a", "b"]
     assert cli.text_lines("") == []
+
+
+@pytest.mark.parametrize("value, expected", [
+    ("arch#intro", {"sheet": "arch", "step": "intro"}),
+    ("arch#3", {"sheet": "arch", "step": "3"}),
+    ("arch#0", {"sheet": "arch", "step": "0"}),
+    ("a_b-1#step.one-2", {"sheet": "a_b-1", "step": "step.one-2"}),
+    ("_x#_y", {"sheet": "_x", "step": "_y"}),
+    ("7#8", {"sheet": "7", "step": "8"}),
+    ("#intro", {"sheet": "", "step": "intro"}),
+    ("#2", {"sheet": "", "step": "2"}),
+    ("", ""),
+])
+def test_parse_sheet_link(value, expected):
+    assert cli.parse_sheet_link(value) == expected
+
+
+@pytest.mark.parametrize("bad", ["intro", "arch", "a b#1", "-a#1", "a#", "#", "a#-1", "a#1x", "a#b c", "a#b#c", "a/b#1", "é#1"])
+def test_parse_sheet_link_errors(bad):
+    with pytest.raises(NvtourError) as e:
+        cli.parse_sheet_link(bad)
+    assert e.value.code == EXIT_USAGE and "--sheet" in e.value.message
+
+
+def test_check_sheet_id():
+    assert cli.check_sheet_id("a-b_1") == "a-b_1"
+    for bad in ("", "-a", "a b", "a#b", "a.b"):
+        with pytest.raises(NvtourError) as e:
+            cli.check_sheet_id(bad)
+        assert e.value.code == EXIT_USAGE
+
+
+def test_build_request_sheet():
+    parser = cli.build_parser()
+    args = parser.parse_args(["step", "a.txt:1", "--sheet", "s#2"])
+    # location() needs a file; only the link is checked here
+    args.spec = __file__ + ":1"
+    _cmd, req = cli.build_request(args, "/w")
+    assert req["sheet"] == {"sheet": "s", "step": "2"}
+    args = parser.parse_args(["start", "T", "--sheet", "main"])
+    assert cli.build_request(args, "/w")[1]["sheet"] == "main"
+    args = parser.parse_args(["start", "T"])
+    assert cli.build_request(args, "/w")[1]["sheet"] is None
+    args = parser.parse_args(["edit", "1", "--sheet", ""])
+    assert cli.build_request(args, "/w")[1]["sheet"] == ""
+
+
+def test_sheet_env(monkeypatch):
+    monkeypatch.delenv("SHEET_SOCKET", raising=False)
+    monkeypatch.delenv("SHEET_HOME", raising=False)
+    assert cli.sheet_env() == {}
+    monkeypatch.setenv("SHEET_SOCKET", "tcp://127.0.0.1:1")
+    monkeypatch.setenv("SHEET_HOME", "")
+    monkeypatch.setenv("PATH_UNRELATED", "x")
+    assert cli.sheet_env() == {"SHEET_SOCKET": "tcp://127.0.0.1:1"}

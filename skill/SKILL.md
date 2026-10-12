@@ -76,6 +76,15 @@ Use this when the user asks about code ("this", "here", "this chunk") but gives 
 - Do not write the file name, the line or the git ref in a note or `--via`. nvim shows them on each change of file or version.
 - `nvtour edit N --via TEXT` changes a link; `--via ''` removes it; `--from 0` links from the step before again.
 
+## Sheets
+
+- Use this only when you also draw a `sheet` canvas for the same topic. nvtour never starts or changes a sheet by itself.
+- `--sheet SHEET#STEP` on `nvtour step` (or `edit`) links a tour step to a step of a sheet. When the user moves to that tour step, the viewer shows the sheet step. Example: ``nvtour step f.cpp:10-12 --sheet arch#evict``.
+- Prefer a step id for STEP (`arch#evict`): numbers change when the sheet changes. 0 is the overview.
+- `nvtour start TITLE --sheet SHEET` sets the sheet of the tour; then `--sheet '#evict'` is enough. `nvtour edit N --sheet ''` removes a link.
+- A value without `#` is exit 2. `#STEP` without `start --sheet` is exit 6.
+- Create the sheet before you link to it. If `sheet` is not installed or the viewer is not open, nothing happens and nvtour prints no error (`nvtour doctor` shows the `sheet command`).
+
 ## Focus
 
 - Concept spans a long file: run `nvtour focus FILE:a-b c-d` once per file.

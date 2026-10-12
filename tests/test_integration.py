@@ -690,6 +690,302 @@ def test_doctor(cli, sandbox):
     assert r.returncode == 0 and "[ok]" in r.stdout and "Lua runtime" in r.stdout
 
 
+# --- sheet links: a fake `sheet` command records what nvtour runs ----------------------------------
+
+
+class FakeSheet:
+    """A script that appends its arguments, one line per call, to a log file."""
+
+    def __init__(self, nv, tmp_path):
+        self.nv = nv
+        self.log = tmp_path / "sheet.log"
+        self.script = tmp_path / "fake-sheet"
+        self.env_log = tmp_path / "sheet-env.log"
+        self.script.write_text(f'#!/bin/sh\necho "$*" >> {self.log}\necho "SOCKET=$SHEET_SOCKET HOME=$SHEET_HOME" >> {self.env_log}\n')
+        self.script.chmod(0o755)
+        nv.api.set_var("nvtour_sheet_cmd", str(self.script))
+
+    def envs(self):
+        """The SHEET_SOCKET and SHEET_HOME that each call saw, as ``SOCKET=... HOME=...`` lines."""
+        return self.env_log.read_text().splitlines() if self.env_log.exists() else []
+
+    def calls(self):
+        return self.log.read_text().splitlines() if self.log.exists() else []
+
+    def wait(self, count, timeout=5.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline and len(self.calls()) < count:
+            time.sleep(0.02)
+        return self.calls()
+
+    def settle(self):
+        """Wait past the debounce time, for tests that expect that nothing was run."""
+        time.sleep(0.5)
+        return self.calls()
+
+
+@pytest.fixture()
+def sheet(nv, tmp_path):
+    fake = FakeSheet(nv, tmp_path)
+    yield fake
+    nv.command("unlet! g:nvtour_sheet_cmd")
+    nv.exec_lua("_G.nvtour.dispatch('clear', {})")
+
+
+GOTO = "goto -q --no-autostart"
+
+
+def test_sheet_link_runs_goto_on_activation(cli, nv, sheet):
+    out = ok(cli("start", "Sheets"))
+    assert out.strip() == "started: Sheets"
+    out = ok(cli("step", "a.txt:1", "--sheet", "arch#intro"))  # the first step jumps
+    assert out.splitlines()[0] == "step 1/1: a.txt:1 [info]  ↔ sheet arch#intro"
+    assert sheet.wait(1) == [f"{GOTO} arch intro"]
+    ok(cli("step", "a.txt:2", "--sheet", "arch#2"))  # not the first step: no jump, no call
+    ok(cli("step", "a.txt:3"))  # no link
+    ok(cli("step", "a.txt:4", "--sheet", "other#0"))
+    assert sheet.settle() == [f"{GOTO} arch intro"]
+    ok(cli("goto", "2"))
+    assert sheet.wait(2)[1:] == [f"{GOTO} arch 2"]
+    ok(cli("next"))  # step 3 has no link
+    sheet.settle()
+    ok(cli("next"))
+    assert sheet.wait(3)[2:] == [f"{GOTO} other 0"]
+    ok(cli("prev"))
+    ok(cli("prev"))
+    assert sheet.wait(4)[3:] == [f"{GOTO} arch 2"]
+    ok(cli("last"))
+    assert sheet.wait(5)[4:] == [f"{GOTO} other 0"]
+    ok(cli("first"))
+    assert sheet.wait(6)[5:] == [f"{GOTO} arch intro"]
+    assert len(sheet.settle()) == 6  # the unlinked step 3 never ran anything
+
+
+def test_sheet_link_on_keys_and_panel(cli, nv, sheet):
+    ok(cli("start", "Keys"))
+    ok(cli("step", "a.txt:1"))
+    ok(cli("step", "a.txt:2", "--sheet", "arch#s2"))
+    ok(cli("step", "a.txt:3", "--sheet", "arch#s3"))
+    nv.input("]w")
+    assert sheet.wait(1) == [f"{GOTO} arch s2"]
+    nv.input("[w")  # step 1 has no link: nothing
+    assert len(sheet.settle()) == 1
+    pb = find_buf(nv, "nvtour://panel")
+    text = lines_of(nv, pb.handle)
+    assert any(l.endswith("↔ arch#s2") for l in text) and any(l.endswith("↔ arch#s3") for l in text)
+    assert not any("↔" in l for l in text if l.lstrip(" ▶").startswith("1."))
+    muted = [m for m in ns_marks(nv, "nvtour_panel", pb.handle) if m[3].get("hl_group") == "NvtourVia" and m[3].get("end_col")]
+    assert muted
+    row = next(i for i, l in enumerate(text) if l.endswith("↔ arch#s3"))
+    nv.api.set_current_win(nv.eval("bufwinid(%d)" % pb.handle))
+    nv.api.win_set_cursor(0, (row + 1, 0))
+    nv.input("<CR>")  # the panel jumps to step 3
+    assert sheet.wait(2)[1:] == [f"{GOTO} arch s3"]
+
+
+def test_sheet_link_debounce_last_step_wins(cli, nv, sheet):
+    ok(cli("start", "Quick"))
+    ok(cli("step", "a.txt:1", "--sheet", "d#1"))
+    ok(cli("step", "a.txt:2", "--sheet", "d#2"))
+    ok(cli("step", "a.txt:3", "--sheet", "d#3"))
+    ok(cli("step", "a.txt:4"))
+    sheet.wait(1)
+    sheet.settle()
+    sheet.log.unlink()
+    nv.exec_lua("local d = _G.nvtour.dispatch; d('goto', { n = 1 }); d('next'); d('next')")
+    sheet.settle()
+    assert sheet.calls() == [f"{GOTO} d 3"]
+    sheet.log.unlink()
+    # A step without a link is the last step too: nothing runs.
+    nv.exec_lua("local d = _G.nvtour.dispatch; d('goto', { n = 2 }); d('goto', { n = 4 })")
+    assert sheet.settle() == []
+
+
+def test_sheet_link_edit_remove_and_renumber(cli, nv, sheet):
+    ok(cli("start", "Edit"))
+    ok(cli("step", "a.txt:1", "--sheet", "e#one"))
+    ok(cli("step", "a.txt:2", "--sheet", "e#two"))
+    ok(cli("step", "a.txt:3"))
+    sheet.wait(1)
+    sheet.settle()
+    # Editing another step does not run anything; editing the current step to another link does.
+    ok(cli("edit", "2", "--sheet", "e#two-b"))
+    assert len(sheet.settle()) == 1
+    out = ok(cli("edit", "1", "--sheet", "f#9"))
+    assert out.splitlines()[0].endswith("↔ sheet f#9")
+    assert sheet.wait(2)[1:] == [f"{GOTO} f 9"]
+    ok(cli("edit", "1", "--note", "same link"))  # the link did not change
+    assert len(sheet.settle()) == 2
+    # An inserted step renumbers the others; links stay with their steps.
+    ok(cli("step", "b.txt:1", "--at", "1", "--sheet", "e#new", "--no-jump"))
+    status = json.loads(ok(cli("--json", "status")))
+    assert [s.get("sheet") for s in status["steps"]] == ["e#new", "f#9", "e#two-b", None]
+    assert status["current"] == 2
+    ok(cli("remove", "1"))
+    ok(cli("goto", "2"))
+    assert sheet.wait(3)[2:] == [f"{GOTO} e two-b"]
+    # '' removes the link; the step is activated without a call.
+    out = ok(cli("edit", "2", "--sheet", ""))
+    assert "↔" not in out
+    ok(cli("goto", "1"))
+    assert sheet.wait(4)[3:] == [f"{GOTO} f 9"]
+    ok(cli("goto", "2"))  # no link: nothing more
+    assert len(sheet.settle()) == 4
+    status = json.loads(ok(cli("--json", "status")))
+    assert [s.get("sheet") for s in status["steps"]] == ["f#9", None, None]
+    # Removing the link of the current step cancels the call that waits.
+    nv.exec_lua("_G.nvtour.dispatch('goto', { n = 1 })")
+    ok(cli("edit", "1", "--sheet", ""))
+    assert len(sheet.settle()) == 4
+
+
+def test_sheet_link_clear_cancels_pending_call(cli, nv, sheet):
+    ok(cli("start", "Clear"))
+    ok(cli("step", "a.txt:1", "--sheet", "c#1", "--no-jump"))
+    nv.exec_lua("local d = _G.nvtour.dispatch; d('goto', { n = 1 }); d('clear', {})")
+    assert sheet.settle() == []
+    status = json.loads(ok(cli("--json", "status")))
+    assert status["steps"] == [] and not status.get("tour_sheet")
+
+
+def test_sheet_link_missing_command_is_ignored(cli, nv, tmp_path):
+    nv.api.set_var("nvtour_sheet_cmd", str(tmp_path / "no-such-sheet"))
+    try:
+        ok(cli("start", "Missing"))
+        r = cli("step", "a.txt:1", "--sheet", "m#1")
+        assert r.returncode == 0 and r.stderr == "" and "↔ sheet m#1" in r.stdout
+        r = cli("goto", "1")
+        assert r.returncode == 0 and r.stderr == ""
+        time.sleep(0.4)  # the delayed call ran and found nothing to start
+        r = cli("next")
+        assert r.returncode == 0 and r.stderr == ""
+        assert nv.exec_lua("return _G.nvtour.state.sheet_pending.timer == nil")
+    finally:
+        nv.command("unlet! g:nvtour_sheet_cmd")
+        ok(cli("clear"))
+
+
+def test_sheet_link_default_command_is_sheet_on_path(cli, nv, tmp_path):
+    log = tmp_path / "path.log"
+    bindir = tmp_path / "bin"
+    bindir.mkdir()
+    script = bindir / "sheet"
+    script.write_text(f'#!/bin/sh\necho "$*" >> {log}\n')
+    script.chmod(0o755)
+    old = nv.exec_lua("local o = vim.env.PATH; vim.env.PATH = ... .. ':' .. o; return o", str(bindir))
+    try:
+        ok(cli("start", "Path"))
+        ok(cli("step", "a.txt:1", "--sheet", "p#start"))
+        deadline = time.time() + 5
+        while time.time() < deadline and not log.exists():
+            time.sleep(0.02)
+        assert log.read_text().splitlines() == [f"{GOTO} p start"]
+    finally:
+        nv.exec_lua("vim.env.PATH = ...", old)
+        ok(cli("clear"))
+
+
+def test_sheet_of_the_tour_and_hash_step(cli, nv, sheet):
+    out = ok(cli("start", "Tour", "--sheet", "main"))
+    assert out.strip() == "started: Tour  ↔ sheet main"
+    out = ok(cli("step", "a.txt:1", "--sheet", "#intro"))
+    assert out.splitlines()[0].endswith("↔ sheet main#intro")
+    ok(cli("step", "a.txt:2", "--sheet", "#3"))
+    ok(cli("step", "a.txt:3", "--sheet", "other#3"))
+    assert sheet.wait(1) == [f"{GOTO} main intro"]
+    ok(cli("edit", "2", "--sheet", "#overview"))
+    ok(cli("goto", "2"))
+    assert sheet.wait(2)[1:] == [f"{GOTO} main overview"]
+    data = json.loads(ok(cli("--json", "step", "b.txt:1", "--sheet", "#0")))
+    assert data["sheet"] == "main#0"
+    data = json.loads(ok(cli("--json", "status")))
+    assert data["tour_sheet"] == "main"
+    assert [s.get("sheet") for s in data["steps"]] == ["main#intro", "main#overview", "other#3", "main#0"]
+    text = ok(cli("status"))
+    assert "sheet: main" in text and "[info]  ↔ sheet other#3" in text
+    # A new tour forgets the sheet of the old one.
+    ok(cli("start", "Next tour"))
+    r = cli("step", "a.txt:1", "--sheet", "#intro")
+    assert r.returncode == 6 and "no sheet" in r.stderr
+    assert json.loads(ok(cli("--json", "status")))["total"] == 0
+    data = json.loads(ok(cli("--json", "start", "T", "--sheet", "x")))
+    assert data["sheet"] == "x"
+
+
+def test_sheet_without_tour_sheet_is_exit_6(cli, nv, sheet):
+    ok(cli("start", "NoSheet"))
+    r = cli("step", "a.txt:1", "--sheet", "#intro")
+    assert r.returncode == 6 and "start --sheet" in r.stderr
+    r = cli("--json", "step", "a.txt:1", "--sheet", "#intro")
+    assert r.returncode == 6 and json.loads(r.stdout)["ok"] is False
+    ok(cli("step", "a.txt:1", "--no-jump"))
+    r = cli("edit", "1", "--sheet", "#intro")
+    assert r.returncode == 6
+    assert sheet.settle() == []
+
+
+@pytest.mark.parametrize("value", ["intro", "a b#1", "a#", "-a#1", "a#-1", "a#1x", "a#1 2", "a#b#c", "#"])
+def test_sheet_bad_values_are_usage_errors(cli, nv, value):
+    ok(cli("start", "Bad"))
+    r = cli("step", "a.txt:1", "--sheet", value)
+    assert r.returncode == 2 and "--sheet" in r.stderr
+    r = cli("edit", "1", "--sheet", value)
+    assert r.returncode == 2
+    assert json.loads(ok(cli("--json", "status")))["total"] == 0  # nothing was added
+
+
+@pytest.mark.parametrize("value", ["", "-a", "a b", "a#1", "a.b"])
+def test_start_sheet_bad_ids_are_usage_errors(cli, nv, value):
+    r = cli("start", "x", "--sheet", value)
+    assert r.returncode == 2 and "--sheet" in r.stderr
+
+
+def test_sheet_env_of_the_cli_reaches_the_call(cli, nv, sheet):
+    # The nvim of the tests was started without SHEET_SOCKET: the value comes with the link.
+    no_vars = {"SHEET_SOCKET": "", "SHEET_HOME": ""}
+    nv.exec_lua("vim.fn.setenv('SHEET_SOCKET', vim.NIL) vim.fn.setenv('SHEET_HOME', vim.NIL)")
+    assert nv.exec_lua("return vim.env.SHEET_SOCKET") is None
+    forward = {"SHEET_SOCKET": "tcp://127.0.0.1:47000", "SHEET_HOME": ""}
+    ok(cli("start", "Env", env_extra=no_vars))
+    ok(cli("step", "a.txt:1", "--sheet", "r#one", env_extra=forward))
+    assert sheet.wait(1) == [f"{GOTO} r one"]
+    assert sheet.envs() == ["SOCKET=tcp://127.0.0.1:47000 HOME="]
+    # A link made without the variables uses the environment of nvim.
+    nv.exec_lua("vim.fn.setenv('SHEET_SOCKET', 'tcp://127.0.0.1:1')")
+    try:
+        ok(cli("step", "a.txt:2", "--sheet", "r#two", env_extra=no_vars))
+        ok(cli("goto", "2", env_extra=forward))  # `goto` brings no variables: the link keeps its own
+        assert sheet.wait(2)[1:] == [f"{GOTO} r two"]
+        assert sheet.envs()[1:] == ["SOCKET=tcp://127.0.0.1:1 HOME="]
+        ok(cli("goto", "1"))
+        assert sheet.wait(3)[2:] == [f"{GOTO} r one"]
+        assert sheet.envs()[2:] == ["SOCKET=tcp://127.0.0.1:47000 HOME="]
+        # SHEET_HOME is passed too; `edit --sheet` records the variables of its own call.
+        ok(cli("edit", "2", "--sheet", "r#three", env_extra={"SHEET_SOCKET": "", "SHEET_HOME": "/tmp/sh-home"}))
+        ok(cli("goto", "2"))
+        assert sheet.wait(4)[3:] == [f"{GOTO} r three"]
+        assert sheet.envs()[3:] == ["SOCKET=tcp://127.0.0.1:1 HOME=/tmp/sh-home"]
+        # '#STEP' without variables takes the ones of `start --sheet`.
+        ok(cli("start", "Env2", "--sheet", "main", env_extra={"SHEET_SOCKET": "tcp://127.0.0.1:47001", "SHEET_HOME": ""}))
+        ok(cli("step", "a.txt:1", "--sheet", "#intro", env_extra=no_vars))
+        assert sheet.wait(5)[4:] == [f"{GOTO} main intro"]
+        assert sheet.envs()[4:] == ["SOCKET=tcp://127.0.0.1:47001 HOME="]
+    finally:
+        nv.exec_lua("vim.fn.setenv('SHEET_SOCKET', vim.NIL)")
+
+
+def test_doctor_reports_the_sheet_command(cli, nv, sheet, sandbox):
+    r = cli("--json", "doctor")
+    checks = {c["name"]: c for c in json.loads(r.stdout)["checks"]}
+    assert checks["sheet command"]["ok"] is True and checks["sheet command"]["required"] is False
+    nv.api.set_var("nvtour_sheet_cmd", str(sheet.script) + "-missing")
+    r = cli("--json", "doctor")
+    data = json.loads(r.stdout)
+    checks = {c["name"]: c for c in data["checks"]}
+    assert checks["sheet command"]["ok"] is None and checks["sheet command"]["required"] is False
+    assert data["ok"] is True and r.returncode == 0
+
+
 def test_zz_safety_files_untouched(cli, nv, sandbox, pristine):
     """Run a full session, then verify no buffer was modified and no file changed on disk."""
     ok(cli("start", "Safety"))

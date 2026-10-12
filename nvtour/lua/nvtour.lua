@@ -39,6 +39,7 @@ local function new_state()
     refs = {}, -- [sha .. ":" .. file] = { buf, file, rel, ref, sha, lines }: buffers of steps at a git ref
     diagrams = {}, -- [name] = { name, file, buf, lines, header, links = { { text, file, l1, l2 } } }
     diagram_split = nil, -- the side of a new diagram window from the last 'diagram --split' (default "above")
+    sheet_pending = {}, -- { timer, step }: the debounced 'sheet goto' that waits to start (see "Sheet link")
   }
 end
 
@@ -932,6 +933,11 @@ local function step_title(s)
   return first
 end
 
+--- A sheet link as the user writes it: SHEET#STEP.
+local function sheet_label(link)
+  return link.sheet .. "#" .. link.step
+end
+
 local function render_panel()
   if not valid_buf(S.panel.buf) then
     return
@@ -978,9 +984,17 @@ local function render_panel()
     if title ~= "" then
       line = line .. (" "):rep(rw - #range + 2) .. title
     end
+    local link_at
+    if s.sheet then
+      link_at = #line
+      line = line .. "  ↔ " .. sheet_label(s.sheet)
+    end
     lines[#lines + 1] = line
     map[#lines] = s.n
     hls[#hls + 1] = { #lines, #mark, #mark + #head, "NvtourSign" .. cap(s.role) }
+    if link_at then
+      hls[#hls + 1] = { #lines, link_at, -1, "NvtourVia" }
+    end
     if s.n == S.tour.current then
       cur_line = #lines
     end
@@ -2079,8 +2093,126 @@ local function diff_close()
   return closed
 end
 
+---------------------------------------------------------------------------
+-- Sheet link
+---------------------------------------------------------------------------
+
+-- A step with a sheet link ({ sheet = ID, step = "3" or "step-id" }) shows that step of the sheet
+-- in the viewer of the `sheet` tool when it becomes current. Only `sheet goto -q --no-autostart ID STEP`
+-- is ever run, detached, without waiting; any failure is ignored (safety rule 7 in DESIGN.md).
+local SHEET_DEBOUNCE_MS = 150
+
+local function sheet_cmd()
+  local c = vim.g.nvtour_sheet_cmd
+  return (type(c) == "string" and c ~= "") and c or "sheet"
+end
+
+--- Drop the call that waits to start.
+local function sheet_cancel()
+  local timer = S.sheet_pending.timer
+  S.sheet_pending = {}
+  if timer then
+    pcall(function()
+      timer:stop()
+      timer:close()
+    end)
+  end
+end
+
+local function sheet_fire(step)
+  local link = step.sheet
+  if not link or S.tour.steps[step.n] ~= step then
+    return -- the link was removed or the step is gone
+  end
+  local cmd = sheet_cmd()
+  if vim.fn.executable(cmd) ~= 1 then
+    return
+  end
+  -- link.env (SHEET_SOCKET, SHEET_HOME from the agent) is merged over the environment of nvim.
+  pcall(vim.system, { cmd, "goto", "-q", "--no-autostart", link.sheet, tostring(link.step) }, {
+    detach = true,
+    stdout = false,
+    stderr = false,
+    env = link.env,
+  })
+end
+
+--- `step` became the current step. The last step wins: a step without a link cancels the call of the
+--- step before it, so holding a key starts one process, not one per step.
+local function sheet_schedule(step)
+  sheet_cancel()
+  if not step.sheet then
+    return
+  end
+  local timer = uv.new_timer()
+  S.sheet_pending = { timer = timer, step = step }
+  timer:start(
+    SHEET_DEBOUNCE_MS,
+    0,
+    vim.schedule_wrap(function()
+      if S.sheet_pending.timer ~= timer then
+        return -- cancelled or replaced
+      end
+      sheet_cancel()
+      pcall(sheet_fire, step)
+    end)
+  )
+end
+
+--- The link of a `--sheet` argument. Returns (link, given): given is false when the argument is
+--- absent (keep the old link); link is nil when the argument removes the link. `#STEP` takes the
+--- sheet of the tour and fails (exit 6) when the tour has none.
+--- env is the SHEET_SOCKET/SHEET_HOME of the CLI of this call (only the two names, only strings).
+local function sheet_env_of(env)
+  local out
+  if type(env) == "table" then
+    for _, name in ipairs({ "SHEET_SOCKET", "SHEET_HOME" }) do
+      if type(env[name]) == "string" and env[name] ~= "" then
+        out = out or {}
+        out[name] = env[name]
+      end
+    end
+  end
+  return out
+end
+
+local function resolve_sheet(v, env)
+  if v == nil then
+    return nil, false
+  end
+  if type(v) ~= "table" then
+    return nil, true
+  end
+  local from_tour = v.sheet == nil or v.sheet == ""
+  local id = v.sheet
+  if id == nil or id == "" then
+    id = S.tour.sheet
+    if not id then
+      fail(
+        ("--sheet #%s: the tour has no sheet; start it with 'nvtour start --sheet SHEET' or use SHEET#STEP"):format(
+          tostring(v.step)
+        ),
+        6
+      )
+    end
+  end
+  local link_env = sheet_env_of(env)
+  if not link_env and from_tour then
+    link_env = S.tour.sheet_env -- '#STEP' of a tour whose 'start --sheet' had the variables
+  end
+  return { sheet = id, step = tostring(v.step), env = link_env }, true
+end
+
+local function same_link(a, b)
+  if a == nil or b == nil then
+    return a == b
+  end
+  return a.sheet == b.sheet and a.step == b.step and vim.deep_equal(a.env, b.env)
+end
+
 --- Remove everything nvtour created. keep_panel keeps the panel window open.
 local function reset(keep_panel)
+  sheet_cancel()
   for buf in pairs(S.focus) do
     unfocus_buf(buf)
   end
@@ -2166,6 +2298,7 @@ local function step_result(step, extra)
     ref = step.ref,
     sha = step.sha,
     diagram = step.diagram,
+    sheet = step.sheet and sheet_label(step.sheet) or nil,
     text = step_text(step),
     keys = installed_keys(),
   }
@@ -2196,6 +2329,7 @@ local function jump(step)
   render_step(step, win)
   scroll_to(step, win)
   flash(step)
+  sheet_schedule(step)
 end
 
 local function announce(step)
@@ -2225,10 +2359,12 @@ local H = {}
 H.start = function(a)
   reset(true)
   S.tour.title = a.title or ""
+  S.tour.sheet = (a.sheet and a.sheet ~= "") and a.sheet or nil
+  S.tour.sheet_env = S.tour.sheet and sheet_env_of(a.sheet_env) or nil
   S.workspace = a.workspace or S.workspace
   ensure_started()
   render_panel()
-  return { ok = true, title = S.tour.title, keys = installed_keys() }
+  return { ok = true, title = S.tour.title, sheet = S.tour.sheet, keys = installed_keys() }
 end
 
 --- Renumber the steps and render all of them again (after an insert, edit or remove).
@@ -2287,6 +2423,7 @@ H.step = function(a)
   end
   local l1, l2 = a.l1, a.l2 or a.l1
   local buf = checked_range(a, l1, l2, a.expect)
+  local link = resolve_sheet(a.sheet, a.sheet_env)
   local steps = S.tour.steps
   local at = a.at or (#steps + 1)
   if at < 1 or at > #steps + 1 then
@@ -2320,6 +2457,7 @@ H.step = function(a)
     via = (a.via ~= "" and a.via) or nil,
     suggest = (a.suggest and a.suggest ~= "") and split_lines(a.suggest) or nil,
     from = from,
+    sheet = link,
     expect = expect_list(a.expect),
     extmark_ids = {},
   }
@@ -2374,6 +2512,7 @@ H.edit = function(a)
   if a.role and not ROLES[a.role] then
     fail("unknown role: " .. tostring(a.role), 2)
   end
+  local link, link_given = resolve_sheet(a.sheet, a.sheet_env)
   -- A new location replaces the old one completely: without a ref it is on the working tree.
   local loc = a.file
       and { file = a.file, ref = a.sha and a.ref or nil, sha = a.sha, rel = a.rel, lines = a.lines, diagram = a.diagram }
@@ -2411,9 +2550,16 @@ H.edit = function(a)
     end
     step.from = from
   end
+  local link_changed = link_given and not same_link(step.sheet, link)
+  if link_given then
+    step.sheet = link
+  end
   rerender_all()
   if a.jump then
     return step_goto(step.n)
+  end
+  if link_changed and step.n == S.tour.current then
+    sheet_schedule(step) -- the current step has another link now
   end
   update_qf()
   render_panel()
@@ -2734,6 +2880,7 @@ H.status = function()
       from = explicit_from(s) and s.from.n or nil,
       expect = expect_list(s.expect),
       suggest = s.suggest,
+      sheet = s.sheet and sheet_label(s.sheet) or nil,
     }
   end
   local focus = {}
@@ -2756,6 +2903,7 @@ H.status = function()
   return {
     ok = true,
     title = S.tour.title,
+    tour_sheet = S.tour.sheet,
     current = S.tour.current,
     total = #S.tour.steps,
     steps = steps,
