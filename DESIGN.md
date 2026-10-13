@@ -372,6 +372,17 @@ and `clear` set a new list. `set_chapter(name, step)` is also `M.set_chapter` fo
 batch `apply`). A tour made by an older runtime has no `chapters` field: `chapters()` creates it on
 first use, so a reload during a tour is safe.
 
+**Heading above the step.** `arrival_lines(step, width, chapter_only)` puts the line `## Name` first
+(`NvtourPanelChapter` for the `## ` and the name, which are two chunks) when `chapter_at(step)` is a
+chapter and the step is not lost. This is for every chapter start, not only when the chapter changes,
+because a chapter start is structure, not a transition. The current step gets it before the `◇` and
+`↔ sheet` lines, in the same frame or band. A step that is not current gets only this line
+(`chapter_only`), above its collapsed note (or alone, when it has no note); the `◇` and sheet lines stay
+for the current step. The name is cut with `clip_chunks` to the note width (`…`), so the heading is one
+line. `peek.lines` keeps the heading first and adds its `◇` line after it. The line depends on the
+chapters, so `H.chapter` calls `rerender_all()` after `set_chapter` and `drop_chapter`; `step`, `remove` and
+`apply` do it already (a pending chapter takes its step before that call).
+
 `]c` and `[c` (`next_chapter`, `prev_chapter`) use the first step of each chapter that is not lost
 (a chapter of lost steps only is skipped). `]c` goes to the first start after the current step. `[c`
 goes to the last start before the current step: inside a chapter, not at its first step, that is the
@@ -753,8 +764,8 @@ same choice as follow mode: greatest `l1`, then smallest `l2`; lost steps do not
 is open, `H.peek` closes it first; the same step again (or no step) only closes: that is the toggle.
 
 `peek.lines(step, width)` builds the lines with the functions of `render_step`, which return chunk lists:
-`arrival_lines` (the `◇` line is added when the arrival lines have none, because the peek is about one
-step), `note_chunks(note, width, true)` (plain, no prefix), `suggest_lines` in the frame `peek.box`
+`arrival_lines` (the `◇` line is added, after the chapter heading, when the arrival lines have none,
+because the peek is about one step), `note_chunks(note, width, true)` (plain, no prefix), `suggest_lines` in the frame `peek.box`
 (`frame` uses the same function, so the frame of the suggestion is the same in both places), and
 `next_lines`. A lost step gets a `✗ lost` line first. The chunks become the lines of a scratch buffer
 `nvtour://peek` (`bufhidden = wipe`) with one extmark per chunk (`ns` `nvtour_peek`). The window is
@@ -783,11 +794,13 @@ numbers; the number width as in nvim: `max('numberwidth', digits + 1)`); there i
 `'statuscolumn'`, `signcolumn=no` or `signcolumn=number`. Both need a window: a step drawn without
 one gets plain lines, and is drawn again on `BufWinEnter` in the window that shows its buffer.
 
-**Frame** (the default). No background. The block above `l1` of the current step (the `◇` line and the
+**Frame** (the default). No background. The block above `l1` of the current step (the chapter heading, the `◇` line and the
 note) is in a frame `╭─╮ │ │ ╰─╯` in `NvtourFrame<Role>` (the role accent blended 75 % over `Normal`
 bg), from the code column to the right edge of the window, or to `vim.g.nvtour_note_width` + 4 cells when that is set (notes then wrap at that width); the note has no `╭ │ ╰ ▸` prefixes in it.
 The "next" line gets a lead `╶─ ` in `NvtourFrame<Role>`, a collapsed note a lead `╶─ ` in
-`NvtourNoteBorder` (instead of `╶ `); continuation lines are indented by 3 cells. The frame costs 2
+`NvtourNoteBorder` (instead of `╶ `); continuation lines are indented by 3 cells. The `## Name` line of
+a chapter start is the first line of that block, also for a step that is not current (the lead is then
+before the heading and the collapsed note is indented below it). The frame costs 2
 screen lines per block; `scroll_to` counts them.
 
 **Band** (`vim.g.nvtour_note_style = "band"`). Each line has `NvtourNoteBg` (a light tint, blended from `Normal`) over the full window

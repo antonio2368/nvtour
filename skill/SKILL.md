@@ -56,7 +56,7 @@ Use this when the user asks about code ("this", "here", "this chunk") but gives 
 
 ## Chapters
 
-- For a tour of more than 8 steps, group the steps: run `nvtour chapter "Why does it fail?"` before the first step of each group (the next step you add starts the chapter). Use 3 to 6 steps per chapter, and name each chapter after the question that it answers. The user moves between chapters with `]c` / `[c`. `nvtour chapter --list` shows them; `nvtour chapter "Name" --at N` and `nvtour chapter --remove N` fix them.
+- For a tour of more than 8 steps, group the steps: run `nvtour chapter "Why does it fail?"` before the first step of each group (the next step you add starts the chapter). Use 3 to 6 steps per chapter, and name each chapter after the question that it answers; the first step of each chapter shows its name above the note, so do not repeat it in the note. The user moves between chapters with `]c` / `[c`. `nvtour chapter --list` shows them; `nvtour chapter "Name" --at N` and `nvtour chapter --remove N` fix them.
 
 ## Marks (the user points at places)
 

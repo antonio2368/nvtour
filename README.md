@@ -350,6 +350,10 @@ nvtour chapter --remove 2
 - **A chapter follows its step.** An insert or a `remove` of another step does not move the heading. When the
   step of a chapter is removed, the heading moves to the step that is now at that place. When there is no such
   step, or that step starts a chapter already, the chapter is dropped.
+- **In the code** the first step of each chapter shows its name: a line `## Name` (group `NvtourPanelChapter`)
+  is the first line above the note, before the `◇` and `↔ sheet` lines. A step that is not current shows the
+  same line above its one-line note, so you see each chapter start while you scroll. A long name is cut with `…`,
+  and the peek float shows the line too.
 - **In the panel** a chapter is a line `## Name` (group `NvtourPanelChapter`) before its first step. The file
   name line starts again after it. The `↓ via` line of that step stays: it is after the heading and before the
   file name. `<CR>` on the line goes to the first step of the chapter. The progress

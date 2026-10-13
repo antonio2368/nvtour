@@ -1729,6 +1729,30 @@ local function via_segs(via)
   return out
 end
 
+--- Cut `chunks` to `width` display cells; a cut line ends with "…". Returns the chunks and their width.
+local function clip_chunks(chunks, width)
+  local out, w = {}, 0
+  for _, c in ipairs(chunks) do
+    local cw = vim.fn.strdisplaywidth(c[1])
+    if w + cw > width then
+      local room, text = width - w - 1, ""
+      for i = 0, vim.fn.strchars(c[1]) - 1 do
+        local ch = vim.fn.strcharpart(c[1], i, 1)
+        local chw = vim.fn.strdisplaywidth(ch)
+        if chw > room then
+          break
+        end
+        text, room = text .. ch, room - chw
+      end
+      out[#out + 1] = { text .. "…", c[2] }
+      return out, width - room
+    end
+    out[#out + 1] = c
+    w = w + cw
+  end
+  return out, w
+end
+
 --- virt_lines of one link line: `prefix` on the first line, the segments wrapped to `width`.
 local function link_lines(prefix, segs, width)
   local out = {}
@@ -1761,16 +1785,27 @@ local function sheet_arrival_lines(step, width)
   return link_lines("↔ ", { { "sheet ", "NvtourVia" }, { step.sheet.sheet, "NvtourViaLoc" } }, width)
 end
 
---- Lines above the note of the current step. The "◇" line, when the file or the version is
---- different from the step before it in the tour (the code the user saw last), then the sheet line:
+--- Lines above the note of a step. The chapter heading comes first, when a chapter starts at the step
+--- (`chapter_only`: a step that is not current gets only this line). For the current step the "◇"
+--- line follows, when the file or the version is different from the step before it in the tour (the
+--- code the user saw last), then the sheet line:
+---   ## Why it fails
 ---   ◇ a.cpp @origin/master (1a2b3c4d5e6f)
 ---   ↔ sheet other
---- The --via text is not repeated here: the "next" line of the step before shows it.
-local function arrival_lines(step, width)
-  local prev = S.tour.steps[step.n - 1]
+--- The heading is one line: a long name is cut with "…". Its "## " is a chunk of its own (the peek
+--- float looks for it). The --via text is not repeated here: the "next" line of the step before shows it.
+local function arrival_lines(step, width, chapter_only)
   local out = {}
+  local chapter = chapter_at(step)
+  if chapter and not step.lost then
+    out[1] = clip_chunks({ { "## ", "NvtourPanelChapter" }, { chapter.name, "NvtourPanelChapter" } }, width)
+  end
+  if chapter_only then
+    return out
+  end
+  local prev = S.tour.steps[step.n - 1]
   if prev and prev ~= step and not same_doc(prev, step) then
-    out = link_lines("◇ ", version_segs(step, prev), width)
+    vim.list_extend(out, link_lines("◇ ", version_segs(step, prev), width))
   end
   return vim.list_extend(out, sheet_arrival_lines(step, width))
 end
@@ -1895,30 +1930,6 @@ local function code_chunks(lines, buf)
     out[i] = chunks
   end
   return out
-end
-
---- Cut `chunks` to `width` display cells; a cut line ends with "…". Returns the chunks and their width.
-local function clip_chunks(chunks, width)
-  local out, w = {}, 0
-  for _, c in ipairs(chunks) do
-    local cw = vim.fn.strdisplaywidth(c[1])
-    if w + cw > width then
-      local room, text = width - w - 1, ""
-      for i = 0, vim.fn.strchars(c[1]) - 1 do
-        local ch = vim.fn.strcharpart(c[1], i, 1)
-        local chw = vim.fn.strdisplaywidth(ch)
-        if chw > room then
-          break
-        end
-        text, room = text .. ch, room - chw
-      end
-      out[#out + 1] = { text .. "…", c[2] }
-      return out, width - room
-    end
-    out[#out + 1] = c
-    w = w + cw
-  end
-  return out, w
 end
 
 --- The suggested lines of `step` as chunk lines: tabs expanded, syntax colours, "+ " in front.
@@ -2112,7 +2123,7 @@ render_step = function(step, win)
     width = math.min(width, limit)
   end
   local framed = note_style() == "frame"
-  local above = current and arrival_lines(step, width) or {}
+  local above = arrival_lines(step, width, not current)
   if step.note and step.note ~= "" then
     vim.list_extend(above, current and note_chunks(step.note, width, framed) or collapsed_chunks(step.note, width))
   end
@@ -3389,8 +3400,12 @@ end
 function peek.lines(step, width)
   local R = cap(step.role)
   local out = arrival_lines(step, width)
-  if not (out[1] and out[1][1][1] == "◇ ") then
-    out = vim.list_extend(link_lines("◇ ", version_segs(step, S.tour.steps[step.n - 1] or {}), width), out)
+  local head = (out[1] and out[1][1][1] == "## ") and 1 or 0 -- the chapter heading stays first
+  if not (out[head + 1] and out[head + 1][1][1] == "◇ ") then
+    local arrival = link_lines("◇ ", version_segs(step, S.tour.steps[step.n - 1] or {}), width)
+    for i, line in ipairs(arrival) do
+      table.insert(out, head + i, line)
+    end
   end
   if step.lost then
     out[#out + 1] = { { "✗ lost", "NvtourLost" }, { " · its lines were deleted", "NvtourVia" } }
@@ -3908,6 +3923,7 @@ H.chapter = function(a)
       )
     end
     drop_chapter(chapter)
+    rerender_all()
     render_panel()
     redraw_winbars()
     return { ok = true, removed = a.remove, name = chapter.name, pending = step == nil, chapters = chapter_list() }
@@ -3921,6 +3937,7 @@ H.chapter = function(a)
     fail(("--at %d is out of range (tour has %d steps)"):format(at, #steps), 6)
   end
   local chapter, old = set_chapter(name, at and steps[at] or nil)
+  rerender_all() -- the heading above the first step of the chapter
   render_panel()
   redraw_winbars()
   return {

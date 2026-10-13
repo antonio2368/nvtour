@@ -5,7 +5,19 @@ from __future__ import annotations
 import json
 import time
 
-from test_integration import eval_winbar, find_buf, lines_of, ns_marks, ok
+from test_integration import (  # noqa: F401 (sheet and band are fixtures)
+    GOTO,
+    band,
+    content,
+    eval_winbar,
+    find_buf,
+    link_texts,
+    lines_of,
+    ns_marks,
+    ok,
+    sheet,
+    step_marks,
+)
 
 
 def status(cli):
@@ -439,3 +451,156 @@ def test_a_multi_line_name_is_one_line(cli, nv):
     out = ok(cli("chapter", "Two\n  lines", "--at", "1"))
     assert out.strip() == 'chapter "Two lines" at step 1'
     assert "## Two lines" in panel_lines(nv)
+
+
+# --- the heading of a chapter above its first step ---------------------------------------------------
+
+
+def peek_text(nv, n):
+    """The lines of the peek float of step `n` (closed again)."""
+    nv.command(f"NvtourPeek {n}")
+    text = nv.exec_lua("local p = _G.nvtour.state.peek; return vim.api.nvim_buf_get_lines(p.buf, 0, -1, false)")
+    nv.command(f"NvtourPeek {n}")
+    return text
+
+
+def test_current_first_step_of_a_chapter_has_the_heading_before_the_other_lines(cli, nv, sheet):
+    ok(cli("start", "Heading", "--sheet", "arch"))
+    ok(cli("step", "a.txt:3", "--sheet", "#intro", "--note", "One."))
+    ok(cli("step", "b.txt:5", "--sheet", "flow#x", "--note", "Two."))
+    ok(cli("chapter", "Why it fails", "--at", "2"))
+    ok(cli("goto", "2"))
+    assert link_texts(nv, "b.txt") == {4: ["## Why it fails", "◇ b.txt", "↔ sheet flow", "Two."]}
+    line = [m[3]["virt_lines"] for m in step_marks(nv, "b.txt") if m[3].get("virt_lines_above")][0]
+    chunks = [c for l in line for c in content(l)]
+    assert ["## ", "NvtourPanelChapter"] in chunks
+    assert ["Why it fails", "NvtourPanelChapter"] in chunks
+    ok(cli("goto", "1"))  # a step in front of the chapter: no heading
+    assert link_texts(nv, "a.txt") == {2: ["↔ sheet arch", "One."]}
+
+
+def test_heading_of_the_current_step_without_a_note_and_in_the_band_style(cli, nv, band):
+    tour(cli, 2)
+    ok(cli("chapter", "Start", "--at", "1"))
+    assert link_texts(nv, "a.txt") == {2: ["## Start"]}  # the current step, no note
+    ok(cli("goto", "2"))
+    assert link_texts(nv, "a.txt") == {2: ["## Start"]}  # not current now: still there
+
+
+def test_not_current_first_step_of_a_chapter_has_a_heading_line(cli, nv):
+    tour(cli, 4)
+    ok(cli("chapter", "One", "--at", "1"))
+    ok(cli("chapter", "Three", "--at", "3"))
+    ok(cli("goto", "2"))
+    assert link_texts(nv, "a.txt") == {2: ["## One"], 8: ["## Three"]}  # steps 2 and 4: no chapter start
+    line = [m[3]["virt_lines"] for m in step_marks(nv, "a.txt") if m[1] == 8 and m[3].get("virt_lines_above")][0]
+    assert ["Three", "NvtourPanelChapter"] in [c for l in line for c in content(l)]
+    assert "╶─ " in [c[0] for l in line for c in l]  # in the grey lead of a step that is not current
+
+
+def test_not_current_first_step_with_a_note_has_the_heading_before_the_collapsed_note(cli, nv):
+    ok(cli("start", "Collapsed"))
+    ok(cli("step", "a.txt:3", "--note", "Current note."))
+    ok(cli("step", "a.txt:6", "--note", "Other note.\nSecond line."))
+    ok(cli("chapter", "Two", "--at", "2"))
+    assert link_texts(nv, "a.txt")[5] == ["## Two", "Other note. …"]
+    ok(cli("goto", "2"))
+    assert link_texts(nv, "a.txt")[5] == ["## Two", "Other note.", "Second line."]
+    assert link_texts(nv, "a.txt")[2] == ["Current note."]
+
+
+def test_every_chapter_start_has_a_heading_not_only_the_change(cli, nv):
+    tour(cli, 3)
+    ok(cli("chapter", "A", "--at", "1"))
+    ok(cli("chapter", "B", "--at", "2"))  # right after A: shown as well
+    ok(cli("chapter", "C", "--at", "3"))
+    ok(cli("goto", "3"))
+    assert link_texts(nv, "a.txt") == {2: ["## A"], 5: ["## B"], 8: ["## C"]}
+
+
+def test_heading_follows_chapter_changes(cli, nv):
+    tour(cli, 3)
+    assert link_texts(nv, "a.txt") == {}
+    ok(cli("chapter", "Two", "--at", "2"))  # chapter --at draws it
+    assert link_texts(nv, "a.txt") == {5: ["## Two"]}
+    ok(cli("chapter", "Renamed", "--at", "2"))
+    assert link_texts(nv, "a.txt") == {5: ["## Renamed"]}
+    ok(cli("chapter", "Moved", "--at", "3"))
+    assert link_texts(nv, "a.txt") == {5: ["## Renamed"], 8: ["## Moved"]}
+    ok(cli("chapter", "--remove", "2"))  # chapter --remove clears it
+    assert link_texts(nv, "a.txt") == {8: ["## Moved"]}
+    ok(cli("remove", "3"))  # the last step goes: so does its chapter
+    assert link_texts(nv, "a.txt") == {}
+
+
+def test_heading_stays_with_a_step_that_gets_a_new_neighbour(cli, nv):
+    tour(cli, 3)
+    ok(cli("chapter", "Two", "--at", "2"))
+    ok(cli("step", "a.txt:1", "--at", "1"))
+    assert link_texts(nv, "a.txt") == {5: ["## Two"]}  # still in front of the step on line 6
+
+
+def test_heading_moves_to_the_next_step_when_its_step_is_removed(cli, nv):
+    tour(cli, 4)
+    ok(cli("chapter", "A", "--at", "2"))
+    ok(cli("remove", "2"))  # A starts at what was step 3 (line 9)
+    assert link_texts(nv, "a.txt") == {8: ["## A"]}
+    ok(cli("chapter", "B", "--at", "3"))
+    ok(cli("remove", "2"))  # the next step has a chapter already: A is dropped
+    assert link_texts(nv, "a.txt") == {11: ["## B"]}
+
+
+def test_pending_chapter_shows_nothing_until_it_has_a_step(cli, nv):
+    tour(cli, 2)
+    ok(cli("chapter", "Later"))
+    assert link_texts(nv, "a.txt") == {}
+    ok(cli("step", "a.txt:12"))
+    assert link_texts(nv, "a.txt") == {11: ["## Later"]}
+
+
+def test_apply_with_chapter_shows_the_heading(cli, nv):
+    toml = """
+[[step]]
+at = "a.txt:3"
+chapter = "First part"
+note = "Note one."
+
+[[step]]
+at = "a.txt:6"
+note = "Note two."
+
+[[step]]
+at = "a.txt:9"
+chapter = "Second part"
+"""
+    ok(cli("apply", "-", stdin=toml))
+    assert link_texts(nv, "a.txt") == {2: ["## First part", "Note one."], 5: ["Note two."], 8: ["## Second part"]}
+
+
+def test_peek_of_a_chapter_start_has_the_heading_first(cli, nv):
+    ok(cli("start", "Peek"))
+    ok(cli("step", "a.txt:3", "--note", "One."))
+    ok(cli("step", "a.txt:6", "--note", "Two."))
+    ok(cli("step", "b.txt:9", "--note", "Three."))
+    ok(cli("chapter", "Middle", "--at", "2"))
+    ok(cli("chapter", "Other file", "--at", "3"))
+    ok(cli("goto", "1"))
+    assert peek_text(nv, 2)[:3] == ["## Middle", "◇ a.txt", "Two."]  # the file line is added after the heading
+    assert peek_text(nv, 3)[:3] == ["## Other file", "◇ b.txt", "Three."]
+    assert peek_text(nv, 1)[:2] == ["◇ a.txt", "One."]  # no chapter
+
+
+def test_long_chapter_name_is_cut(cli, nv):
+    nv.vars["nvtour_note_width"] = 40
+    try:
+        tour(cli, 2)
+        ok(cli("chapter", "A very long chapter name that does not fit into the note width at all", "--at", "1"))
+        ok(cli("chapter", "Another extremely long chapter name that does not fit either", "--at", "2"))
+        texts = link_texts(nv, "a.txt")
+        for row in (2, 5):
+            (line,) = texts[row]
+            assert line.startswith("## ") and line.endswith("…")
+            assert len(line) <= 40
+        assert [p for p in panel_lines(nv) if p.startswith("## ")][0].endswith("at all")  # the panel is not cut
+    finally:
+        del nv.vars["nvtour_note_width"]
