@@ -2845,7 +2845,10 @@ local function sheet_env_of(env)
   return out
 end
 
-local function resolve_sheet(v, env)
+--- The link of a --sheet value (see parse_sheet_link in cli.py). `tour` (default: the tour) gives the
+--- sheet and the variables that '#STEP' uses; `apply` passes the ones of the tour it is making.
+local function resolve_sheet(v, env, tour)
+  tour = tour or S.tour
   if v == nil then
     return nil, false
   end
@@ -2855,7 +2858,7 @@ local function resolve_sheet(v, env)
   local from_tour = v.sheet == nil or v.sheet == ""
   local id = v.sheet
   if id == nil or id == "" then
-    id = S.tour.sheet
+    id = tour.sheet
     if not id then
       fail(
         ("--sheet #%s: the tour has no sheet; start it with 'nvtour start --sheet SHEET' or use SHEET#STEP"):format(
@@ -2867,7 +2870,7 @@ local function resolve_sheet(v, env)
   end
   local link_env = sheet_env_of(env)
   if not link_env and from_tour then
-    link_env = S.tour.sheet_env -- '#STEP' of a tour whose 'start --sheet' had the variables
+    link_env = tour.sheet_env -- '#STEP' of a tour whose 'start --sheet' had the variables
   end
   return { sheet = id, step = tostring(v.step), env = link_env }, true
 end
@@ -3125,12 +3128,24 @@ M._resolve_query = resolve_query
 
 --- Load the buffer of location `a` and check that l1-l2 exists and (with `expect`, a list) contains
 --- each expected text. A text range `a.query` gives l1 and l2 (the arguments are not used then).
---- Returns the buffer and the checked l1 and l2.
-local function checked_range(a, l1, l2, expect)
-  local buf = loc_buf(a)
-  local count = api.nvim_buf_line_count(buf)
+--- With `lines` (a list), those lines are checked and no buffer is loaded (`apply` checks the lines
+--- of a git blob or of a diagram that is not in nvim yet). Returns the buffer and the checked l1 and l2.
+local function checked_range(a, l1, l2, expect, lines)
+  local buf, count, get
+  if lines then
+    count = #lines
+    get = function(first, last)
+      return vim.list_slice(lines, first, last)
+    end
+  else
+    buf = loc_buf(a)
+    count = api.nvim_buf_line_count(buf)
+    get = function(first, last)
+      return api.nvim_buf_get_lines(buf, first - 1, last, false)
+    end
+  end
   if a.query then
-    l1, l2 = resolve_query(api.nvim_buf_get_lines(buf, 0, -1, false), a.query, doc_name(a))
+    l1, l2 = resolve_query(get(1, count), a.query, doc_name(a))
   end
   if l1 < 1 or l2 < l1 then
     fail(("bad range %d-%d"):format(l1, l2), 6)
@@ -3138,23 +3153,87 @@ local function checked_range(a, l1, l2, expect)
   if l2 > count then
     fail(("range %d-%d is beyond end of file (%d lines): %s"):format(l1, l2, count, doc_name(a)), 6)
   end
-  local lines = api.nvim_buf_get_lines(buf, l1 - 1, l2, false)
+  local checked = get(l1, l2)
   for _, expect in ipairs(expect_list(expect) or {}) do
     local found = false
-    for _, line in ipairs(lines) do
+    for _, line in ipairs(checked) do
       if line:find(expect, 1, true) then
         found = true
         break
       end
     end
     if not found then
-      local first = api.nvim_buf_get_lines(buf, l1 - 1, l1, false)[1] or ""
+      local first = checked[1] or ""
       local range = l1 == l2 and tostring(l1) or (l1 .. "-" .. l2)
       local at = a.ref and (" @" .. a.ref) or ""
       fail(("--expect %q not found in %s:%s%s; line %d is %q"):format(expect, doc_path(a), range, at, l1, first), 6)
     end
   end
   return buf, l1, l2
+end
+
+--- The step table for location `a` ({ file, ref, sha, diagram, note, label, ... } as H.step gets it) at
+--- index `n`, with its checked `buf`, `l1` and `l2`, its sheet `link` and its `from` step.
+local function make_step(a, n, buf, l1, l2, link, from)
+  return {
+    n = n,
+    file = a.file,
+    ref = a.sha and a.ref or nil,
+    sha = a.sha,
+    diagram = a.diagram,
+    buf = buf,
+    l1 = l1,
+    l2 = l2,
+    role = a.role or "info",
+    label = a.label,
+    note = a.note,
+    via = (a.via ~= "" and a.via) or nil,
+    suggest = (a.suggest and a.suggest ~= "") and split_lines(a.suggest) or nil,
+    from = from,
+    sheet = link,
+    expect = expect_list(a.expect),
+    query = a.query, -- the text range the lines came from (nil: the agent gave line numbers)
+    resolved_from = a.resolved_from,
+    orig_l1 = l1, -- the range given by the agent, for the report when the step moves
+    orig_l2 = l2,
+    extmark_ids = {},
+  }
+end
+
+--- Put `step` into the tour at `step.n` (1 to #steps + 1). The step is added only after it rendered
+--- (and jumped, with `opts.jump`); a failure leaves no half step behind. `opts.render = false` does
+--- not draw it: the caller draws all steps with rerender_all (`apply` does it once at the end). A
+--- pending chapter starts at the step. The caller also updates the quickfix list and the panel.
+local function add_step(step, opts)
+  local steps = S.tour.steps
+  local prev_current = S.tour.current
+  local ok, err = pcall(function()
+    anchor_step(step)
+    if opts.render ~= false then
+      render_step(step, tour_win(step.buf))
+    end
+    if opts.jump then
+      jump(step)
+    end
+  end)
+  if not ok then
+    for _, id in ipairs(step.extmark_ids) do
+      pcall(api.nvim_buf_del_extmark, step.buf, S.ns_steps, id)
+    end
+    del_anchor(step)
+    S.tour.current = prev_current
+    pcall(rerender_all) -- the jump may have drawn the previous current step as not current
+    error(err, 0)
+  end
+  table.insert(steps, step.n, step)
+  local pending = chapter_at(nil)
+  if pending then
+    pending.step = step -- the next step added, wherever it is inserted
+    sort_chapters()
+  end
+  if step.n < #steps and not opts.jump and S.tour.current >= step.n then
+    S.tour.current = S.tour.current + 1
+  end
 end
 
 H.step = function(a)
@@ -3183,56 +3262,8 @@ H.step = function(a)
   if #steps == 0 and vim.g.nvtour_auto_panel ~= false and not S.panel.user_closed then
     panel_open() -- before rendering, so the first note is wrapped to the final window width
   end
-  local step = {
-    n = at,
-    file = a.file,
-    ref = a.sha and a.ref or nil,
-    sha = a.sha,
-    diagram = a.diagram,
-    buf = buf,
-    l1 = l1,
-    l2 = l2,
-    role = role,
-    label = a.label,
-    note = a.note,
-    via = (a.via ~= "" and a.via) or nil,
-    suggest = (a.suggest and a.suggest ~= "") and split_lines(a.suggest) or nil,
-    from = from,
-    sheet = link,
-    expect = expect_list(a.expect),
-    query = a.query, -- the text range the lines came from (nil: the agent gave line numbers)
-    resolved_from = a.resolved_from,
-    orig_l1 = l1, -- the range given by the agent, for the report when the step moves
-    orig_l2 = l2,
-    extmark_ids = {},
-  }
-  -- The step is added only after it rendered (and jumped); a failure leaves no half step behind.
-  local prev_current = S.tour.current
-  local ok, err = pcall(function()
-    anchor_step(step)
-    render_step(step, tour_win(buf))
-    if do_jump then
-      jump(step)
-    end
-  end)
-  if not ok then
-    for _, id in ipairs(step.extmark_ids) do
-      pcall(api.nvim_buf_del_extmark, step.buf, S.ns_steps, id)
-    end
-    del_anchor(step)
-    S.tour.current = prev_current
-    pcall(rerender_all) -- the jump may have drawn the previous current step as not current
-    error(err, 0)
-  end
-  table.insert(steps, at, step)
-  local pending = chapter_at(nil)
-  if pending then
-    pending.step = step -- the next step added, wherever it is inserted
-    sort_chapters()
-  end
-  if at < #steps and not do_jump and S.tour.current >= at then
-    S.tour.current = S.tour.current + 1
-  end
+  local step = make_step(a, at, buf, l1, l2, link, from)
+  add_step(step, { jump = do_jump })
   rerender_all() -- the steps next to the new one show links to it
   if do_jump then
     update_qf(step.n)
@@ -3513,9 +3544,9 @@ end
 -- Focus handlers
 ---------------------------------------------------------------------------
 
-H.focus = function(a)
-  S.workspace = a.workspace or S.workspace
-  local buf = load_buf(a.file)
+--- The ranges `{ l1, l2 }` of focus args `a` in `buf` (a text range gives the lines it selects now),
+--- checked against the buffer; fails (exit 6) on a bad range and (exit 2) when there is none.
+local function focus_ranges(a, buf)
   local count = api.nvim_buf_line_count(buf)
   local ranges = {}
   for _, r in ipairs(a.ranges or {}) do
@@ -3531,6 +3562,15 @@ H.focus = function(a)
   if #ranges == 0 then
     fail("focus needs at least one range", 2)
   end
+  return ranges
+end
+
+--- Fold or dim the ranges of `a` in its file. With `move`, the file is shown and the cursor goes to the
+--- first range; without it the view stays and the folds are applied when the file is shown.
+local function do_focus(a, move)
+  local buf = load_buf(a.file)
+  local count = api.nvim_buf_line_count(buf)
+  local ranges = focus_ranges(a, buf)
   unfocus_buf(buf)
   local merged = merge_ranges(ranges, a.context or 2, count)
   -- The ranges follow the edits of the user like the steps do (see "Steps follow edits").
@@ -3541,9 +3581,6 @@ H.focus = function(a)
   end
   S.focus[buf] = { ranges = merged, dim = a.dim and true or false, file = a.file, anchors = anchors }
   attach_buf(buf)
-  -- Before the first step focus shows the file; during a tour the view stays on the current step
-  -- and folds are applied when the file is shown (by a step or by the user).
-  local move = S.tour.current == 0
   local win = tour_win(buf, move)
   if move then
     win = show_buf(win, buf)
@@ -3573,6 +3610,13 @@ H.focus = function(a)
     mode = a.dim and "dim" or "fold",
     deferred = (not a.dim and not shown) or nil,
   }
+end
+
+H.focus = function(a)
+  S.workspace = a.workspace or S.workspace
+  -- Before the first step focus shows the file; during a tour the view stays on the current step
+  -- and folds are applied when the file is shown (by a step or by the user).
+  return do_focus(a, S.tour.current == 0)
 end
 
 H.unfocus = function(a)
@@ -3780,6 +3824,228 @@ H.panel = function(a)
   end
   render_panel()
   return { ok = true, status = status }
+end
+
+---------------------------------------------------------------------------
+-- Apply: a whole tour from one call
+---------------------------------------------------------------------------
+
+--- Run `fn` and return what it returns; an error of nvtour from it gets `prefix` in front of its
+--- message (`step[3]: ...`), the code stays.
+local function scoped(prefix, fn)
+  local res = vim.F.pack_len(pcall(fn))
+  if res[1] then
+    return unpack(res, 2, res.n) -- the values after `true`
+  end
+  local err = res[2]
+  if type(err) == "table" and err.nvtour then
+    err = { nvtour = true, msg = prefix .. err.msg, code = err.code }
+  elseif type(err) == "string" then
+    err = prefix .. err
+  end
+  error(err, 0)
+end
+
+--- The first 100 characters of line `l1` of `lines` (a list) or of `buf`, as the step result shows it.
+local function first_text(buf, lines, l1)
+  local line = lines and lines[l1] or (api.nvim_buf_get_lines(buf, l1 - 1, l1, false)[1] or "")
+  return vim.fn.strcharpart(line, 0, 100)
+end
+
+--- A whole tour in one call (see DESIGN.md section 15). The arguments are `title`, `sheet`,
+--- `sheet_env`, `panel`, `focus`, `diagrams` and `steps` (entries as the commands of the same names
+--- get them, with `lines` of a git blob only in the first step that has it), and the flags `append`,
+--- `check` and `no_jump`. Phase 1 checks everything and changes nothing of the tour (files stay
+--- loaded, as after a failed `step`); a failure names the entry (`step[4]: ...`). With `check` it
+--- ends there. Phase 2 builds the tour; the steps are drawn, and the quickfix list and the panel are
+--- updated, once at the end.
+--- The steps are numbered from 1 in the file. With `append` a `from` is the number in the final tour:
+--- the existing steps come first, then the steps of the file.
+local function apply_tour(a)
+  S.workspace = a.workspace or S.workspace
+  local append = a.append and true or false
+  local base = append and #S.tour.steps or 0
+  -- The tour that '#STEP' links of the steps go with: the one that is there, or the one that is made.
+  local tour = S.tour
+  if not append then
+    local sheet = (a.sheet and a.sheet ~= "") and a.sheet or nil
+    tour = { sheet = sheet, sheet_env = sheet and sheet_env_of(a.sheet_env) or nil }
+  end
+
+  -- Phase 1: check.
+  local diagram_lines = {} -- [name] = the lines of a diagram of the file
+  for i, d in ipairs(a.diagrams or {}) do
+    scoped(("diagram[%d]: "):format(i), function()
+      local lines = d.lines or {}
+      if #lines == 0 then
+        fail("the diagram is empty", 6)
+      end
+      if d.split and not DIAGRAM_SPLITS[d.split] then
+        fail(("bad split %q: use above, below, left, right or full"):format(d.split), 2)
+      end
+      for _, s in ipairs(append and S.tour.steps or {}) do -- as 'diagram' does for a diagram that is replaced
+        if s.diagram == d.name and s.l2 > #lines then
+          fail(("step %d (lines %s) is beyond the new diagram (%d lines); edit or remove it first"):format(s.n, fmt_range(s), #lines), 6)
+        end
+      end
+      diagram_lines[d.name] = lines
+    end)
+  end
+  for i, f in ipairs(a.focus or {}) do
+    scoped(("focus[%d]: "):format(i), function()
+      focus_ranges(f, load_buf(f.file))
+    end)
+  end
+  local plan, blobs = {}, {}
+  local running, pending_name -- the chapter that the next step is in, and the pending one it starts
+  if append then
+    local last = S.tour.steps[#S.tour.steps]
+    running = last and (chapter_of(last) or {}).name
+    pending_name = (chapter_at(nil) or {}).name
+  end
+  for i, st in ipairs(a.steps or {}) do
+    scoped(("step[%d]: "):format(i), function()
+      if not ROLES[st.role or "info"] then
+        fail("unknown role: " .. tostring(st.role), 2)
+      end
+      local lines -- the lines to check, when they are not in a buffer yet
+      if st.sha then
+        local key = st.sha .. ":" .. st.file
+        if st.lines then
+          blobs[key] = st.lines
+        else
+          st.lines = blobs[key]
+        end
+        lines = st.lines
+      elseif st.diagram then
+        local d = S.diagrams[st.diagram]
+        lines = diagram_lines[st.diagram] or (append and d and d.lines) or nil
+        if not lines then
+          fail(("no diagram %q in the file%s"):format(st.diagram, append and " or in the tour" or ""), 6)
+        end
+      end
+      local buf, l1, l2 = checked_range(st, st.l1 or 0, st.l2 or st.l1 or 0, st.expect, lines)
+      if st.from and (st.from < 1 or st.from > base + i - 1) then
+        fail(("from %d: no such step before this one (%d step(s) come before it)"):format(st.from, base + i - 1), 6)
+      end
+      local link = resolve_sheet(st.sheet, a.sheet_env, tour)
+      local chapter
+      if st.chapter ~= nil then
+        chapter = vim.trim((st.chapter:gsub("%s+", " "))) -- a heading is one line
+        if chapter == "" then
+          fail("the chapter needs a name", 2)
+        end
+      end
+      if i == 1 and pending_name then
+        running = pending_name
+      end
+      running = chapter or running
+      plan[i] = { st = st, l1 = l1, l2 = l2, link = link, chapter = chapter, in_chapter = running, text = first_text(buf, lines, l1) }
+    end)
+  end
+
+  if a.check then
+    local out = {}
+    for i, p in ipairs(plan) do
+      local st = p.st
+      out[i] = {
+        n = base + i,
+        total = base + #plan,
+        file = st.file,
+        l1 = p.l1,
+        l2 = p.l2,
+        role = st.role or "info",
+        label = st.label,
+        via = (st.via ~= "" and st.via) or nil,
+        from = st.from,
+        ref = st.sha and st.ref or nil,
+        sha = st.sha,
+        diagram = st.diagram,
+        sheet = p.link and sheet_label(p.link) or nil,
+        chapter = p.in_chapter,
+        resolved_from = st.resolved_from,
+        text = p.text,
+      }
+    end
+    return { ok = true, check = true, steps = out, total = base + #plan }
+  end
+
+  -- Phase 2: build.
+  if not append then
+    reset(true)
+    S.tour.title = a.title or ""
+    S.tour.sheet, S.tour.sheet_env = tour.sheet, tour.sheet_env
+  end
+  ensure_started()
+  for i, d in ipairs(a.diagrams or {}) do
+    scoped(("diagram[%d]: "):format(i), function()
+      H.diagram(d)
+    end)
+  end
+  for i, f in ipairs(a.focus or {}) do
+    scoped(("focus[%d]: "):format(i), function()
+      do_focus(f, false) -- the view moves with the jump to the first step
+    end)
+  end
+  if a.panel ~= nil then
+    S.panel.text = split_lines(a.panel)
+  end
+  local first_tour_step = #S.tour.steps == 0
+  if ((first_tour_step and #plan > 0) or a.panel ~= nil) and vim.g.nvtour_auto_panel ~= false and not S.panel.user_closed then
+    panel_open() -- before rendering, so the notes are wrapped to the final window width
+  end
+  local added = {}
+  for i, p in ipairs(plan) do
+    scoped(("step[%d]: "):format(i), function()
+      local st = p.st
+      local buf = loc_buf(st)
+      local from = st.from and S.tour.steps[st.from] or nil
+      local step = make_step(st, #S.tour.steps + 1, buf, p.l1, p.l2, p.link, from)
+      add_step(step, { jump = false, render = false })
+      if p.chapter then
+        set_chapter(p.chapter, step)
+      end
+      added[#added + 1] = step
+    end)
+  end
+  rerender_all()
+  local jumped_to
+  if #added > 0 and not a.no_jump then
+    jumped_to = added[1].n
+    step_goto(jumped_to) -- also updates the quickfix list and the panel
+  else
+    update_qf()
+    render_panel()
+  end
+  local results = {}
+  for i, step in ipairs(added) do
+    local r = step_result(step, { jumped = step.n == jumped_to })
+    r.keys = nil
+    results[i] = r
+  end
+  return {
+    ok = true,
+    steps = results,
+    total = #S.tour.steps,
+    panel_lines = #S.panel.text,
+    chapters = #chapter_list(),
+    jumped_to = jumped_to,
+    current = S.tour.current,
+    keys = installed_keys(),
+  }
+end
+
+H.apply = function(a)
+  if not a.check then
+    return apply_tour(a)
+  end
+  local workspace = S.workspace -- a check changes nothing, also not the directory that paths are shown from
+  local ok, res = pcall(apply_tour, a)
+  S.workspace = workspace
+  if not ok then
+    error(res, 0)
+  end
+  return res
 end
 
 H.status = function()

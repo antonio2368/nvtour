@@ -30,6 +30,7 @@ Use this when the user asks about code ("this", "here", "this chunk") but gives 
 2. Run `nvtour start "<title>"`.
 3. Interleave with your chat explanation: one `nvtour step FILE:L1[-L2] ...` per point.
    - Use 3 to 8 steps. One idea per step.
+   - For a tour of 3 or more steps, write the whole tour as TOML and run `nvtour apply - <<'EOF' ... EOF` once, in place of steps 2 to 4 (keys: `title`, `sheet`, `panel`, `[[step]]` with `at`, `role`, `label`, `note`, `expect`, `via`, `from`, `suggest`, `sheet`, `ref`, `chapter`, `[[focus]]`, `[[diagram]]`). Check the echoed `step N/T` lines, and run `apply --check` first when the tour is long or uses `ref`; a wrong entry changes nothing and the error names it (`step[4]: ...`). Use `step`, `edit` and `remove` only for fixes.
    - Follow reading order: cause, propagation, effect (or entry, core, exit).
    - Only the first step moves the user's view. Later steps are added without a jump, so the tour opens at step 1.
    - When a step is in a different file from the step before it, give `--via TEXT`: why the tour goes there (see "Links").

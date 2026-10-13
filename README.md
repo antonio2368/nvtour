@@ -39,6 +39,7 @@ Neovim in parallel. You step through the tour with `]w` / `[w`.
 | ✅ **Self-checking ranges** | `--expect TEXT` stops a wrong line number before it shows the wrong code. |
 | 🔎 **Ranges by text** | `FILE:/TEXT/` finds the lines by their text, so the agent does not count lines. |
 | 📑 **Chapters** | `chapter "Name"` groups the steps of a long tour under headings. `]c` / `[c` move between chapters. |
+| 📦 **A tour in one call** | `nvtour apply` reads a whole tour (steps, chapters, focus, diagrams, panel) from a TOML file on stdin. |
 | ⚓ **Steps follow your edits** | When you edit a file during a tour, the steps move with the lines. `status` reports a step that moved or was lost. |
 
 > [!IMPORTANT]
@@ -389,6 +390,88 @@ nvtour step src/cache.cpp:31-38 --label "load from the store" --via 'a miss call
 - `diagram` again with the same name replaces the lines. `--no-show` does not open the window. `clear` and
   `start` delete the diagrams, so make them after `start`.
 
+### Tour files (`apply`)
+
+For a tour of 3 steps or more, write the whole tour as a file and run it in one call. One call is faster
+than many calls, and nothing is done when one step is wrong: the old tour stays as it was.
+
+```sh
+nvtour apply - <<'EOF'
+title = "Dangling iterator in cleanup"
+sheet = "arch"                        # optional, like start --sheet
+panel = """
+**Cause**: use after erase. **Fix**: copy the value before `erase()`.
+"""
+
+[[focus]]                             # optional, like nvtour focus
+file = "src/a.cpp"
+ranges = ["400-440", "/evict/../}/"]
+dim = false
+context = 2
+
+[[diagram]]                           # optional, like nvtour diagram
+name = "read"
+format = "mermaid"                    # or: file = "docs/read.mmd"
+source = """
+sequenceDiagram
+  C->>K: get
+"""
+links = ["get=src/cache.cpp:/Cache::get/+8"]
+split = "above"
+
+[[step]]
+at = "src/a.cpp:/it->second/"        # FILE:L1[-L2] or any text range
+role = "fault"
+label = "dangling iterator"
+note = "The iterator is used after `erase()` invalidated it."
+expect = ["it->second"]              # list or one string
+suggest = """
+        it->second.expires_at += ttl;
+"""                                  # string with new lines, or a list of lines
+sheet = "#evict"                     # SHEET#STEP or #STEP
+chapter = "The bug"                  # starts a chapter at this step
+
+[[step]]
+at = "src/a.cpp:/it->second/"
+ref = "origin/master"                # optional: the file at a git ref (not with diagram)
+role = "context"
+label = "the old code"
+
+[[step]]
+at = "2"                             # with diagram: L1[-L2] or a text range of the diagram
+diagram = "read"                     # optional: a step on a diagram (not with ref)
+label = "the read"
+via = "the cleanup thread runs `evict()`"
+from = 1                             # optional: the link comes from step 1 (an earlier step)
+EOF
+```
+
+- **The file** is TOML (`tomllib`), or JSON when the first character that is not white space is `{`. The
+  JSON object has the same keys. nvtour never writes a tour file. `apply FILE` reads a file, and `apply -`
+  (the default) reads stdin. Stdin from a terminal is exit 2.
+- **The keys** of `[[focus]]`, `[[diagram]]` and `[[step]]` are the options of `focus`, `diagram` and `step`.
+  `[[diagram]]` also takes `ascii`, `header` and `show` (`show = false` is `--no-show`), and needs one of
+  `source` and `file`. A step must have `at`; a focus must have `file` and `ranges`. `ref` and `diagram` do
+  not go together on one step. `suggest` and `expect` take a string or a list. A chapter is a key of the
+  step (`chapter = "Name"`): there is no `[[chapter]]` table. The steps are added in the order of the file, so `at` is a location, not a number.
+- **Unknown keys** and wrong types are exit 2, and the message names the entry. The entries are numbered
+  from 1 in the order of the file: `step[3]: unknown key "lable" (did you mean "label"?)`.
+- **Everything is checked first,** in nvim: files, ranges, text ranges, `expect`, `from`, sheet links,
+  chapter names and the lines of diagram steps. A failure is exit 6 (or 2) with the entry in front, for
+  example `step[4]: --expect "it->second" not found in src/a.cpp:402; line 402 is "..."`. Nothing is
+  changed: the old tour, its diagrams and its focus stay. (Buffers that were loaded stay loaded, as after a
+  failed `step`.)
+- **A new tour is the default.** `apply` does what `start` does, adds the diagrams, the focus, the steps and
+  the panel text, and jumps to step 1. `--no-jump` leaves the view where it is.
+- **`--append`** adds the steps to the current tour. The file has no `title` and no `sheet` then (exit 2).
+  `from` is a step number of the final tour: the steps that are there come first, so the first new step is
+  `steps + 1`. A new step can be on a diagram of the tour. `apply --append` jumps to the first new step,
+  unless you give `--no-jump`.
+- **`--check`** does all the checks and prints the resolved steps. It draws nothing and changes nothing.
+- **Output:** the two lines of `step` for each step, then `panel: N lines`, `chapters: N` and
+  `jumped to step 1`. With `--check` each step line starts with `ok ` and the last line is
+  `check: N steps ok`. `--json` has `steps`, `total`, `panel_lines`, `chapters`, `jumped_to` and `current`.
+
 ---
 
 ## 📖 Command reference
@@ -410,6 +493,7 @@ nvtour step src/cache.cpp:31-38 --label "load from the store" --via 'a miss call
 | `edit N [FILE:L1[-L2]\|FILE:/TEXT/ [--ref GITREF]] [--note] [--label] [--role] [--expect] [--via] [--from N] [--suggest] [--sheet SHEET#STEP] [--jump]` | change a step (`''` removes a label, note, link text, suggestion, sheet link or the `--expect` texts; a new `--expect` list replaces the old one; `--from 0` links from the step before again; a new location without `--ref` is on the working tree) |
 | `step L1[-L2] --diagram NAME [...]`, `edit N L1[-L2] --diagram NAME` | a step on lines of a diagram |
 | `remove N` | remove a step |
+| `apply [FILE\|-] [--append] [--check] [--no-jump]` | a whole tour from a TOML or JSON file: a new tour by default; `--append` adds to the current tour; `--check` only checks (see [Tour files](#tour-files-apply)) |
 | `chapter "NAME" [--at N]`, `chapter --remove N`, `chapter --list` | a heading in front of step N, or of the next step added; remove one; list them (see [Chapters](#chapters)) |
 | `panel [TEXT\|-\|--file PATH] [--toggle] [--clear]` | side panel text |
 

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import difflib
 import json
 import math
 import os
@@ -10,6 +11,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tomllib
 from typing import Any, Mapping, NoReturn
 
 from . import __version__, diagram, discover, gitutil, ranges
@@ -180,6 +182,14 @@ def build_parser() -> argparse.ArgumentParser:
     p = cmd("remove", "remove step N")
     p.add_argument("n", type=int)
 
+    p = cmd("apply", "make a whole tour from a TOML or JSON file (see DESIGN.md, Tour file format)")
+    p.add_argument("file", nargs="?", default="-", metavar="FILE|-", help="the tour file (default: stdin)")
+    p.add_argument("--append", action="store_true", help="add the steps to the current tour, not a new tour "
+                   "(the file has no title or sheet then)")
+    p.add_argument("--check", action="store_true", help="check everything and print the resolved steps, "
+                   "but change nothing")
+    p.add_argument("--no-jump", action="store_true", help="do not jump to the first new step")
+
     p = cmd("chapter", "start a chapter (a heading) at a step, remove one, or list them")
     p.add_argument("name", nargs="?", help="the name of the chapter")
     p.add_argument("--at", type=int, metavar="N", help="start the chapter at step N (default: the next step added; "
@@ -324,10 +334,12 @@ def focus_range(l1: int | None, l2: int | None, query: dict[str, Any] | None) ->
     return {"query": lua_query(query)} if query else [l1, l2]  # type: ignore[list-item]
 
 
-def location(spec: str, ref: str | None, diagram_name: str | None = None) -> dict[str, Any]:
+def location(spec: str, ref: str | None, diagram_name: str | None = None,
+             blobs: dict[tuple[str, str], tuple[gitutil.Blob, list[str]]] | None = None) -> dict[str, Any]:
     """Lua args for a step location: ``FILE:L1[-L2]`` on the working tree or at ``ref``, or
     ``L1[-L2]`` of a diagram. A text range (``FILE:/TEXT/``) gives ``query`` (the Lua runtime finds
-    the lines in the buffer) and ``resolved_from`` instead of ``l1`` and ``l2``."""
+    the lines in the buffer) and ``resolved_from`` instead of ``l1`` and ``l2``. ``blobs`` (``apply``)
+    keeps the blob of each ``(file, ref)``, so that it is read from git once."""
     if diagram_name is not None:
         if ref is not None:
             raise NvtourError(EXIT_USAGE, "--ref and --diagram cannot be used together")
@@ -342,14 +354,269 @@ def location(spec: str, ref: str | None, diagram_name: str | None = None) -> dic
     if ref is None:
         ranges.require_file(path)
     else:
-        blob = gitutil.blob_at(path, ref)
-        loc.update(ref=ref, sha=blob.sha, rel=blob.rel, lines=text_lines(blob.text))
+        if blobs is not None and (path, ref) in blobs:
+            blob, lines = blobs[(path, ref)]
+        else:
+            blob = gitutil.blob_at(path, ref)
+            lines = text_lines(blob.text)
+            if blobs is not None:
+                blobs[(path, ref)] = (blob, lines)
+        loc.update(ref=ref, sha=blob.sha, rel=blob.rel, lines=lines)
     return loc
 
 
 def read_text_arg(value: str | None, what: str) -> str | None:
     """Return stdin content when ``value`` is '-', else the value."""
     return read_stdin(what) if value == "-" else value
+
+
+def diagram_args(name: str, source: str, fmt: str, ascii_only: bool, link_specs: list[str], header: int | None,
+                 split: str | None, show: bool, header_opt: str = "--header") -> dict[str, Any]:
+    """Lua args of a diagram (the ``diagram`` command and a ``[[diagram]]`` of ``apply``): the source is
+    rendered here, the links are checked against the rendered lines."""
+    lines = diagram.render(source, fmt, ascii_only)
+    links = [diagram.parse_link(spec, lines) for spec in link_specs]
+    if header is None:
+        header = diagram.header_row(source, fmt, lines)
+    if not 0 <= header <= len(lines):
+        raise NvtourError(EXIT_BAD_FILE, f"{header_opt} {header} is not a line of the diagram (1-{len(lines)}, or 0)")
+    return {"name": name, "lines": lines, "links": links, "header": header, "split": split, "show": show}
+
+
+# ---------------------------------------------------------------------------
+# Tour files (`apply`)
+# ---------------------------------------------------------------------------
+
+
+def _string(value: Any) -> str:
+    if not isinstance(value, str):
+        raise ValueError("must be a string")
+    return value
+
+
+def _name(value: Any) -> str:
+    if not _string(value).strip():
+        raise ValueError("must not be empty")
+    return value
+
+
+def _boolean(value: Any) -> bool:
+    if not isinstance(value, bool):
+        raise ValueError("must be true or false")
+    return value
+
+
+def _integer(minimum: int) -> Any:
+    def check(value: Any) -> int:
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError("must be an integer")
+        if value < minimum:
+            raise ValueError(f"must be {minimum} or more")
+        return value
+    return check
+
+
+def _choice(options: list[str]) -> Any:
+    def check(value: Any) -> str:
+        if value not in options:
+            raise ValueError(f"must be one of: {', '.join(options)}")
+        return value  # type: ignore[no-any-return]
+    return check
+
+
+def _strings(message: str = "must be a list of strings") -> Any:
+    def check(value: Any) -> list[str]:
+        if not isinstance(value, list) or not all(isinstance(v, str) for v in value):
+            raise ValueError(message)
+        return value
+    return check
+
+
+def _one_or_more(value: Any) -> list[str]:
+    """One string or a list of strings, as a list."""
+    return [value] if isinstance(value, str) else _strings("must be a string or a list of strings")(value)
+
+
+def _lines(value: Any) -> str:
+    """Text as one string, or as a list of lines."""
+    return value if isinstance(value, str) else "\n".join(_strings("must be a string or a list of lines")(value))
+
+
+# What a tour file can have: key -> check (it returns the value to use). `required` keys must be there.
+TOUR_KEYS: dict[str, Any] = {"title": _string, "sheet": _string, "panel": _string}
+FOCUS_KEYS: dict[str, Any] = {"file": _name, "ranges": _strings(), "dim": _boolean, "context": _integer(0)}
+DIAGRAM_KEYS: dict[str, Any] = {
+    "name": _name, "format": _choice(diagram.FORMATS), "source": _string, "file": _name, "links": _strings(),
+    "split": _choice(["above", "below", "left", "right", "full"]), "ascii": _boolean, "header": _integer(0),
+    "show": _boolean,
+}
+STEP_KEYS: dict[str, Any] = {
+    "at": _name, "ref": _name, "diagram": _name, "role": _choice(ROLES), "label": _string, "note": _string,
+    "expect": _one_or_more, "via": _string, "from": _integer(1), "suggest": _lines, "sheet": _string,
+    "chapter": _name,
+}
+TOUR_TABLES = {"focus": (FOCUS_KEYS, ["file", "ranges"]), "diagram": (DIAGRAM_KEYS, ["name"]),
+               "step": (STEP_KEYS, ["at"])}
+
+
+def tour_error(where: str, message: str) -> NvtourError:
+    return NvtourError(EXIT_USAGE, f"{where}: {message}")
+
+
+def unknown_key(key: Any, keys: Any, where: str) -> NvtourError:
+    """The error for a key that a table does not have, with the closest key when there is one."""
+    close = difflib.get_close_matches(str(key), list(keys), n=1)
+    if close:
+        hint = f' (did you mean "{close[0]}"?)'
+    elif key == "chapter":
+        hint = ' (a chapter starts at a step: give the step a "chapter")'
+    else:
+        hint = f" (the keys are: {', '.join(keys)})"
+    return tour_error(where, f'unknown key "{key}"{hint}')
+
+
+def check_entry(entry: Any, keys: Mapping[str, Any], required: list[str], where: str) -> dict[str, Any]:
+    """The values of one table of a tour file, checked: only ``keys``, each of the right type."""
+    if not isinstance(entry, dict):
+        raise tour_error(where, "must be a table")
+    out: dict[str, Any] = {}
+    for key, value in entry.items():
+        if key not in keys:
+            raise unknown_key(key, keys, where)
+        if value is None:  # JSON null is the same as no key
+            continue
+        try:
+            out[key] = keys[key](value)
+        except ValueError as exc:
+            raise tour_error(where, f'"{key}" {exc}') from None
+    for key in required:
+        if key not in out:
+            raise tour_error(where, f'missing the key "{key}"')
+    return out
+
+
+def parse_tour(text: str) -> dict[str, Any]:
+    """The tour file ``text`` (TOML, or JSON when it starts with ``{``), checked: unknown keys and wrong
+    types are exit 2, naming the entry (``step[3]: unknown key "lable" (did you mean "label"?)``; the
+    entries are numbered from 1 in the order of the file). Returns ``title``, ``sheet`` and ``panel``
+    when given, and the lists ``focus``, ``diagram`` and ``step`` of the checked tables (a key that is
+    not in the file is not in the table; ``expect`` is a list, ``suggest`` a string). Touches no
+    file and no other state."""
+    is_json = text.lstrip().startswith("{")
+    try:
+        data = json.loads(text) if is_json else tomllib.loads(text)
+    except (json.JSONDecodeError, tomllib.TOMLDecodeError) as exc:
+        raise NvtourError(EXIT_USAGE, f"tour file: bad {'JSON' if is_json else 'TOML'}: {exc}") from None
+    if not isinstance(data, dict):
+        raise NvtourError(EXIT_USAGE, "tour file: the top level must be a table (an object)")
+    for key in data:
+        if key not in TOUR_KEYS and key not in TOUR_TABLES:
+            raise unknown_key(key, [*TOUR_KEYS, *TOUR_TABLES], "tour")
+    tour = check_entry({k: v for k, v in data.items() if k in TOUR_KEYS}, TOUR_KEYS, [], "tour")
+    for name, (keys, required) in TOUR_TABLES.items():
+        entries = data.get(name)
+        if entries is None:
+            entries = []
+        if not isinstance(entries, list):
+            raise tour_error("tour", f'"{name}" must be an array of tables ([[{name}]])')
+        tour[name] = [check_entry(e, keys, required, f"{name}[{i}]") for i, e in enumerate(entries, 1)]
+    for i, d in enumerate(tour["diagram"], 1):
+        if ("source" in d) == ("file" in d):
+            raise tour_error(f"diagram[{i}]", 'give one of "source" and "file"')
+    return tour
+
+
+def scoped(where: str, fn: Any) -> Any:
+    """Run ``fn``; an error of nvtour from it gets ``where`` (``step[3]``) in front of its message."""
+    try:
+        return fn()
+    except NvtourError as exc:
+        raise NvtourError(exc.code, f"{where}: {exc.message}") from None
+
+
+def read_tour(path: str) -> str:
+    """The text of the tour file ``path``, or of stdin for ``-``."""
+    if path == "-":
+        return read_stdin("apply -")
+    full = ranges.resolve_path(path)
+    ranges.require_file(full)
+    with open(full, encoding="utf-8") as fh:
+        return fh.read()
+
+
+def tour_diagram(d: dict[str, Any]) -> dict[str, Any]:
+    """Lua args of one ``[[diagram]]``: the same as ``nvtour diagram NAME`` with the options of the table."""
+    name = diagram.check_name(d["name"])
+    if "file" in d:
+        path = ranges.resolve_path(d["file"])
+        ranges.require_file(path)
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            source, fmt = fh.read(), d.get("format") or diagram.guess_format(path)
+    else:
+        source, fmt = d["source"], d.get("format") or "mermaid"
+    req = diagram_args(name, source, fmt, d.get("ascii", False), d.get("links", []), d.get("header"),
+                       d.get("split"), d.get("show", True), header_opt="header")
+    return {k: v for k, v in req.items() if v is not None}  # nested nils do not survive msgpack
+
+
+def tour_focus(f: dict[str, Any]) -> dict[str, Any]:
+    """Lua args of one ``[[focus]]``: the same as ``nvtour focus`` with the options of the table."""
+    path = ranges.resolve_path(f["file"])
+    ranges.require_file(path)
+    req: dict[str, Any] = {"file": path, "ranges": [focus_range(*ranges.parse_range_or_query(r)) for r in f["ranges"]],
+                           "context": f.get("context", 2)}
+    if f.get("dim"):
+        req["dim"] = True
+    return req
+
+
+def tour_step(st: dict[str, Any], blobs: dict[tuple[str, str], tuple[gitutil.Blob, list[str]]],
+              sent: set[tuple[str, str]]) -> dict[str, Any]:
+    """Lua args of one ``[[step]]``. The lines of a git blob go with the first step on it only."""
+    req = location(st["at"], st.get("ref"), st.get("diagram"), blobs)
+    if "sha" in req:
+        key = (req["sha"], req["file"])
+        if key in sent:
+            del req["lines"]
+        sent.add(key)
+    for key in ("role", "label", "note", "via", "suggest", "from"):
+        if key in st:
+            req[key] = st[key]
+    if st.get("expect"):
+        req["expect"] = st["expect"]
+    link = parse_sheet_link(st["sheet"]) if "sheet" in st else ""
+    if link:
+        req["sheet"] = link
+    if "chapter" in st:
+        req["chapter"] = st["chapter"]
+    return req
+
+
+def apply_request(args: argparse.Namespace, base: dict[str, Any]) -> dict[str, Any]:
+    """Lua args of ``apply``: the tour file, checked and with everything resolved that Python does
+    (git blobs once per file and ref, diagram renderers, sheet links)."""
+    tour = parse_tour(read_tour(args.file))
+    if args.append:
+        for key in ("title", "sheet"):
+            if key in tour:
+                raise NvtourError(EXIT_USAGE, f'apply --append: the file has "{key}"; a tour that is added to has '
+                                  "its own title and sheet")
+    sheet = None
+    if "sheet" in tour:
+        sheet = scoped("sheet", lambda: check_sheet_id(tour["sheet"]))
+    names: dict[str, int] = {}
+    for i, d in enumerate(tour["diagram"], 1):
+        if d["name"] in names:
+            raise tour_error(f"diagram[{i}]", f'the name "{d["name"]}" is used by diagram[{names[d["name"]]}] already')
+        names[d["name"]] = i
+    blobs: dict[tuple[str, str], tuple[gitutil.Blob, list[str]]] = {}
+    sent: set[tuple[str, str]] = set()
+    diagrams = [scoped(f"diagram[{i}]", lambda d=d: tour_diagram(d)) for i, d in enumerate(tour["diagram"], 1)]
+    focus = [scoped(f"focus[{i}]", lambda f=f: tour_focus(f)) for i, f in enumerate(tour["focus"], 1)]
+    steps = [scoped(f"step[{i}]", lambda st=st: tour_step(st, blobs, sent)) for i, st in enumerate(tour["step"], 1)]
+    return {**base, "title": tour.get("title"), "sheet": sheet, "sheet_env": sheet_env() or None,
+            "panel": tour.get("panel"), "focus": focus, "diagrams": diagrams, "steps": steps,
+            "append": args.append or None, "check": args.check or None, "no_jump": args.no_jump or None}
 
 
 def build_request(args: argparse.Namespace, workspace: str) -> tuple[str, dict[str, Any]]:
@@ -391,13 +658,10 @@ def build_request(args: argparse.Namespace, workspace: str) -> tuple[str, dict[s
             ranges.require_file(path)
             with open(path, encoding="utf-8", errors="replace") as fh:
                 source, fmt = fh.read(), args.format or diagram.guess_format(path)
-        lines = diagram.render(source, fmt, args.ascii)
-        links = [diagram.parse_link(spec, lines) for spec in args.link or []]
-        header = diagram.header_row(source, fmt, lines) if args.header is None else args.header
-        if not 0 <= header <= len(lines):
-            raise NvtourError(EXIT_BAD_FILE, f"--header {header} is not a line of the diagram (1-{len(lines)}, or 0)")
-        return "diagram", {**base, "name": name, "lines": lines, "links": links, "header": header,
-                           "split": args.split, "show": not args.no_show}
+        return "diagram", {**base, **diagram_args(name, source, fmt, args.ascii, args.link or [], args.header,
+                                                  args.split, not args.no_show)}
+    if c == "apply":
+        return "apply", apply_request(args, base)
     if c == "remove":
         return "remove", {"n": args.n}
     if c == "chapter":
@@ -462,18 +726,42 @@ def fmt_moved(s: Mapping[str, Any]) -> str:
     return ""
 
 
+def format_step(res: Mapping[str, Any], workspace: str, prefix: str = "") -> str:
+    """``step N/T: file:L1-L2 [role] label`` and the first highlighted line, so the agent can check it."""
+    label = f" {res['label']}" if res.get("label") else ""
+    lost = "  (lost)" if res.get("lost") else ""
+    out = f"{prefix}step {res['n']}/{res['total']}: {fmt_loc(res, workspace)} [{res['role']}]{label}{fmt_sheet(res)}{lost}"
+    if res.get("text") is not None:
+        out += f"\n  {res['l1']}| {res['text']}"  # lets the agent see what it highlighted
+    return out
+
+
+def format_apply(res: Mapping[str, Any], workspace: str) -> str:
+    """The step lines of ``apply``, then its summary; with ``--check`` each step line starts with ``ok `` and
+    there is no summary but ``check: N steps ok``."""
+    steps = res.get("steps") or []
+    if res.get("check"):
+        out = [format_step(s, workspace, "ok ") for s in steps]
+        out.append(f"check: {len(steps)} step{'' if len(steps) == 1 else 's'} ok")
+        return "\n".join(out)
+    out = [format_step(s, workspace) for s in steps]
+    n = res["panel_lines"]
+    out.append(f"panel: {n} line{'' if n == 1 else 's'}")
+    out.append(f"chapters: {res['chapters']}")
+    if res.get("jumped_to"):
+        out.append(f"jumped to step {res['jumped_to']}")
+    return "\n".join(out)
+
+
 def format_result(args: argparse.Namespace, res: dict[str, Any], workspace: str) -> str:
     """One-line (or short) human output for a successful command."""
     c = args.command
     if c in ("step", "edit", "goto", "next", "prev", "first", "last"):
         if res.get("message"):
             return str(res["message"])
-        label = f" {res['label']}" if res.get("label") else ""
-        lost = "  (lost)" if res.get("lost") else ""
-        out = f"step {res['n']}/{res['total']}: {fmt_loc(res, workspace)} [{res['role']}]{label}{fmt_sheet(res)}{lost}"
-        if res.get("text") is not None:
-            out += f"\n  {res['l1']}| {res['text']}"  # lets the agent see what it highlighted
-        return out
+        return format_step(res, workspace)
+    if c == "apply":
+        return format_apply(res, workspace)
     if c == "remove":
         return f"removed step {res['removed']}; {res['total']} step(s) left"
     if c == "status":

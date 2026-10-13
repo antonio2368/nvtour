@@ -146,6 +146,7 @@ nvtour edit N [FILE:L1[-L2] | FILE:/TEXT/... [--ref GITREF] | L1[-L2] | /TEXT/..
             [--label TEXT] [--role ROLE] [--expect TEXT]... [--via TEXT] [--from N]
             [--suggest TEXT | --suggest -] [--jump]
 nvtour remove N
+nvtour apply [FILE | -] [--append] [--check] [--no-jump]
 nvtour chapter NAME [--at N] | nvtour chapter --remove N | nvtour chapter --list
 nvtour goto N | nvtour next | nvtour prev | nvtour first | nvtour last
 nvtour status
@@ -235,6 +236,14 @@ msgpack) and `resolved_from` instead of `l1` and `l2`.
   `FILE:L1[-L2] --ref GITREF` on that ref. `--ref` without a location is a usage error (exit 2).
   `edit --sheet SHEET#STEP` changes the sheet link, `--sheet ''` removes it. Links stay with their
   steps when the steps are renumbered; `edit` without `--sheet` keeps the link.
+- **apply** — a whole tour from a TOML or JSON file (§15): by default a new tour (as `start`), then the
+  diagrams, the focus, the steps and the panel text of the file, then one jump to step 1 (`--no-jump`: none).
+  `--append` adds the steps to the current tour instead (a `title` or `sheet` in the file is exit 2; `from`
+  numbers are the ones of the final tour; it jumps to the first new step). `--check` does all the checks and
+  prints the resolved steps with the prefix `ok ` and `check: N steps ok`, and changes nothing. Everything is
+  checked before anything changes: a failure is exit 6 (exit 2 for the form of the file) with the entry in
+  front of the message (`step[4]: ...`) and the old tour stays. Reads stdin for `-` (the default) and refuses
+  a terminal (exit 2).
 - **chapter** — a heading in front of a step (§5, "Chapters"; §7; §11). `chapter NAME` is pending: it
   takes the next step that is added, at any place (also with `step --at`). `--at N` puts it in front of
   step N; N equal to steps + 1 is pending and a larger N is exit 6 (like `step --at`). Another chapter at
@@ -969,7 +978,8 @@ description: Give a visual, read-only walkthrough of code inside the user's runn
 Body (concise, imperative): see `skill/SKILL.md`. It covers point and ask (`attach` and `where`
 when no location is given, the previous-selection caveat, the `@REF`, `modified` and no-file
 flags, an answer in chat and a tour only on an explicit request in nvim), the workflow (attach,
-start, one step per point, panel summary; only the first step moves the view), how to get line
+start, one step per point or, for 3 steps or more, the whole tour in one `apply` call, panel summary; only
+the first step moves the view), how to get line
 numbers right (`rg -n`, the echoed line, `--expect`), fixing a tour (`edit`, `remove`, `--at`,
 `status`), note style and roles, focus and its manual-fold caveat, diffs, and what to do on each
 exit code.
@@ -980,3 +990,135 @@ exit code.
   supports the kitty graphics protocol. Not for alacritty.
 - MCP stdio wrapper exposing the same commands as tools.
 - tmux: focus the pane running the selected nvim.
+
+## 15. Tour file format (`apply`)
+
+`nvtour apply [FILE|-] [--append] [--check] [--no-jump]` makes a whole tour from one file, in one RPC
+(`apply`). nvtour only reads the format; it never writes it (a later `save` command could write the
+same keys from `status --json`).
+
+```toml
+title = "Dangling iterator in cleanup"
+sheet = "arch"                       # optional, like start --sheet
+panel = """
+**Cause**: use after erase. **Fix**: copy the value before `erase()`.
+"""
+
+[[focus]]                            # optional, like nvtour focus
+file = "src/a.cpp"
+ranges = ["400-440", "/evict/../}/"]
+dim = false
+context = 2
+
+[[diagram]]                          # optional, like nvtour diagram
+name = "read"
+format = "mermaid"                   # or file = "docs/read.mmd"
+source = """
+sequenceDiagram
+  C->>K: get
+"""
+links = ["get=src/cache.cpp:/Cache::get/+8"]
+split = "above"
+
+[[step]]
+at = "src/a.cpp:/it->second/"        # FILE:L1[-L2] or any text range
+role = "fault"
+label = "dangling iterator"
+note = "The iterator is used after `erase()` invalidated it."
+expect = ["it->second"]              # list or one string
+suggest = """
+        it->second.expires_at += ttl;
+"""                                  # string with new lines, or a list of lines
+sheet = "#evict"                     # SHEET#STEP or #STEP
+chapter = "The bug"                  # starts a chapter at this step
+
+[[step]]
+at = "src/a.cpp:/it->second/"
+ref = "origin/master"                # optional: the file at a git ref (not with diagram)
+role = "context"
+label = "the old code"
+
+[[step]]
+at = "2"                             # with diagram: L1[-L2] or a text range of the diagram
+diagram = "read"                     # optional: a step on a diagram (not with ref)
+label = "the read"
+via = "the cleanup thread runs `evict()`"
+from = 1                             # optional: the link comes from step 1 (an earlier step)
+```
+
+### Schema
+
+| table | keys (type) | required |
+|---|---|---|
+| top level | `title`, `sheet`, `panel` (strings); the tables `focus`, `diagram`, `step` | none |
+| `[[focus]]` | `file` (string), `ranges` (list of `L1[-L2]` or text ranges `/TEXT/...`), `dim` (bool), `context` (int ≥ 0, default 2) | `file`, `ranges` |
+| `[[diagram]]` | `name`, `format` (`mermaid`, `dot`, `easy`, `text`), `source` (string) or `file` (path), `links` (list of `TEXT=FILE:L1[-L2]` or `TEXT=FILE:/TEXT/`), `split` (`above`, `below`, `left`, `right`, `full`), `ascii` (bool), `header` (int ≥ 0), `show` (bool, default true) | `name`, and exactly one of `source` and `file` |
+| `[[step]]` | `at`, `ref`, `diagram`, `role`, `label`, `note`, `expect` (string or list), `via`, `from` (int ≥ 1), `suggest` (string or list of lines), `sheet`, `chapter` | `at` |
+
+The keys have the meaning of the options of the commands of the same names (`step`, `focus`,
+`diagram`, `start`): `at` is the location argument of `step` (`FILE:L1[-L2]` or `FILE:/TEXT/...`; with
+`diagram`, `L1[-L2]` or `/TEXT/...`, as `step --diagram NAME`), `show = false` is `--no-show`. A chapter
+is a key of the step: there is no `[[chapter]]` table. The steps are added in file order (`at` is a
+location, never an insert position). A diagram `file` is read from the cwd of the CLI, with the format
+guessed from its extension as for `nvtour diagram`; with `source` the default format is mermaid.
+A JSON `null` value is the same as no key. The format is JSON when the first
+character that is not white space is `{` (the same keys, arrays for the tables), else TOML (`tomllib`).
+`sheet` of the top level is checked as `start --sheet` is; a step `sheet` is `SHEET#STEP` or `#STEP`.
+An empty file is a tour with no step.
+
+### Python phase (`cli.py`)
+
+- `parse_tour(text) -> dict` is pure (no file, no git, no nvim). It checks the tables and the types and
+  returns the values to use (`expect` is a list, `suggest` one string, a key that is absent stays
+  absent). An unknown key, a wrong type, a missing required key or `source` and `file` together is exit 2.
+  The message names the entry with a number from 1 in file order: `step[3]: unknown key "lable" (did you
+  mean "label"?)` (`difflib.get_close_matches`), `step[1]: "from" must be 1 or more`, `focus[1]: missing
+  the key "ranges"`; the top level is `tour:`. A bad TOML or JSON text is `tour file: bad TOML: ...`.
+- `apply_request(args, base)` then builds the Lua args with the helpers of the commands. Each entry runs
+  in `scoped("step[3]", ...)`, so any error of the helpers (a bad range, an unknown git ref, a
+  renderer that fails, a bad sheet link) carries the prefix and keeps its exit code. `location(spec,
+  ref, diagram, blobs)` is used per step; with `ref`, git is read once per `(file, ref)` (the `blobs`
+  cache), and the lines of a blob go with the first step on a given `(commit, file)` only (the Lua side
+  keeps them for the other steps). `diagram_args` is the code of the `diagram` command. `--append` with
+  `title` or `sheet` in the file is exit 2. The args are `{ title, sheet, sheet_env, panel, focus,
+  diagrams, steps, append, check, no_jump }`; a nested table never has an absent key (nested nils do not
+  survive msgpack), so the entries only have the keys that the file had.
+
+### Lua phase (`H.apply`)
+
+1. **Check** (no change to the tour). For each diagram: not empty, the split, and (with `append`) no step
+   on a diagram of the same name beyond the new lines. For each focus: the ranges (`focus_ranges`, the same
+   code as `focus`). For each step: the role, then `checked_range` (the same code as `step`: it loads the
+   file, resolves a text range, checks the range and each `expect`). A step on a git blob is checked on
+   the lines that came with it, and a step on a diagram on the lines of the diagram of the file (or, with
+   `append`, of a diagram of the tour); neither makes a buffer. A diagram step with no such diagram is exit
+   6. `from` must be a step before this one: `1 .. i-1` for entry `i`; with `append` the numbers are the
+   ones of the final tour (the `E` steps that are there are `1 .. E`, entry `i` is step `E + i`). The sheet
+   link is made by `resolve_sheet` against the tour that will exist (the sheet of the file, not the one
+   of the old tour; with `append`, the tour that is there). A chapter name is cut to one line like
+   `chapter NAME`, and an empty one is exit 2. A failure is `scoped("step[i]: ", ...)`: the exit code of
+   the failure with the entry in front. Buffers that were loaded stay loaded, as after a failed `step`.
+2. **Check mode.** With `check` the call ends here and returns the resolved steps (`n`, `total`, `file`,
+   `l1`, `l2`, `role`, `label`, `via`, `from`, `ref`, `sha`, `diagram`, `sheet`, `chapter`, `resolved_from`
+   and the first line `text`). With `append`, `n` and `total` count the steps that are there.
+3. **Build.** Unless `append`: `reset(true)` (as `start`), the title, the sheet and its variables. Then
+   `ensure_started`, the diagrams (`H.diagram`), the focus (`do_focus(f, false)`: the view stays and the
+   folds are applied when the file is shown), the panel text and, on the first step of a tour, the panel
+   window (before the notes are drawn, as `step` does). Each step goes through `make_step` and
+   `add_step`, the code that `H.step` uses after its checks, with `render = false`; a chapter of the
+   entry is set with `set_chapter` (a pending chapter takes the first new step, and the chapter of the
+   file replaces its name). Then once: `rerender_all`, and `step_goto(first new step)` (which updates the
+   quickfix list and the panel) unless `no_jump`, else `update_qf` and `render_panel`. A file with no step
+   does not jump.
+4. **Result.** `{ ok, steps = [step results, without keys], total, panel_lines, chapters, jumped_to,
+   current, keys }`; with `check`, `{ ok, check = true, steps, total }`.
+
+`--append` jumps to the first new step (unless `--no-jump`), so that the user sees what was added; `step`
+alone jumps only for the first step of a tour.
+
+### Output
+
+One block per step as `step` prints it (`step N/T: file:L1-L2 [role] label` and the first line,
+`  L1| text`), then `panel: N lines`, `chapters: N` and `jumped to step N` (`N` is 1 for a new tour; the
+line is left out with `--no-jump`). With `--check` each step line starts with `ok ` and the output ends
+with `check: N steps ok`. `--json` has the same data as fields (above).
