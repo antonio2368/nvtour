@@ -42,6 +42,7 @@ Neovim in parallel. You step through the tour with `]w` / `[w`.
 | 📦 **A tour in one call** | `nvtour apply` reads a whole tour (steps, chapters, focus, diagrams, panel) from a TOML file on stdin. |
 | 🔭 **Focus on the steps** | `focus --steps` folds every toured file to the lines of its steps. The folds follow the steps when they change. |
 | 👀 **Peek at a step** | `<leader>wk` shows the full note and suggested code of the step under the cursor in a float, without leaving the current step. |
+| 📌 **Marks from you** | `<leader>wm` marks the line or selection under the cursor. The agent reads your marks with `nvtour marks`. |
 | ⚓ **Steps follow your edits** | When you edit a file during a tour, the steps move with the lines. `status` reports a step that moved or was lost. |
 
 > [!IMPORTANT]
@@ -239,6 +240,46 @@ frame, and the `→ next` line. The border has the colour of the role, and the t
 - The float is as wide as the window text area (at most 100 cells), or `vim.g.nvtour_note_width`, and at
   most half as high as the window. In the panel it uses the width of the editor.
 - The float shows a scratch buffer `nvtour://peek`. No file buffer is written.
+
+### Marks
+
+You can point at code for the agent. Put the cursor on a line (or select lines or text) and press `<leader>wm`.
+A `◆` sign shows the mark, and nvim says `nvtour: mark 2 added (a.cpp:88-90)`. Press `<leader>wM` to add a
+comment too: nvim asks `Note for the agent:`. An empty or cancelled input keeps the mark without a comment.
+
+The agent reads the marks with `nvtour marks`. The output looks like `where`:
+
+```
+1. src/a.cpp:88-90  (2 min ago)  "why is this not under the lock?"
+     cache.erase(key);
+     ...
+2. src/b.cpp:12  @origin/master  (1 min ago)
+```
+
+- A mark has the file, the range, the text, the time, and the comment if there is one. In a step at a git
+  ref, it has the ref and the commit (`@REF` in the output). In a diagram, the output shows `diagram NAME`.
+- **Text:** the saved text is at most 200 lines and 64 KiB, like `where`. The text output shows the first 5
+  lines of a mark, then `...`. `--json` has all the text. The text is the text at the time of the mark.
+- **Selection:** in visual mode (character, line or block), the mark covers the selected lines, and the text
+  is the selected text. In normal mode it is the cursor line.
+- **Sign:** the `◆` is on the first line of the range (`NvtourUserMark`, links to `DiagnosticHint`).
+- **Edits:** the mark follows your edits, like a step. If you delete all its lines, the output shows
+  `(lines deleted)` with the last range and the saved text. An undo brings the lines back.
+- `nvtour marks --clear` prints the marks and removes them, signs too. It removes exactly what it prints.
+  `:NvtourMarksClear` removes them too.
+- `nvtour marks --wait SECONDS` waits until there is at least one mark (it checks every 0.5 s). After
+  `SECONDS` without a mark it is exit 6: `no marks after S s`. With `--clear`, it clears only what it printed.
+  Without `--wait`, no marks gives `no marks` (exit 0). Each check is a short call inside `--timeout`, so a
+  nvim that waits at a prompt is still found (exit 5).
+- **The marks are yours.** `start` and `clear` keep them, and so do the mark keys. Only `marks --clear` and
+  `:NvtourMarksClear` remove them. They live in the nvim process only: they are gone when nvim exits.
+- The mark keys are installed when nvtour loads in nvim (any `nvtour` command, also `attach`), not when a tour
+  starts. The key rules are the same as for the other keys (free keys only, one warning). They work in normal
+  and visual mode. Change them with `mark` and `mark_note` in `vim.g.nvtour_keys`.
+- While the `Note for the agent:` prompt is open, nvim waits for you and agent commands fail with exit 5.
+  The agent can retry after you answer.
+- `nvtour status` shows `marks: N` (`"marks": N` in `--json`; the text line only when N is more than 0).
+- A mark never writes a file buffer.
 
 ### Focus on the steps
 
@@ -565,6 +606,7 @@ EOF
 | `goto N`, `next`, `prev`, `first`, `last` | navigate (a lost step: `goto` is exit 6, the others skip it) |
 | `status` | the tour, focus, panel, diff tabs and installed keys; steps that moved `(was L1-L2)` or are lost `(lost)`; `modified:` files |
 | `where` | cursor, live or previous selection (exact text), visible range of the user's file window |
+| `marks [--wait SECONDS] [--clear]` | the places that the user marked with `<leader>wm`; `--wait`: wait for a mark (exit 6 after the time); `--clear`: remove what is printed (see [Marks](#marks)) |
 
 **View**
 
@@ -588,7 +630,8 @@ after the subcommand.
 ## ⌨️ Keys
 
 Default keys are set only if they are free. If a key is already mapped, a warning is shown once and the key
-is skipped.
+is skipped. The tour keys are set when a tour starts and removed by `clear`. The mark keys (`<leader>wm`,
+`<leader>wM`) are set when nvtour loads in nvim and stay.
 
 | key | action |
 |---|---|
@@ -597,6 +640,7 @@ is skipped.
 | `]c` / `[c` | first step of the next chapter / of this chapter (or the one before) |
 | `<leader>wp` | toggle panel |
 | `<leader>wk` | peek at the step under the cursor in a float (see [Peek at a step](#peek-at-a-step)) |
+| `<leader>wm` / `<leader>wM` | mark the cursor line or the selection for the agent / the same, then ask for a comment (see [Marks](#marks)); normal and visual mode; always installed, also without a tour |
 | `<leader>wc` | clear everything |
 
 **In the panel:** `<CR>` jumps to the step under the cursor (on a chapter line, a file name or a link line: the
@@ -606,7 +650,8 @@ step after it), `K` peeks at that step, `q` closes the panel.
 
 **Commands:** `:NvtourNext`, `:NvtourPrev`, `:NvtourFirst`, `:NvtourLast`, `:NvtourNextChapter`,
 `:NvtourPrevChapter`, `:NvtourGoto N`, `:NvtourPanel`, `:NvtourClear`, `:NvtourPeek [N]` (see
-[Peek at a step](#peek-at-a-step)), `:NvtourFollow` (turn [follow mode](#follow-the-cursor) on or off).
+[Peek at a step](#peek-at-a-step)), `:NvtourFollow` (turn [follow mode](#follow-the-cursor) on or off),
+`:NvtourMarksClear` (remove all [marks](#marks)).
 
 **Quickfix:** the list `nvtour: <title>` works too (`:cnext`, `:cprev`), but it only moves the cursor. It does
 not change the current step of the tour.
@@ -619,7 +664,8 @@ Set these in `init.lua` before the first step:
 
 ```lua
 vim.g.nvtour_keys = { next = "]w", prev = "[w", first = "[W", last = "]W", panel = "<leader>wp", clear = "<leader>wc",
-                      next_chapter = "]c", prev_chapter = "[c", peek = "<leader>wk" }
+                      next_chapter = "]c", prev_chapter = "[c", peek = "<leader>wk",
+                      mark = "<leader>wm", mark_note = "<leader>wM" }
 vim.g.nvtour_auto_panel = false               -- do not open the panel on the first step
 vim.g.nvtour_steal_focus = "unless_terminal"  -- "always" | "never"; default keeps the focus in a terminal window
 vim.g.nvtour_winbar = false                   -- do not show the tour position in the winbar of the tour window
@@ -663,6 +709,7 @@ In the names below, `{...}` is one of `Fault`, `Flow`, `Fix`, `Context`, `Info`.
 | `NvtourPanelCurrent`, `NvtourPanelFile`, `NvtourPanelProgress` | panel |
 | `NvtourPanelChapter` | the `## Name` line of a chapter in the panel, and the name in the winbar (links to `Title`) |
 | `NvtourLost` | `✗ lost` of a step whose lines were deleted (links to `DiagnosticError`) |
+| `NvtourUserMark` | the `◆` sign of a mark of the user (links to `DiagnosticHint`) |
 
 The groups are defined with `default = true`, so a plain `vim.api.nvim_set_hl(0, "NvtourSignFault", {...})`
 in `init.lua` wins on first load. To survive colorscheme changes and runtime upgrades, set overrides in an
@@ -688,7 +735,7 @@ vim.api.nvim_create_autocmd("User", {
 | `3` | no unique matching nvim (table of live instances on stderr) |
 | `4` | no live nvim at all, or the `--socket` path does not exist |
 | `5` | RPC failure or timeout; `waiting for input` means nvim is at a prompt and nothing ran |
-| `6` | bad file, range or `--expect` |
+| `6` | bad file, range or `--expect`; `marks --wait`: `no marks after S s` |
 
 With `--json`, errors are printed on stdout too: `{"ok": false, "code": N, "error": "..."}`. Warnings (for
 example a key that is already mapped) are in the `warnings` list, or on stderr as `warning: ...`.
@@ -808,6 +855,10 @@ The full design is in [`DESIGN.md`](DESIGN.md).
 - `where` reports the user's file window: when the current window is a terminal, the panel or another special
   window, it uses the previous window. It uses the live visual selection when in visual mode (`live`), else
   the `'<`/`'>` marks (`previous`); characterwise and blockwise selections give the exact text.
+- Marks (`<leader>wm`) are in the Lua state only, with an anchor extmark and a `◆` sign on the first line of the
+  range. They survive `start` and `clear` because they belong to the user, not to the tour. The CLI polls
+  `marks_count` for `--wait`, so a prompt in nvim is found at each check, and `--clear` clears in the same
+  call that returns the marks.
 - The runtime version is a hash of the Lua source, so any change to it is loaded into nvim on the next command.
 
 </details>

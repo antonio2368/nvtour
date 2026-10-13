@@ -50,13 +50,21 @@ Use this when the user asks about code ("this", "here", "this chunk") but gives 
 
 - `nvtour edit N [FILE:L1-L2] [--note ...] [--label ...] [--role ...]` changes step N. `--label ''` removes the label.
 - `nvtour remove N` removes step N. `nvtour step ... --at N` inserts at position N.
-- `nvtour status` shows the tour, focus, panel and keys. Use it after an error or when you lost track. Do not `clear` and start again.
+- `nvtour status` shows the tour, focus, panel and keys (and `marks: N` when the user marked places: see "Marks"). Use it after an error or when you lost track. Do not `clear` and start again.
 - The user can turn on follow mode (`status` shows `follow: on`): the current step then changes when the cursor of the user moves, without `]w`. Run `nvtour status` before you answer a follow-up question during a tour. The user can also peek at any step in a float (`<leader>wk`, or `K` in the panel) without a change of the current step, so a question can be about a step that is not current.
 - Steps follow the edits of the user. After the user edits files, run `nvtour status`: a step `(was 88-90)` moved and is fine. A step `(lost)` needs `nvtour edit N FILE:L1-L2`. A `modified: a.cpp` line means the buffer differs from disk: line numbers from `rg` can be wrong in that file.
 
 ## Chapters
 
 - For a tour of more than 8 steps, group the steps: run `nvtour chapter "Why does it fail?"` before the first step of each group (the next step you add starts the chapter). Use 3 to 6 steps per chapter, and name each chapter after the question that it answers. The user moves between chapters with `]c` / `[c`. `nvtour chapter --list` shows them; `nvtour chapter "Name" --at N` and `nvtour chapter --remove N` fix them.
+
+## Marks (the user points at places)
+
+- When you need the user to point at several places, ask them to put the cursor on each place (or select it) and press `<leader>wm`, or `<leader>wM` to add a comment. Then run `nvtour marks --wait 110 --clear`: it returns as soon as there is a mark, and prints the file, the lines, the first lines of the text, the git ref (`@REF`) and the comment. Exit 6 (`no marks after 110 s`) means the user has not marked yet: tell them, and run it again when they say they are done.
+- If `nvtour status` shows `marks: N`, or the user says "the places I marked", run `nvtour marks` to read them. Add `--json` for the whole text of a mark.
+- A mark that shows `(lines deleted)` points at lines that the user deleted: use the saved text. A mark with `@REF` is on the file at that git ref: read `git show REF:PATH`.
+- The marks stay when you run `start` or `clear`. They belong to the user.
+- While the user types a comment (`<leader>wM`), nvim waits for input and commands fail with exit 5 `waiting for input`: retry once after a short wait.
 
 ## Writing notes
 
@@ -148,7 +156,8 @@ Use this when the user asks about code ("this", "here", "this chunk") but gives 
 - Never modify files.
 - Never create a tour unless the user explicitly asks for it in nvim or the editor ("in nvim", "in the editor", "show me in vim") or says yes to your offer. "Walk me through", "explain" or "tour" alone is not enough: answer in chat.
 - Never run `nvtour clear` unless the user asks or you start a new tour.
-- Exit codes: 2 usage, 3 no unique nvim match, 4 no nvim (or `--socket` path missing), 5 RPC failure, 6 bad file, range or `--expect`.
+- Never run `nvtour marks --clear` unless you have read the marks in this turn (`--clear` prints what it removes, so one call is enough).
+- Exit codes: 2 usage, 3 no unique nvim match, 4 no nvim (or `--socket` path missing), 5 RPC failure, 6 bad file, range or `--expect` (or `marks --wait` with no mark).
 - Exit 5 with `waiting for input`: nothing ran. Ask the user to press `<Esc>` or `<Enter>` in nvim, then retry once.
 - Exit 5 with a timeout `during dispatch`: the command may still run. Run `nvtour status` before you retry.
 - Warnings (for example a key that is already mapped) are printed on stderr as `warning: ...`.

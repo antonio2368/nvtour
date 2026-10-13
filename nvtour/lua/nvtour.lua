@@ -24,6 +24,7 @@ local function new_state()
     ns_flash = api.nvim_create_namespace("nvtour_flash"),
     ns_diagram = api.nvim_create_namespace("nvtour_diagram"),
     ns_anchor = api.nvim_create_namespace("nvtour_anchor"), -- one extmark per step: where its lines are now
+    ns_marks = api.nvim_create_namespace("nvtour_marks"), -- one extmark (and sign) per mark of the user
     flash = { buf = nil, seq = 0 },
     winbars = {}, -- [winid] = the window's own local 'winbar', restored by clear
     panel = { buf = nil, win = nil, text = {}, user_closed = false, line_map = {} },
@@ -47,6 +48,10 @@ local function new_state()
     follow_timers = {}, -- [win] = the debounce timer of the follow mode (see "Follow the cursor")
     follow_jump = {}, -- { win, buf, line }: where the last jump put the cursor; follow ignores it
     peek = {}, -- { win, buf, step, ... } while a peek float is open (see "Peek a step"); {} when closed
+    marks = {}, -- the marks of the user (see "Marks"); they belong to the user, not to the tour
+    mark_seq = 0, -- the id of the next mark
+    mark_keys = {}, -- [name] = lhs: the KEYS.always that we installed
+    mark_keymaps_installed = false,
   }
 end
 
@@ -68,6 +73,8 @@ local DEFAULT_KEYS = {
   next_chapter = "]c",
   prev_chapter = "[c",
   peek = "<leader>wk",
+  mark = "<leader>wm",
+  mark_note = "<leader>wM",
 }
 
 ---------------------------------------------------------------------------
@@ -148,6 +155,7 @@ local function define_highlights(force)
   set("NvtourPanelChapter", { link = "Title" }) -- the "## Name" line of a chapter (also in the winbar)
   set("NvtourPanelProgress", { link = "Comment" })
   set("NvtourLost", { link = "DiagnosticError" }) -- the "✗ lost" of a step whose lines are gone
+  set("NvtourUserMark", { link = "DiagnosticHint" }) -- the "◆" sign of a mark of the user
   -- Lets init.lua re-apply overrides after a reload or colorscheme change:
   --   vim.api.nvim_create_autocmd("User", { pattern = "NvtourHighlights", callback = function() ... end })
   pcall(api.nvim_exec_autocmds, "User", { pattern = "NvtourHighlights", modeline = false })
@@ -556,14 +564,15 @@ local sync_schedule -- the same
 ---------------------------------------------------------------------------
 
 -- Every step on a file (or a git ref) has one extmark in ns_anchor over its lines. The marks move
--- with the user's edits; sync_step reads them back into step.l1 and step.l2.
+-- with the user's edits; sync_step reads them back into step.l1 and step.l2. The marks of the user
+-- (see "Marks") use the same anchors in ns_marks.
 
 --- Make an anchor over lines l1-l2 of `buf`. Returns its id and `tail`, true when the end could not
 --- be put on a column: an empty last line at the end of the buffer.
 --- Gravity: the start moves with a line inserted above it (O on the first line); the end stays
 --- (o on the last line does not grow the range). A range that ends on an empty line ends at the
 --- start of the next line, so that the end is not mistaken for an end that moved there.
-local function set_anchor(buf, l1, l2)
+local function set_anchor(buf, l1, l2, ns, extra)
   local count = api.nvim_buf_line_count(buf)
   l1 = math.min(math.max(l1, 1), count)
   l2 = math.min(math.max(l2, l1), count)
@@ -576,22 +585,28 @@ local function set_anchor(buf, l1, l2)
       tail = true
     end
   end
-  local id = api.nvim_buf_set_extmark(buf, S.ns_anchor, l1 - 1, 0, {
-    end_row = row,
-    end_col = col,
-    right_gravity = true,
-    end_right_gravity = false,
-    invalidate = true, -- deleting all lines of the range marks it invalid; an undo restores it
-    undo_restore = true,
-  })
+  local id = api.nvim_buf_set_extmark(
+    buf,
+    ns or S.ns_anchor,
+    l1 - 1,
+    0,
+    vim.tbl_extend("force", {
+      end_row = row,
+      end_col = col,
+      right_gravity = true,
+      end_right_gravity = false,
+      invalidate = true, -- deleting all lines of the range marks it invalid; an undo restores it
+      undo_restore = true,
+    }, extra or {})
+  )
   return id, tail
 end
 
 --- Lines l1, l2 of the anchor `id` and whether it is invalid (all its lines were deleted). nil when
 --- the mark does not exist. A deleted last line moves the end to column 0 of the next line: that
---- row is then the last line of the range.
-local function read_anchor(buf, id, tail)
-  local ok, m = pcall(api.nvim_buf_get_extmark_by_id, buf, S.ns_anchor, id, { details = true })
+--- row is then the last line of the range. `ns` is the namespace of the anchor (default ns_anchor).
+local function read_anchor(buf, id, tail, ns)
+  local ok, m = pcall(api.nvim_buf_get_extmark_by_id, buf, ns or S.ns_anchor, id, { details = true })
   if not ok or not m or #m == 0 then
     return nil
   end
@@ -1170,13 +1185,19 @@ end
 
 local step_goto -- forward declaration
 
-local KEY_ORDER = { "next", "prev", "first", "last", "panel", "clear", "next_chapter", "prev_chapter", "peek" }
+-- The two sets of keys (one table: a Lua chunk has at most 200 local variables). The keys of a tour
+-- (KEYS.tour) are installed when a tour starts and removed by clear. The keys of the marks
+-- (KEYS.always) stay while the runtime is loaded (see "Marks").
+local KEYS = {
+  tour = { "next", "prev", "first", "last", "panel", "clear", "next_chapter", "prev_chapter", "peek" },
+  always = { "mark", "mark_note" },
+}
 
 --- "]w next · [w prev · ..." for the keys that are installed (the chapter keys: when there are chapters).
 local function keys_line()
   local parts = {}
   local chaptered = S.tour.chapters and #S.tour.chapters > 0
-  for _, name in ipairs(KEY_ORDER) do
+  for _, name in ipairs(KEYS.tour) do
     if S.keys[name] and (chaptered or not name:find("chapter", 1, true)) then
       parts[#parts + 1] = "`" .. S.keys[name] .. "` " .. name:gsub("_", " ")
     end
@@ -2732,8 +2753,32 @@ local function key_actions()
     elseif res.message then
       notify(res.message)
     end
+    return res
+  end
+  -- Marks the cursor line, or the selection in visual mode (which ends). With `note`, then asks for
+  -- a comment: an empty or cancelled input keeps the mark without one.
+  local function mark_key(note)
+    local res = run("mark")
+    local mode = api.nvim_get_mode().mode
+    if mode == "v" or mode == "V" or mode == "\22" then
+      pcall(vim.cmd, "normal! \27")
+    end
+    if note and res.ok then
+      vim.ui.input({ prompt = "Note for the agent: " }, function(text)
+        text = text and vim.trim(text) or ""
+        if text ~= "" then
+          run("mark_comment", { id = res.id, comment = text })
+        end
+      end)
+    end
   end
   return {
+    mark = function()
+      mark_key(false)
+    end,
+    mark_note = function()
+      mark_key(true)
+    end,
     next = function()
       run("next")
     end,
@@ -2774,8 +2819,11 @@ local function key_actions()
   }
 end
 
-local function install_keymaps()
-  if S.keymaps_installed then
+--- Install the keys of `set` (KEYS.tour or KEYS.always) that are free. A key that is taken is skipped
+--- with one warning. The keys of the marks also work in visual mode.
+local function install_keymaps(set)
+  local always = set == KEYS.always
+  if (always and S.mark_keymaps_installed) or (not always and S.keymaps_installed) then
     return
   end
   local cfg = vim.g.nvtour_keys
@@ -2783,16 +2831,17 @@ local function install_keymaps()
     cfg = {}
   end
   local actions = key_actions()
-  for name, fn in pairs(actions) do
+  local reg = always and S.mark_keys or S.keys
+  for _, name in ipairs(set) do
     local lhs = cfg[name]
     if lhs == nil then
       lhs = DEFAULT_KEYS[name]
     end
     if type(lhs) == "string" and lhs ~= "" then
-      if vim.fn.maparg(lhs, "n") == "" then
-        vim.keymap.set("n", lhs, fn, { desc = "nvtour " .. name })
+      if vim.fn.maparg(lhs, "n") == "" and (not always or vim.fn.maparg(lhs, "x") == "") then
+        vim.keymap.set(always and { "n", "x" } or "n", lhs, actions[name], { desc = "nvtour " .. name })
         S.keymaps[lhs] = true
-        S.keys[name] = lhs
+        reg[name] = lhs
       else
         local msg = "key " .. lhs .. " is already mapped; skipping '" .. name .. "'"
         if not S.warned[lhs] then
@@ -2805,16 +2854,33 @@ local function install_keymaps()
       end
     end
   end
-  S.keymaps_installed = true
+  if always then
+    S.mark_keymaps_installed = true
+  else
+    S.keymaps_installed = true
+  end
 end
 
-local function remove_keymaps()
-  for lhs in pairs(S.keymaps) do
-    pcall(vim.keymap.del, "n", lhs)
+--- Remove the keys of `set` (KEYS.tour or KEYS.always) that we installed.
+local function remove_keymaps(set)
+  local always = set == KEYS.always
+  local reg = always and S.mark_keys or S.keys
+  for _, name in ipairs(set) do
+    local lhs = reg[name]
+    if lhs then
+      pcall(vim.keymap.del, "n", lhs)
+      if always then
+        pcall(vim.keymap.del, "x", lhs)
+      end
+      S.keymaps[lhs] = nil
+      reg[name] = nil
+    end
   end
-  S.keymaps = {}
-  S.keys = {}
-  S.keymaps_installed = false
+  if always then
+    S.mark_keymaps_installed = false
+  else
+    S.keymaps_installed = false
+  end
 end
 
 local function clear_step_marks()
@@ -3001,7 +3067,7 @@ local function reset(keep_panel)
   clear_step_marks()
   clear_winbars()
   diff_close()
-  remove_keymaps()
+  remove_keymaps(KEYS.tour) -- the keys of the marks stay: the marks belong to the user
   local qf_id = S.tour.qf_id
   if qf_valid() then
     vim.fn.setqflist({}, "r", { id = qf_id, title = "nvtour (cleared)", items = {} })
@@ -3044,7 +3110,7 @@ local function ensure_started()
   elseif vim.fn.getqflist({ id = S.tour.qf_id, title = 0 }).title ~= qf_title() then
     update_qf()
   end
-  install_keymaps()
+  install_keymaps(KEYS.tour)
 end
 
 ---------------------------------------------------------------------------
@@ -4581,6 +4647,8 @@ H.status = function()
     panel = { open = panel_shown(), user_closed = S.panel.user_closed },
     follow = follow.on(),
     keys = installed_keys(),
+    mark_keys = next(S.mark_keys) and S.mark_keys or vim.empty_dict(),
+    marks = #S.marks,
     workspace = S.workspace,
     version = M.VERSION,
   }
@@ -4599,8 +4667,62 @@ H.clear = function(a)
   return { ok = true, unlisted = unlisted }
 end
 
-local MAX_SEL_LINES, MAX_SEL_BYTES = 200, 65536
-local SEL_KIND = { v = "char", V = "line", ["\22"] = "block" }
+-- The limits of a selection that is reported (where) or saved (marks), and the names of its kinds.
+local SEL = { lines = 200, bytes = 65536, kind = { v = "char", V = "line", ["\22"] = "block" } }
+
+--- The selection in window `win`, which shows `buf`: the live one when `win` is the current window
+--- and `mode` is a visual mode, else the previous one (the '< and '> marks). nil when there is none.
+--- The text is cut to SEL.lines lines and SEL.bytes bytes.
+local function selection_of(win, buf, mode)
+  local live = win == api.nvim_get_current_win() and SEL.kind[mode] ~= nil
+  return api.nvim_win_call(win, function()
+    local p1, p2, kind
+    if live then
+      p1, p2, kind = vim.fn.getpos("v"), vim.fn.getpos("."), mode
+    else
+      p1, p2, kind = vim.fn.getpos("'<"), vim.fn.getpos("'>"), vim.fn.visualmode()
+    end
+    if not SEL.kind[kind] or p1[2] < 1 or p2[2] < 1 then
+      return nil
+    end
+    local l1, l2 = math.min(p1[2], p2[2]), math.max(p1[2], p2[2])
+    local c1, c2
+    if kind == "\22" then
+      c1, c2 = math.min(p1[3], p2[3]), math.max(p1[3], p2[3])
+    elseif kind == "v" then
+      local a, b = p1, p2
+      if p1[2] > p2[2] or (p1[2] == p2[2] and p1[3] > p2[3]) then
+        a, b = p2, p1
+      end
+      c1, c2 = a[3], b[3]
+    end
+    local text
+    if kind ~= "V" then
+      local ok, region = pcall(vim.fn.getregion, p1, p2, { type = kind })
+      text = ok and region or nil
+    end
+    text = text or api.nvim_buf_get_lines(buf, l1 - 1, math.min(l2, l1 + SEL.lines), false)
+    local out, bytes, truncated = {}, 0, false
+    for i, line in ipairs(text) do
+      if i > SEL.lines or bytes + #line > SEL.bytes then
+        truncated = true
+        break
+      end
+      out[#out + 1] = line
+      bytes = bytes + #line + 1
+    end
+    return {
+      live = live,
+      kind = SEL.kind[kind],
+      l1 = l1,
+      l2 = l2,
+      c1 = c1,
+      c2 = c2,
+      text = out,
+      truncated = truncated or (#text < l2 - l1 + 1),
+    }
+  end)
+end
 
 H.where = function()
   local cur = api.nvim_get_current_win()
@@ -4612,7 +4734,6 @@ H.where = function()
   end
   local buf = api.nvim_win_get_buf(win)
   local mode = api.nvim_get_mode().mode
-  local live = win == cur and SEL_KIND[mode] ~= nil
   local res = {
     ok = true,
     file = api.nvim_buf_get_name(buf),
@@ -4634,53 +4755,144 @@ H.where = function()
     res.line, res.col = pos[1], pos[2] + 1
     res.top, res.bottom = vim.fn.line("w0"), vim.fn.line("w$")
     res.cwd = vim.fn.getcwd(0)
-    local p1, p2, kind
-    if live then
-      p1, p2, kind = vim.fn.getpos("v"), vim.fn.getpos("."), mode
-    else
-      p1, p2, kind = vim.fn.getpos("'<"), vim.fn.getpos("'>"), vim.fn.visualmode()
-    end
-    if not SEL_KIND[kind] or p1[2] < 1 or p2[2] < 1 then
-      return
-    end
-    local l1, l2 = math.min(p1[2], p2[2]), math.max(p1[2], p2[2])
-    local c1, c2
-    if kind == "\22" then
-      c1, c2 = math.min(p1[3], p2[3]), math.max(p1[3], p2[3])
-    elseif kind == "v" then
-      local a, b = p1, p2
-      if p1[2] > p2[2] or (p1[2] == p2[2] and p1[3] > p2[3]) then
-        a, b = p2, p1
-      end
-      c1, c2 = a[3], b[3]
-    end
-    local text
-    if kind ~= "V" then
-      local ok, region = pcall(vim.fn.getregion, p1, p2, { type = kind })
-      text = ok and region or nil
-    end
-    text = text or api.nvim_buf_get_lines(buf, l1 - 1, math.min(l2, l1 + MAX_SEL_LINES), false)
-    local out, bytes, truncated = {}, 0, false
-    for i, line in ipairs(text) do
-      if i > MAX_SEL_LINES or bytes + #line > MAX_SEL_BYTES then
-        truncated = true
-        break
-      end
-      out[#out + 1] = line
-      bytes = bytes + #line + 1
-    end
-    res.selection = {
-      live = live,
-      kind = SEL_KIND[kind],
-      l1 = l1,
-      l2 = l2,
-      c1 = c1,
-      c2 = c2,
-      text = out,
-      truncated = truncated or (#text < l2 - l1 + 1),
-    }
   end)
+  res.selection = selection_of(win, buf, mode)
   return res
+end
+
+---------------------------------------------------------------------------
+-- Marks
+---------------------------------------------------------------------------
+
+-- The user marks places for the agent with <leader>wm (or <leader>wM, with a comment). A mark has an
+-- extmark in ns_marks (an anchor like the ones of the steps, so it follows edits) with a "◆" sign on
+-- the first line of its range; a long range has the sign on its first line only. The list is in S.marks
+-- (Lua state only: it is gone with nvim). Marks belong to the user: start and clear keep them; only
+-- `nvtour marks --clear` and :NvtourMarksClear remove them.
+local marks = {}
+
+--- The range of mark `m` now: reads the anchor back. A mark whose lines were all deleted keeps its
+--- last range and gets `deleted`; an undo restores the lines and clears the flag.
+function marks.sync(m)
+  if not (valid_buf(m.buf) and api.nvim_buf_is_loaded(m.buf)) then
+    return
+  end
+  local l1, l2, invalid = read_anchor(m.buf, m.extmark, m.tail, S.ns_marks)
+  if not l1 then
+    return
+  end
+  m.deleted = invalid or nil
+  if not invalid then
+    m.l1, m.l2 = l1, l2
+  end
+end
+
+--- Remove the sign of mark `m`.
+function marks.del(m)
+  if valid_buf(m.buf) then
+    pcall(api.nvim_buf_del_extmark, m.buf, S.ns_marks, m.extmark)
+  end
+end
+
+--- A path for the notification: from the workspace, else from the current directory.
+function marks.short_path(path)
+  local rel = relpath(path)
+  return rel ~= path and rel or vim.fn.fnamemodify(path, ":.")
+end
+
+--- Add a mark on the cursor line, or on the selection in visual mode, of the current window.
+H.mark = function()
+  local win = api.nvim_get_current_win()
+  local buf = api.nvim_win_get_buf(win)
+  local diagram = vim.b[buf].nvtour_diagram
+  if not (file_win(win) or (diagram and is_normal_win(win))) then
+    fail("mark: this window shows no file")
+  end
+  local file = api.nvim_buf_get_name(buf)
+  if file == "" then
+    fail("mark: this buffer has no name")
+  end
+  local ref = vim.b[buf].nvtour_ref
+  if ref then
+    file = ref.file -- the real path, not nvtour://
+  end
+  local mode = api.nvim_get_mode().mode
+  local m = { buf = buf, file = file, ref = ref and ref.ref or nil, sha = ref and ref.sha or nil, diagram = diagram, at = os.time() }
+  local sel = SEL.kind[mode] and selection_of(win, buf, mode)
+  if sel then
+    m.l1, m.l2, m.kind, m.text, m.truncated = sel.l1, sel.l2, sel.kind, sel.text, sel.truncated
+  else
+    local line = api.nvim_win_get_cursor(win)[1]
+    m.l1, m.l2, m.kind = line, line, "line"
+    m.text = api.nvim_buf_get_lines(buf, line - 1, line, false)
+    m.truncated = false
+    if #m.text[1] > SEL.bytes then
+      m.text, m.truncated = {}, true
+    end
+  end
+  m.extmark, m.tail = set_anchor(buf, m.l1, m.l2, S.ns_marks, {
+    sign_text = "◆",
+    sign_hl_group = "NvtourUserMark",
+    priority = 200, -- over the bar of a step
+  })
+  S.mark_seq = S.mark_seq + 1
+  m.id = S.mark_seq
+  S.marks[#S.marks + 1] = m
+  local where = diagram and ("diagram " .. diagram) or marks.short_path(file)
+  return {
+    ok = true,
+    id = m.id,
+    n = #S.marks,
+    message = ("nvtour: mark %d added (%s:%s)"):format(#S.marks, where, m.l1 == m.l2 and m.l1 or (m.l1 .. "-" .. m.l2)),
+  }
+end
+
+--- Set the comment of the mark with id `a.id` (the number of a mark changes when marks are cleared).
+H.mark_comment = function(a)
+  for _, m in ipairs(S.marks) do
+    if m.id == a.id then
+      m.comment = a.comment
+      return { ok = true }
+    end
+  end
+  return { ok = true } -- the mark was cleared while the prompt was open
+end
+
+--- The marks, in the order they were made. With `clear`, the signs and the list are removed after the
+--- list is built, so what is returned is what is removed.
+H.marks = function(a)
+  local now = os.time()
+  local list = {}
+  for i, m in ipairs(S.marks) do
+    marks.sync(m)
+    list[i] = {
+      n = i,
+      file = m.file,
+      ref = m.ref,
+      sha = m.sha,
+      diagram = m.diagram,
+      l1 = m.l1,
+      l2 = m.l2,
+      kind = m.kind,
+      text = m.text,
+      truncated = m.truncated or nil,
+      comment = m.comment,
+      at = m.at,
+      age = now - m.at,
+      deleted = m.deleted,
+    }
+  end
+  if a.clear then
+    for _, m in ipairs(S.marks) do
+      marks.del(m)
+    end
+    S.marks = {}
+  end
+  return { ok = true, marks = list, count = #list, now = now }
+end
+
+H.marks_count = function()
+  return { ok = true, count = #S.marks }
 end
 
 ---------------------------------------------------------------------------
@@ -4809,6 +5021,11 @@ end)
 ucmd("NvtourPeek", function(o)
   return dispatch("peek", { n = o.args ~= "" and (tonumber(o.args) or 0) or nil })
 end, { nargs = "?" })
+ucmd("NvtourMarksClear", function()
+  local res = dispatch("marks", { clear = true })
+  res.message = ("nvtour: %d mark(s) cleared"):format(res.count or 0)
+  return res
+end)
 ucmd("NvtourFollow", function()
   local on = not follow.on()
   vim.g.nvtour_follow_cursor = on
@@ -4820,9 +5037,11 @@ end)
 
 -- After an upgrade during a tour, re-install the keys so new or renamed actions appear.
 if PREV_VERSION ~= nil and PREV_VERSION ~= M.VERSION then
+  -- The keys of the marks are ours too: remove and install them again, once.
+  remove_keymaps(KEYS.always)
   if S.keymaps_installed then
-    remove_keymaps()
-    install_keymaps()
+    remove_keymaps(KEYS.tour)
+    install_keymaps(KEYS.tour)
   end
   if valid_buf(S.panel.buf) then
     map_panel_keys(S.panel.buf)
@@ -4835,6 +5054,9 @@ if PREV_VERSION ~= nil and PREV_VERSION ~= M.VERSION then
   pcall(rerender_all) -- marks drawn by the old version may differ (for example the old line tint)
   pcall(render_panel)
 end
+
+-- The keys of the marks are installed when the runtime loads, tour or not (a no-op when they are).
+install_keymaps(KEYS.always)
 
 _G.nvtour = M
 return M

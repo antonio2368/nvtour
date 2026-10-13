@@ -121,7 +121,7 @@ live instance.
 | 3 | no unique match | table of live instances (pid, cwd, score) + hint: `open nvim in <W>` or `nvtour attach <pid>` |
 | 4 | no live nvim at all, or `--socket` path missing | `no running nvim found; open nvim in <W> and retry` / `socket not found: P` |
 | 5 | RPC failure or timeout, nvim waiting for input | message with the phase; `waiting for input ... not run` |
-| 6 | bad file / range (file missing, L1 > L2, beyond EOF, `--expect` mismatch) | message |
+| 6 | bad file / range (file missing, L1 > L2, beyond EOF, `--expect` mismatch); `marks --wait` without a mark | message (`no marks after S s`) |
 
 The agent relays 3/4 messages to the user verbatim. With `--json` every failure (also usage errors)
 prints `{"ok": false, "code": N, "error": "..."}` on stdout. Unexpected exceptions become one line
@@ -206,7 +206,9 @@ msgpack) and `resolved_from` instead of `l1` and `l2`.
 - **instances** — prints one line per socket: `pid  state(live|stale|unresponsive|blocked)  score
   cwd (#buffers)`. With `--prune` unlinks stale sockets (Unix sockets owned by the user only).
 - **attach** — selects and pins an instance. With no argument runs selection; prints
-  `attached: pid P  socket S  cwd C  (exact match|subdir|parent|buffers)`.
+  `attached: pid P  socket S  cwd C  (exact match|subdir|parent|buffers)`. It also loads the Lua runtime
+  in that nvim (§5, "Marks": the mark keys are installed when the runtime loads); when that fails it prints
+  `warning: could not load the nvtour runtime: ...` on stderr and still pins.
 - **where** — context for "point and ask", read from the user's file window (the current window,
   or the previous one when the current window is a terminal, the panel or another special window):
   `file:line:col` (with ` @REF` when the window shows a ref step buffer; `file` is then the real path
@@ -214,6 +216,18 @@ msgpack) and `resolved_from` instead of `l1` and `l2`.
   `top-bottom`, window cwd, and the selection `{live, kind = char|line|block, l1, c1, l2, c2, text,
   truncated}`: live in visual mode, else the previous `'<`/`'>` selection. Char and block selections
   give the exact text (`getregion()`); at most 200 lines and 64 KiB.
+- **marks** `[--wait SECONDS] [--clear]` — the places that the user marked with `<leader>wm` (§5, "Marks"),
+  in the order they were made. One entry per mark, in the form of `where`:
+  `N. FILE:L1-L2 [@REF] [(lines deleted)] (AGE) ["comment"]` (`diagram NAME:L1-L2` on a diagram), then up to
+  5 lines of the saved text with 5 spaces in front, then `...` when there are more lines (or the text was
+  cut). AGE is `N s ago`, `N min ago` or `N h ago`. No marks: `no marks`, exit 0. `--json`: `{ok, marks =
+  [{n, file, ref, sha, diagram, l1, l2, kind = char|line|block, text (all lines), truncated, comment, at,
+  age, deleted}], count, now}`. `--clear` removes the marks in the same Lua call that returns them (so what
+  is printed is what is removed; marks made later stay). `--wait S` first polls `marks_count` every 0.5 s,
+  each time with a new short RPC (own connection, `--timeout`, the check for a nvim that waits for input),
+  and goes on when the count is more than 0; after S seconds it is exit 6 with `no marks after S s`. This is
+  `run_marks` in `cli.py`; the call itself is the normal `run_remote`. While a `vim.ui.input` prompt of
+  `<leader>wM` is open, nvim waits for input and every call fails with exit 5 (as for any prompt).
 - **start** — resets any existing tour (same as `clear` but keeps the panel if open), sets the
   title, creates a fresh quickfix list, installs keymaps. `step` without a prior `start` implicitly
   starts an untitled tour. `--sheet SHEET` sets the sheet of the tour (§6, "Sheet link"); the id is
@@ -271,7 +285,9 @@ msgpack) and `resolved_from` instead of `l1` and `l2`.
   in `--json` (`step` is `null` when pending); the text has a line `## Name` before the step that starts the
   chapter, and `## Name (pending: the next step added)` at the end for a pending chapter.
   `follow` (`--json`, true or false) tells if the follow mode is on (§6, "Follow the cursor"); the text has
-  the line `follow: on` only then.
+  the line `follow: on` only then. `marks` (`--json`, a number) is the number of marks of the user (§5, "Marks");
+  the text has the line `marks: N` only when N is more than 0. `mark_keys` (`--json`) has the installed keys of
+  the marks; `keys` has only the keys of the tour.
 - **focus / unfocus** — §8.
 - **diff / diff-close** — §9.
 - **diagram** — renders a diagram into a read-only buffer that steps can point to (`step --diagram`);
@@ -308,7 +324,11 @@ M.state = {
                         ref = "v1" } },  -- file at a git ref (a focus from the steps only)
   pending_folds = { [winid] = { [bufnr] = saved fold options } }, -- restored on BufWinEnter
   diff_tabs = { tabpage handles },
-  keys = { [action] = lhs },  -- the keys that were installed
+  keys = { [action] = lhs },  -- the keys of the tour that were installed (KEYS.tour)
+  mark_keys = { [action] = lhs },  -- the keys of the marks that were installed (KEYS.always)
+  marks = { { id, buf, file, ref, sha, diagram, l1, l2, kind, text, truncated, comment, at, extmark, tail } },
+  ns_marks = nvim_create_namespace("nvtour_marks"),  -- the extmark and sign of each mark (§5, "Marks")
+  mark_seq = n,  -- the id of the next mark
   tour_win = winid,           -- last window used for the tour
   added_bufs = { [bufnr] = true }, -- buffers nvtour added to the buffer list
   ns_flash = nvim_create_namespace("nvtour_flash"),
@@ -363,6 +383,42 @@ with no chapter, `no chapters` (exit 6 in the result, a warning for a key).
 link (not a number, so it stays correct when steps are inserted or removed); a link to a removed
 step falls back to the step before. `below` is the number of link lines below the range, and
 `drawn_win` the window that the band was computed for.
+
+### Marks
+
+The user marks places for the agent (`<leader>wm`, `<leader>wM`; `mark` and `mark_note` in `nvtour_keys`).
+The marks belong to the user, not to the tour: `start` and `clear` keep them (`reset` does not touch
+`S.marks` or `ns_marks`), and only `H.marks({ clear = true })` (`nvtour marks --clear`) and
+`:NvtourMarksClear` remove them. They are in `S.marks` only, so they are gone with the nvim process; a
+reload of the runtime keeps them (the fill loop after `new_state()`).
+
+`H.mark` (the key calls it through `dispatch`, like the other keys) works on the current window: a file
+window, a ref step buffer or a diagram window (else `mark: this window shows no file`). In visual mode
+(`SEL.kind[mode]`) it takes the selection from `selection_of(win, buf, mode)`; that function was
+factored out of `H.where`, so `where` and the marks have the same limits `SEL.lines` = 200 and `SEL.bytes`
+= 64 KiB, and the same text (`getregion`). In normal mode the mark is the cursor line, kind `line`. A mark
+has `file` (the real path for a ref buffer, with `ref` and `sha`), `diagram` for a diagram buffer, the
+saved `text`, `at = os.time()` and, for `<leader>wM`, a `comment`. The key action then asks with
+`vim.ui.input({ prompt = "Note for the agent: " })`; an empty or cancelled input keeps the mark without a
+comment (`H.mark_comment` finds the mark by `id`; the number `n` changes when marks are cleared). A visual
+selection ends after the key.
+
+The range is an anchor made with `set_anchor` and read with `read_anchor`, both with the namespace `ns_marks`
+(§6, "Steps follow edits": gravity, `invalidate`, `undo_restore`). The extmark has `sign_text = "◆"` in
+`NvtourUserMark` (links to `DiagnosticHint`), priority 200 (above the bar of a step). The sign is on the
+first line of the range only (one extmark). `H.marks` calls `marks.sync` for each mark, which reads the lines
+back from the extmark; when all lines were deleted (`invalid`) the mark keeps its last range and has
+`deleted = true` (`(lines deleted)` in the output), and an undo clears the flag. The `text` is the text at
+the time of the mark.
+
+Keys: `KEYS.tour` (next, prev, first, last, panel, clear, peek, next_chapter, prev_chapter) and
+`KEYS.always` (mark, mark_note). `install_keymaps(set)` and `remove_keymaps(set)` take one of them (in one
+table `KEYS` because the main chunk is at the limit of 200 local variables). `reset` removes only
+`KEYS.tour`. `install_keymaps(KEYS.always)` runs at the end of the runtime chunk, so the mark keys exist after
+any command, also `attach`, without a tour. The keys of the marks are set in normal and visual mode, with
+the same rule as the others (free in both modes; one warning per key in `S.warned`). A runtime upgrade removes
+the keys that we installed and installs them again, so a key is never mapped twice and a key of the user that
+we skipped is not warned about again. `status` has `mark_keys` for them.
 
 ### Tour window
 
@@ -996,16 +1052,21 @@ closes their windows, and empty `state.diagrams`. So `diagram` comes after `star
 
 ## 11. Keymaps and user commands
 
-Installed by `start`/first `step`, removed by `clear`. Global normal-mode maps, each set **only if
-`vim.fn.maparg(lhs, "n") == ""`**; otherwise `vim.notify` a warning once, return it in `warnings`,
+The keys of the tour (`KEYS.tour`) are installed by `start`/first `step` and removed by `clear`. The keys of
+the marks (`KEYS.always`) are installed when the runtime loads and stay (§5, "Marks"); they are also set in
+visual mode, and are free only when `maparg` is empty in both modes. Global normal-mode maps, each set
+**only if `vim.fn.maparg(lhs, "n") == ""`**; otherwise `vim.notify` a warning once, return it in `warnings`,
 and skip that key. `vim.g.nvtour_keys` is read (missing entries use the defaults), never written.
 
 ```lua
 DEFAULT_KEYS = {
   next = "]w", prev = "[w", first = "[W", last = "]W", panel = "<leader>wp", clear = "<leader>wc",
   next_chapter = "]c", prev_chapter = "[c", peek = "<leader>wk",
+  mark = "<leader>wm", mark_note = "<leader>wM",
 }
 ```
+
+`mark` adds a mark on the cursor line or the selection; `mark_note` does the same and asks for a comment.
 
 `peek` shows the full content of the step under the cursor in a float (§6, "Peek a step"). While the float
 is open, `<Esc>` and `q` are mapped (buffer-local) to close it; they are removed on close.
@@ -1017,7 +1078,8 @@ built-in key is, so nvtour takes them; in a window in diff mode they run the bui
 User commands (defined on load, always available): `:NvtourNext`, `:NvtourPrev`, `:NvtourFirst`,
 `:NvtourLast`, `:NvtourNextChapter`, `:NvtourPrevChapter`, `:NvtourGoto N`, `:NvtourPanel`, `:NvtourClear`,
 `:NvtourPeek [N]` (peeks step N, default the step under the cursor; see "Peek a step"), `:NvtourFollow`
-(flips `vim.g.nvtour_follow_cursor` and says the new state; see "Follow the cursor").
+(flips `vim.g.nvtour_follow_cursor` and says the new state; see "Follow the cursor"), `:NvtourMarksClear`
+(removes all marks and says how many; see §5, "Marks").
 
 The quickfix list also works (`:cnext`, `:cprev`, `:copen`); it moves the cursor only, not the
 current step.

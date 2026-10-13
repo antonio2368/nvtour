@@ -11,6 +11,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 import tomllib
 from typing import Any, Mapping, NoReturn
 
@@ -134,6 +135,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--clear", action="store_true", help="remove the pin")
 
     cmd("where", "show cursor, selection and visible range")
+
+    p = cmd("marks", "show the places that the user marked (<leader>wm in nvim)")
+    p.add_argument("--wait", type=positive_float, metavar="SECONDS",
+                   help="wait until there is a mark; exit 6 after SECONDS without one")
+    p.add_argument("--clear", action="store_true", help="remove the marks that are printed")
 
     p = cmd("start", "start a new tour")
     p.add_argument("title", nargs="?", default="")
@@ -681,6 +687,8 @@ def build_request(args: argparse.Namespace, workspace: str) -> tuple[str, dict[s
         return "goto", {"n": args.n}
     if c == "clear":
         return c, {"keep_buffers": args.keep_buffers or None}
+    if c == "marks":
+        return "marks", {"clear": args.clear or None}
     if c in ("next", "prev", "first", "last", "where", "diff-close", "status"):
         return c, {}
     if c == "focus" and args.steps:
@@ -822,6 +830,8 @@ def format_result(args: argparse.Namespace, res: dict[str, Any], workspace: str)
         return "cleared"
     if c == "where":
         return format_where(res, workspace)
+    if c == "marks":
+        return format_marks(res, workspace)
     return json.dumps(res)
 
 
@@ -877,6 +887,8 @@ def format_status(res: dict[str, Any], workspace: str) -> str:
         out.append(f"diagram: {d['name']} ({d['count']} lines, {d['links']} link(s))")
     if res.get("follow"):
         out.append("follow: on")
+    if res.get("marks"):
+        out.append(f"marks: {res['marks']}")
     panel = res.get("panel") or {}
     out.append(f"panel: {'open' if panel.get('open') else 'closed'}   diff tabs: {res.get('diff_tabs', 0)}")
     out.append(f"keys: {format_keys(res.get('keys'))}")
@@ -920,6 +932,35 @@ def format_where(res: dict[str, Any], workspace: str) -> str:
     return "\n".join(out)
 
 
+MARK_TEXT_LINES = 5  # lines of a mark that the text output shows; --json has all of them
+
+
+def fmt_age(seconds: int) -> str:
+    if seconds < 60:
+        return f"{max(seconds, 0)} s ago"
+    if seconds < 3600:
+        return f"{seconds // 60} min ago"
+    return f"{seconds // 3600} h ago"
+
+
+def format_marks(res: Mapping[str, Any], workspace: str) -> str:
+    """Like ``where``: ``N. FILE:L1-L2 [@REF] [(lines deleted)] (AGE) ["comment"]``, then the first lines."""
+    out = []
+    for m in res.get("marks") or []:
+        head = f"{m['n']}. {fmt_loc(m, workspace)}"
+        if m.get("deleted"):
+            head += "  (lines deleted)"
+        head += f"  ({fmt_age(int(m.get('age') or 0))})"
+        if m.get("comment"):
+            head += f'  "{" ".join(m["comment"].split())}"'
+        out.append(head)
+        text = m.get("text") or []
+        out.extend(f"     {line}" for line in text[:MARK_TEXT_LINES])
+        if len(text) > MARK_TEXT_LINES or m.get("truncated"):
+            out.append("     ...")
+    return "\n".join(out) or "no marks"
+
+
 def emit(args: argparse.Namespace, res: dict[str, Any], text: str, socket: str | None = None) -> None:
     """Print JSON or text."""
     if args.json:
@@ -931,11 +972,9 @@ def emit(args: argparse.Namespace, res: dict[str, Any], text: str, socket: str |
         print(text)
 
 
-def run_remote(args: argparse.Namespace, workspace: str, env: Mapping[str, str]) -> int:
-    """Commands that talk to the selected nvim instance."""
-    cmd, payload = build_request(args, workspace)
-    sock, _source = pick_socket(args, workspace, env)
-    client = Client(sock, args.timeout).connect()
+def rpc(sock: str, timeout: float, cmd: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """One short call to the nvim at ``sock``; a result that is not ok raises with its exit code."""
+    client = Client(sock, timeout).connect()
     try:
         client.check_not_blocked()
         client.ensure_lua_loaded()
@@ -944,6 +983,25 @@ def run_remote(args: argparse.Namespace, workspace: str, env: Mapping[str, str])
         client.close()
     if not res.get("ok"):
         raise NvtourError(int(res.get("code") or EXIT_RPC), str(res.get("error", "unknown error")))
+    return res
+
+
+def wait_for_marks(sock: str, timeout: float, seconds: float) -> None:
+    """Poll ``marks_count`` every 0.5 s (short calls, each inside ``timeout``) until there is a mark;
+    exit 6 after ``seconds``. A blocked nvim fails the call as usual (exit 5)."""
+    deadline = time.monotonic() + seconds
+    while rpc(sock, timeout, "marks_count", {}).get("count", 0) == 0:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            raise NvtourError(EXIT_BAD_FILE, f"no marks after {seconds:g} s")
+        time.sleep(min(0.5, left))
+
+
+def run_remote(args: argparse.Namespace, workspace: str, env: Mapping[str, str], sock: str | None = None) -> int:
+    """Commands that talk to the selected nvim instance (``sock``: already chosen)."""
+    cmd, payload = build_request(args, workspace)
+    sock = sock or pick_socket(args, workspace, env)[0]
+    res = rpc(sock, args.timeout, cmd, payload)
     if cmd == "diagram":
         res["lines"] = payload["lines"]  # the agent picks step ranges from them
     emit(args, res, format_result(args, res, workspace), sock)
@@ -951,6 +1009,15 @@ def run_remote(args: argparse.Namespace, workspace: str, env: Mapping[str, str])
         for w in res.get("warnings") or []:
             print(f"warning: {w}", file=sys.stderr)
     return 0
+
+
+def run_marks(args: argparse.Namespace, workspace: str, env: Mapping[str, str]) -> int:
+    """``marks``: with --wait, first wait for a mark. --clear removes in the same call that returns the
+    marks, so only what is printed is removed."""
+    sock = pick_socket(args, workspace, env)[0]
+    if args.wait is not None:
+        wait_for_marks(sock, args.timeout, args.wait)
+    return run_remote(args, workspace, env, sock)
 
 
 def run_instances(args: argparse.Namespace, workspace: str, env: Mapping[str, str]) -> int:
@@ -1001,6 +1068,14 @@ def run_attach(args: argparse.Namespace, workspace: str, env: Mapping[str, str])
         else:
             inst = discover.select(discover.inspect_all(workspace, env), workspace)
     discover.write_pin(workspace, inst.socket, env, inst.pid)
+    try:  # the keys of the marks are installed when the runtime loads
+        client = Client(inst.socket, args.timeout).connect()
+        try:
+            client.ensure_lua_loaded()
+        finally:
+            client.close()
+    except NvtourError as exc:
+        print(f"warning: could not load the nvtour runtime: {exc.message}", file=sys.stderr)
     kind = inst.kind or "manual"
     text = f"attached: pid {inst.pid}  socket {inst.socket}  cwd {inst.cwd}  ({kind})"
     emit(args, {"ok": True, **inst.to_dict(), "workspace": workspace}, text)
@@ -1134,6 +1209,8 @@ def run(args: argparse.Namespace, env: Mapping[str, str]) -> int:
         return run_instances(args, workspace, env)
     if args.command == "attach":
         return run_attach(args, workspace, env)
+    if args.command == "marks":
+        return run_marks(args, workspace, env)
     return run_remote(args, workspace, env)
 
 
