@@ -198,6 +198,23 @@ so the step moves with the code. The range, the quickfix list, the panel and `]w
 - A diagram step whose `--expect` text is gone after `diagram NAME` is lost too.
 - Only anchors (extmarks) are used. The files and buffers are never changed.
 
+### Follow the cursor
+
+Set `vim.g.nvtour_follow_cursor = true` (default off), or run `:NvtourFollow` to turn it on and off. Then the
+step that holds your cursor becomes the current step. Its full note, the winbar, the panel, the quickfix
+index and the linked sheet step follow. Nothing scrolls, nothing flashes, and no message is shown.
+
+- Only normal-mode moves count (`CursorMoved`), after a pause of 100 ms. Moves in the panel do not count.
+- When ranges are nested, the innermost one (the greatest first line) wins. A lost step is skipped.
+- The cursor outside every step keeps the last current step.
+- `]w` goes on from the step that you followed.
+- A jump (`goto`, `]w`) puts the cursor on the first line of its step. That step stays current, also when
+  a smaller step starts on the same line.
+- `nvtour status` shows the line `follow: on` (`"follow": true` in `--json`), so an agent knows that the
+  current step can change without a key.
+- Default off, because the sheet viewer would jump each time the cursor crosses a step, and the note
+  under the cursor would change while you edit.
+
 ### Focus on the steps
 
 After a long tour in long files, run one command: `nvtour focus --steps [FILE] [--context N] [--dim]`.
@@ -562,7 +579,8 @@ step after it), `q` closes the panel.
 **In a diagram:** `<CR>` on an underlined link text opens its code; elsewhere it moves down as usual.
 
 **Commands:** `:NvtourNext`, `:NvtourPrev`, `:NvtourFirst`, `:NvtourLast`, `:NvtourNextChapter`,
-`:NvtourPrevChapter`, `:NvtourGoto N`, `:NvtourPanel`, `:NvtourClear`.
+`:NvtourPrevChapter`, `:NvtourGoto N`, `:NvtourPanel`, `:NvtourClear`, `:NvtourFollow` (turn
+[follow mode](#follow-the-cursor) on or off).
 
 **Quickfix:** the list `nvtour: <title>` works too (`:cnext`, `:cprev`), but it only moves the cursor. It does
 not change the current step of the tour.
@@ -580,6 +598,7 @@ vim.g.nvtour_auto_panel = false               -- do not open the panel on the fi
 vim.g.nvtour_steal_focus = "unless_terminal"  -- "always" | "never"; default keeps the focus in a terminal window
 vim.g.nvtour_winbar = false                   -- do not show the tour position in the winbar of the tour window
 vim.g.nvtour_flash = 0                        -- ms the range flashes after a jump (default 300; 0 = off)
+vim.g.nvtour_follow_cursor = true             -- the step under the cursor becomes the current step (default false)
 vim.g.nvtour_note_style = "band"              -- a background band instead of the frame (default "frame")
 vim.g.nvtour_note_width = 160                 -- wrap notes at most this many cells wide (default: the window width)
 vim.g.nvtour_sheet_cmd = "sheet"              -- the command for steps with --sheet (default "sheet")

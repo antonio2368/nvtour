@@ -44,6 +44,8 @@ local function new_state()
     attached = {}, -- [buf] = true: buffers with an nvim_buf_attach of ours (see "Steps follow edits")
     sync_timers = {}, -- [buf] = the debounce timer of the sync after an edit
     reloaded = {}, -- [buf] = true: the content was replaced (:e!); the steps are anchored again
+    follow_timers = {}, -- [win] = the debounce timer of the follow mode (see "Follow the cursor")
+    follow_jump = {}, -- { win, buf, line }: where the last jump put the cursor; follow ignores it
   }
 end
 
@@ -2939,9 +2941,26 @@ local function same_link(a, b)
   return a.sheet == b.sheet and a.step == b.step and vim.deep_equal(a.env, b.env)
 end
 
+-- The follow mode (see "Follow the cursor") keeps its functions in one table: a Lua chunk has at most
+-- 200 local variables.
+local follow = {}
+
+--- Stop the pending follow checks of all windows.
+function follow.cancel_all()
+  for win, timer in pairs(S.follow_timers) do
+    S.follow_timers[win] = nil
+    pcall(function()
+      timer:stop()
+      timer:close()
+    end)
+  end
+  S.follow_jump = {}
+end
+
 --- Remove everything nvtour created. keep_panel keeps the panel window open.
 local function reset(keep_panel)
   sheet_cancel()
+  follow.cancel_all()
   for buf in pairs(S.sync_timers) do
     sync_cancel(buf)
   end
@@ -3045,6 +3064,30 @@ local function step_result(step, extra)
   return r
 end
 
+--- `step` becomes the current step: draw the old and the new step, show the winbar in `win`, start the
+--- sheet link. `opts.scroll` puts the cursor on the step and scrolls to it, then flashes the range
+--- (a jump; follow mode moves nothing). `opts.lists` also updates the quickfix list and the panel
+--- (the caller of a jump does that after it, when the step is in the tour).
+local function make_current(step, win, opts)
+  local old = S.tour.steps[S.tour.current]
+  S.tour.current = step.n
+  if old and old ~= step and valid_buf(old.buf) and api.nvim_buf_is_loaded(old.buf) then
+    render_step(old, tour_win(old.buf))
+  end
+  set_winbar(win) -- before the note is wrapped and the view is computed: it takes a row
+  render_step(step, win)
+  if opts.scroll then
+    scroll_to(step, win)
+    S.follow_jump = { win = win, buf = step.buf, line = step.l1 }
+    flash(step)
+  end
+  if opts.lists then
+    update_qf(step.n)
+    render_panel()
+  end
+  sheet_schedule(step)
+end
+
 local function jump(step)
   step_buf(step)
   sync_step(step)
@@ -3058,16 +3101,7 @@ local function jump(step)
     S.tour_win = win -- the diagram window is never a window for code
   end
   enter_win(win)
-  local old = S.tour.steps[S.tour.current]
-  S.tour.current = step.n
-  if old and old ~= step and valid_buf(old.buf) and api.nvim_buf_is_loaded(old.buf) then
-    render_step(old, tour_win(old.buf))
-  end
-  set_winbar(win) -- before the note is wrapped and the view is computed: it takes a row
-  render_step(step, win)
-  scroll_to(step, win)
-  flash(step)
-  sheet_schedule(step)
+  make_current(step, win, { scroll = true })
 end
 
 local function announce(step)
@@ -3095,6 +3129,115 @@ step_goto = function(n)
   announce(step)
   return step_result(step)
 end
+
+---------------------------------------------------------------------------
+-- Follow the cursor
+---------------------------------------------------------------------------
+
+-- With vim.g.nvtour_follow_cursor on, the step that holds the cursor becomes the current step. The
+-- one CursorMoved autocmd always exists and returns at once when the mode is off. A move starts a
+-- timer per window (like the sheet link): a burst of moves is one check. The check changes no
+-- cursor, view or focus, and gives no announcement.
+follow.DEBOUNCE_MS = 100
+
+function follow.on()
+  local v = vim.g.nvtour_follow_cursor
+  return v == true or v == 1
+end
+
+--- True for a window whose cursor can follow: a file window or a diagram window (not the panel, not a
+--- window of a diff tab) that shows a buffer with a step.
+function follow.win(win)
+  if not is_normal_win(win) or win == S.panel.win or is_diff_tab(api.nvim_win_get_tabpage(win)) then
+    return false
+  end
+  local buf = api.nvim_win_get_buf(win)
+  if not (file_win(win) or is_diagram_buf(buf)) then
+    return false
+  end
+  for _, s in ipairs(S.tour.steps) do
+    if s.buf == buf then
+      return true
+    end
+  end
+  return false
+end
+
+--- The step that holds the cursor line `line` of `buf`: the innermost (the greatest l1, then the
+--- smallest l2; the current step wins a tie). Lost steps do not count.
+function follow.step_at(buf, line)
+  local best
+  for _, s in ipairs(S.tour.steps) do
+    if s.buf == buf and not s.lost and s.l1 <= line and line <= s.l2 then
+      if
+        not best
+        or s.l1 > best.l1
+        or (s.l1 == best.l1 and s.l2 < best.l2)
+        or (s.l1 == best.l1 and s.l2 == best.l2 and s.n == S.tour.current)
+      then
+        best = s
+      end
+    end
+  end
+  return best
+end
+
+function follow.fire(win, buf)
+  if not follow.on() or not follow.win(win) or api.nvim_win_get_buf(win) ~= buf then
+    return
+  end
+  local line = api.nvim_win_get_cursor(win)[1]
+  local at = S.follow_jump
+  if at.win == win and at.buf == buf and at.line == line then
+    return -- the cursor is where a jump put it: the jump chose the step
+  end
+  at.win = nil
+  sync_buf(buf)
+  local step = follow.step_at(buf, line)
+  if step and step.n ~= S.tour.current then
+    make_current(step, win, { lists = true })
+    redraw_winbars()
+  end
+end
+
+function follow.schedule(win)
+  local timer = S.follow_timers[win]
+  if timer then
+    timer:stop()
+  else
+    timer = uv.new_timer()
+    S.follow_timers[win] = timer
+  end
+  local buf = api.nvim_win_get_buf(win)
+  timer:start(
+    follow.DEBOUNCE_MS,
+    0,
+    vim.schedule_wrap(function()
+      if S.follow_timers[win] ~= timer then
+        return -- cancelled or replaced
+      end
+      S.follow_timers[win] = nil
+      pcall(function()
+        timer:stop()
+        timer:close()
+      end)
+      pcall(follow.fire, win, buf)
+    end)
+  )
+end
+
+api.nvim_create_autocmd("CursorMoved", {
+  group = aug,
+  callback = function()
+    if not follow.on() or #S.tour.steps == 0 then
+      return
+    end
+    local win = api.nvim_get_current_win()
+    if follow.win(win) then
+      follow.schedule(win)
+    end
+  end,
+})
 
 local H = {}
 
@@ -4211,6 +4354,7 @@ H.status = function()
     diagrams = diagrams,
     diff_tabs = diffs,
     panel = { open = panel_shown(), user_closed = S.panel.user_closed },
+    follow = follow.on(),
     keys = installed_keys(),
     workspace = S.workspace,
     version = M.VERSION,
@@ -4436,6 +4580,14 @@ ucmd("NvtourPanel", function()
 end)
 ucmd("NvtourClear", function()
   return dispatch("clear", {})
+end)
+ucmd("NvtourFollow", function()
+  local on = not follow.on()
+  vim.g.nvtour_follow_cursor = on
+  if not on then
+    follow.cancel_all()
+  end
+  return { ok = true, message = "nvtour: follow " .. (on and "on" or "off") }
 end)
 
 -- After an upgrade during a tour, re-install the keys so new or renamed actions appear.

@@ -875,6 +875,8 @@ def format_status(res: dict[str, Any], workspace: str) -> str:
         out.append(fmt_focus(f, workspace, status=True))
     for d in res.get("diagrams") or []:
         out.append(f"diagram: {d['name']} ({d['count']} lines, {d['links']} link(s))")
+    if res.get("follow"):
+        out.append("follow: on")
     panel = res.get("panel") or {}
     out.append(f"panel: {'open' if panel.get('open') else 'closed'}   diff tabs: {res.get('diff_tabs', 0)}")
     out.append(f"keys: {format_keys(res.get('keys'))}")

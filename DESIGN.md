@@ -270,6 +270,8 @@ msgpack) and `resolved_from` instead of `l1` and `l2`.
   `tour_sheet` and the line `sheet: SHEET` show the sheet of the tour. `chapters = [{ name, step }]` is
   in `--json` (`step` is `null` when pending); the text has a line `## Name` before the step that starts the
   chapter, and `## Name (pending: the next step added)` at the end for a pending chapter.
+  `follow` (`--json`, true or false) tells if the follow mode is on (§6, "Follow the cursor"); the text has
+  the line `follow: on` only then.
 - **focus / unfocus** — §8.
 - **diff / diff-close** — §9.
 - **diagram** — renders a diagram into a read-only buffer that steps can point to (`step --diagram`);
@@ -320,6 +322,8 @@ M.state = {
   attached = { [bufnr] = true },  -- buffers with our nvim_buf_attach
   sync_timers = { [bufnr] = uv timer },  -- the debounced sync after an edit
   reloaded = { [bufnr] = true },  -- the content was replaced; the steps are anchored again
+  follow_timers = { [winid] = uv timer },  -- the debounced check of the follow mode (§6, "Follow the cursor")
+  follow_jump = { win, buf, line },  -- where the last jump put the cursor; the follow check ignores it
 }
 ```
 
@@ -434,8 +438,9 @@ For a step at `l1..l2` in buffer `buf` (0-based rows internally):
 4. **Marker** — on `l1`, for every step: `virt_text = { {"  ← ", NvtourLabel<Role>}, {n,
    NvtourSign<Role>}, {" " .. label, NvtourLabel<Role>} }` (no label: `← n`), `virt_text_pos = "eol"`.
 5. **Jump** (first step of a tour, or `--jump`; never with `--no-jump`) — show the buffer in the
-   tour window, set `tour.current = n`, re-render the old and the new current step, set the winbar,
-   then scroll (in that window via `nvim_win_call`): cursor on `l1`, `normal! zv`, and
+   tour window, then `make_current(step, win, { scroll = true })`: set `tour.current = n`,
+   re-render the old and the new current step, set the winbar, and scroll (in that window via
+   `nvim_win_call`): cursor on `l1`, `normal! zv`, and
    `winrestview({ topline, topfill })`. The block (the note, `l1..l2` and the "next" line, measured
    with `nvim_win_text_height`, so virtual lines and wrapped lines count; it counts the lines below
    `l2` with the next row, so they are added) is centred when it fits in the
@@ -571,7 +576,8 @@ so a step id is never read as a sheet id. `start --sheet SHEET` sets the sheet o
 
 - **When.** Each time a step with a link becomes the current step: `goto`, `next`, `prev`, `first`,
   `last`, the keymaps, `<CR>` in the panel, and the jump to the first step by `step`. The call is
-  in `jump()`, the one place where the current step changes (every navigation goes through it).
+  in `make_current()`, the one place where the current step changes (every navigation goes through
+  `jump()`, which calls it; the follow mode calls it too, see "Follow the cursor").
   `edit` and a render do not call it, unless the link of the current step changed. `remove` does
   not call it. `edit` and `remove` keep the links of the other steps. `clear` and `start` drop all
   links and cancel a call that waits.
@@ -651,6 +657,32 @@ The user can edit a buffer during a tour. The extmarks of a step move with the e
   a step whose buffer was loaded again), from its `l1` and `l2`. `reset` clears `ns_anchor` in all
   buffers and cancels the timers. `clear_step_marks` clears `ns_anchor` too. Reading or writing an
   anchor never changes a buffer: anchors are extmarks (§12 rule 1 is the same).
+
+### Follow the cursor
+
+`jump(step)` shows the buffer, enters the window and calls `make_current(step, win, opts)`. That
+function is the one place where the current step changes: it sets `tour.current`, draws the old and
+the new step, sets the winbar of `win` and starts the sheet link (`sheet_schedule`). With
+`opts.scroll` (a jump) it also scrolls, notes the cursor position in `state.follow_jump` and flashes
+the range. With `opts.lists` it also runs `update_qf(n)` and `render_panel()`. `jump` does not set
+`lists`: its callers do that, because `add_step` jumps before the step is in the tour.
+
+`vim.g.nvtour_follow_cursor` (`true` or `1`; default off) turns the follow mode on. The one
+`CursorMoved` autocmd (group `nvtour`, not `CursorMovedI`) always exists and returns at once when the
+mode is off or the tour has no step; `:NvtourFollow` only flips the option. A move in a window that
+shows a buffer with a step starts a 100 ms timer of that window (`state.follow_timers[win]`, like the
+sheet link and the sync after an edit; `reset` and `:NvtourFollow` (off) cancel them). The window is
+a file window or a diagram window; the panel and the windows of a diff tab never count.
+
+When the timer fires, the window must still show the same buffer. `sync_buf(buf)` reads the anchors.
+The step with the cursor line in `l1..l2` is chosen: the greatest `l1`, then the smallest `l2` (the
+innermost; the current step wins a tie); lost steps are skipped. When it is not the current step,
+`make_current(step, win, { lists = true })` runs, with `win` the window of the cursor (not
+`state.tour_win`: the buffer can be in several windows). Nothing else changes: no scroll, no flash, no
+`notify`, no cursor or focus change. `state.tour_win` is not set. No step under the cursor: the
+current step stays. A jump moves the cursor to `l1` of its step; the check ignores that one position
+(`state.follow_jump`), else a smaller step that starts on the same line would take the current step
+from the step of the jump. `status` has `follow`.
 
 ### Frame and band
 
@@ -947,7 +979,8 @@ built-in key is, so nvtour takes them; in a window in diff mode they run the bui
 (`normal! ]c`), so `nvtour diff` tabs keep working.
 
 User commands (defined on load, always available): `:NvtourNext`, `:NvtourPrev`, `:NvtourFirst`,
-`:NvtourLast`, `:NvtourNextChapter`, `:NvtourPrevChapter`, `:NvtourGoto N`, `:NvtourPanel`, `:NvtourClear`.
+`:NvtourLast`, `:NvtourNextChapter`, `:NvtourPrevChapter`, `:NvtourGoto N`, `:NvtourPanel`, `:NvtourClear`,
+`:NvtourFollow` (flips `vim.g.nvtour_follow_cursor` and says the new state; see "Follow the cursor").
 
 The quickfix list also works (`:cnext`, `:cprev`, `:copen`); it moves the cursor only, not the
 current step.
