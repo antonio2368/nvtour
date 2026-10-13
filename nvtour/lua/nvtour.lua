@@ -987,6 +987,16 @@ local function gaps_of(ranges, count)
   return gaps
 end
 
+--- Dim the lines outside `ranges` (the gaps) of `buf`; the old dim marks go.
+local function draw_dim(buf, ranges)
+  api.nvim_buf_clear_namespace(buf, S.ns_focus, 0, -1)
+  for _, g in ipairs(gaps_of(ranges, api.nvim_buf_line_count(buf))) do
+    for l = g[1], g[2] do
+      api.nvim_buf_set_extmark(buf, S.ns_focus, l - 1, 0, { end_row = l, end_col = 0, hl_group = "NvtourDim", hl_eol = true, priority = 200 })
+    end
+  end
+end
+
 local FOLD_OPTS = { "foldmethod", "foldenable", "foldlevel", "foldminlines" }
 
 --- Window-local fold options of `win` (`:setlocal` values, so other buffers are not affected).
@@ -2266,6 +2276,9 @@ local function refold(buf)
   end
   f.stale = nil
   if f.dim then
+    if f.from_steps then
+      draw_dim(buf, f.ranges) -- a dim of anchored ranges moves with its marks; this one is made from the steps
+    end
     return
   end
   if vim.fn.mode():find("^[iR]") then
@@ -2276,6 +2289,49 @@ local function refold(buf)
   for win in pairs(f.saved or {}) do
     if valid_win(win) and api.nvim_win_get_buf(win) == buf then
       apply_folds(buf, win)
+    end
+  end
+end
+
+--- The ranges `{ l1, l2 }` of the steps in `buf` that a focus from the steps shows: not those of
+--- diagrams and lost steps.
+local function step_ranges(buf)
+  local ranges = {}
+  for _, s in ipairs(S.tour.steps) do
+    if s.buf == buf and not s.diagram and not s.lost then
+      ranges[#ranges + 1] = { s.l1, s.l2 }
+    end
+  end
+  return ranges
+end
+
+--- Make the focus of `buf` again from the steps in it, when it is a focus from the steps (`focus
+--- --steps`). The ranges are those of the steps now (their anchors are read by sync_step), so a step
+--- that was added, edited, removed or moved by an edit changes the folds. With no step left in the
+--- buffer the focus ends. Nothing is done when the ranges are the same: the folds stay as they are.
+local function refocus_steps(buf)
+  local f = S.focus[buf]
+  if not f or not f.from_steps then
+    return
+  end
+  local ranges = valid_buf(buf) and api.nvim_buf_is_loaded(buf) and step_ranges(buf) or {}
+  if #ranges == 0 then
+    unfocus_buf(buf)
+    return
+  end
+  local merged = merge_ranges(ranges, f.from_steps.context, api.nvim_buf_line_count(buf))
+  if vim.deep_equal(merged, f.ranges) and not f.refold then
+    return
+  end
+  f.ranges = merged
+  refold(buf)
+end
+
+--- refocus_steps for all buffers that have a focus from the steps.
+local function refocus_all_steps()
+  for buf, f in pairs(S.focus) do
+    if f.from_steps then
+      refocus_steps(buf)
     end
   end
 end
@@ -2305,6 +2361,7 @@ local function sync_fire(buf)
       update_qf()
     end
     render_panel()
+    refocus_steps(buf) -- a focus from the steps follows the moved or lost steps
   end
   if focus then
     refold(buf)
@@ -3070,6 +3127,7 @@ local function rerender_all()
       render_step(s, tour_win(s.buf))
     end
   end
+  refocus_all_steps() -- the steps of a file changed: so do the folds of a focus from the steps
 end
 
 --- Lines (l1, l2) that the text range `q` selects in the list `lines`; `name` is for the messages.
@@ -3565,21 +3623,25 @@ local function focus_ranges(a, buf)
   return ranges
 end
 
---- Fold or dim the ranges of `a` in its file. With `move`, the file is shown and the cursor goes to the
---- first range; without it the view stays and the folds are applied when the file is shown.
-local function do_focus(a, move)
-  local buf = load_buf(a.file)
+--- Fold or dim `ranges` (plus `ctx` lines around each) of `buf`, which holds `file`. With `move`, the
+--- file is shown and the cursor goes to the first range; without it the view stays and the folds are
+--- applied when the file is shown. `from_steps` (`{ context, dim }`) makes the focus follow the steps
+--- of the buffer (see refocus_steps): the ranges are then not given by a command, so they have no
+--- anchors of their own; the anchors of the steps are the only ones.
+local function focus_buf(buf, file, ranges, ctx, dim, move, from_steps)
   local count = api.nvim_buf_line_count(buf)
-  local ranges = focus_ranges(a, buf)
   unfocus_buf(buf)
-  local merged = merge_ranges(ranges, a.context or 2, count)
+  local merged = merge_ranges(ranges, ctx, count)
   -- The ranges follow the edits of the user like the steps do (see "Steps follow edits").
-  local anchors = {}
-  for i, r in ipairs(merged) do
-    local id, tail = set_anchor(buf, r[1], r[2])
-    anchors[i] = { id = id, tail = tail }
+  local anchors
+  if not from_steps then
+    anchors = {}
+    for i, r in ipairs(merged) do
+      local id, tail = set_anchor(buf, r[1], r[2])
+      anchors[i] = { id = id, tail = tail }
+    end
   end
-  S.focus[buf] = { ranges = merged, dim = a.dim and true or false, file = a.file, anchors = anchors }
+  S.focus[buf] = { ranges = merged, dim = dim and true or false, file = file, anchors = anchors, from_steps = from_steps }
   attach_buf(buf)
   local win = tour_win(buf, move)
   if move then
@@ -3588,12 +3650,8 @@ local function do_focus(a, move)
     enter_win(win)
   end
   local shown = win ~= nil and api.nvim_win_get_buf(win) == buf
-  if a.dim then
-    for _, g in ipairs(gaps_of(merged, count)) do
-      for l = g[1], g[2] do
-        api.nvim_buf_set_extmark(buf, S.ns_focus, l - 1, 0, { end_row = l, end_col = 0, hl_group = "NvtourDim", hl_eol = true, priority = 200 })
-      end
-    end
+  if dim then
+    draw_dim(buf, merged)
   elseif shown then
     apply_folds(buf, win)
   end
@@ -3605,11 +3663,18 @@ local function do_focus(a, move)
   end
   return {
     ok = true,
-    file = a.file,
+    file = file,
     ranges = merged,
-    mode = a.dim and "dim" or "fold",
-    deferred = (not a.dim and not shown) or nil,
+    mode = dim and "dim" or "fold",
+    deferred = (not dim and not shown) or nil,
   }
+end
+
+--- Fold or dim the ranges of `a` in its file.
+local function do_focus(a, move)
+  local buf = load_buf(a.file)
+  local ranges = focus_ranges(a, buf)
+  return focus_buf(buf, a.file, ranges, a.context or 2, a.dim, move)
 end
 
 H.focus = function(a)
@@ -3617,6 +3682,39 @@ H.focus = function(a)
   -- Before the first step focus shows the file; during a tour the view stays on the current step
   -- and folds are applied when the file is shown (by a step or by the user).
   return do_focus(a, S.tour.current == 0)
+end
+
+--- Fold or dim every toured file (with `a.file`, only that file) to the lines of its steps, and keep
+--- it so: the folds follow the steps (see refocus_steps). One result per buffer, in tour order. Diagram
+--- steps and lost steps do not count; a buffer of a git ref does. The view does not move.
+H.focus_steps = function(a)
+  S.workspace = a.workspace or S.workspace
+  sync_all()
+  local order, ranges = {}, {}
+  for _, st in ipairs(S.tour.steps) do
+    if not st.diagram and not st.lost and (not a.file or st.file == a.file) then
+      local buf = step_buf(st)
+      if not ranges[buf] then
+        ranges[buf] = { file = st.file, ref = st.ref, ranges = {} }
+        order[#order + 1] = buf
+      end
+      local list = ranges[buf].ranges
+      list[#list + 1] = { st.l1, st.l2 }
+    end
+  end
+  if #order == 0 then
+    fail(a.file and ("focus --steps: no step is in " .. a.file) or "focus --steps: the tour has no steps", 6)
+  end
+  local ctx = a.context or 2
+  local results = {}
+  for _, buf in ipairs(order) do
+    local g = ranges[buf]
+    local res = focus_buf(buf, g.file, g.ranges, ctx, a.dim, false, { context = ctx, dim = a.dim and true or false })
+    S.focus[buf].ref = g.ref
+    res.ref = g.ref
+    results[#results + 1] = res
+  end
+  return { ok = true, focus = results }
 end
 
 H.unfocus = function(a)
@@ -4085,7 +4183,7 @@ H.status = function()
   end
   local focus = {}
   for _, f in pairs(S.focus) do
-    focus[#focus + 1] = { file = f.file, ranges = f.ranges, mode = f.dim and "dim" or "fold" }
+    focus[#focus + 1] = { file = f.file, ref = f.ref, ranges = f.ranges, mode = f.dim and "dim" or "fold", from_steps = f.from_steps and true or nil }
   end
   local diffs = 0
   for _, t in ipairs(S.diff_tabs) do

@@ -96,6 +96,7 @@ Use this when the user asks about code ("this", "here", "this chunk") but gives 
 ## Focus
 
 - Concept spans a long file: run `nvtour focus FILE:a-b c-d` once per file.
+- After a long tour in long files, run `nvtour focus --steps` once. It folds every toured file to the lines of its steps, and it stays in sync when you add, edit or remove steps (or the user edits). Use `--dim` when the user has manual folds. Run it again when a new file gets its first step.
 - During a tour, focus does not move the view; the folds appear when that file is shown.
 - Fold mode removes the user's own manual folds in that window. Use `--dim` if the user has manual folds or the surrounding code matters. `nvtour unfocus` undoes it.
 

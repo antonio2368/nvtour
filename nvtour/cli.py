@@ -206,11 +206,15 @@ def build_parser() -> argparse.ArgumentParser:
     cmd("first", "go to the first step")
     cmd("last", "go to the last step")
 
-    p = cmd("focus", "fold or dim everything except the given ranges")
-    p.add_argument("spec", metavar="FILE:L1-L2|FILE:/TEXT/")
+    p = cmd("focus", "fold or dim everything except the given ranges (or the ranges of the steps)")
+    p.add_argument("spec", nargs="?", metavar="FILE:L1-L2|FILE:/TEXT/|FILE",
+                   help="the first range; with --steps: only this file (no range)")
     p.add_argument("more", nargs="*", metavar="L3-L4|/TEXT/")
     p.add_argument("--context", type=non_negative_int, default=2)
     p.add_argument("--dim", action="store_true")
+    p.add_argument("--steps", action="store_true",
+                   help="focus every toured file (or only FILE) on the ranges of its steps; the focus follows "
+                        "the steps when they change (unfocus ends it)")
 
     p = cmd("unfocus", "undo focus")
     p.add_argument("file", nargs="?")
@@ -679,7 +683,24 @@ def build_request(args: argparse.Namespace, workspace: str) -> tuple[str, dict[s
         return c, {"keep_buffers": args.keep_buffers or None}
     if c in ("next", "prev", "first", "last", "where", "diff-close", "status"):
         return c, {}
+    if c == "focus" and args.steps:
+        if args.more:
+            raise NvtourError(EXIT_USAGE, "focus --steps: the ranges come from the steps; give no range")
+        path = None
+        if args.spec:
+            path = ranges.resolve_path(args.spec)
+            if not os.path.isfile(path):
+                try:
+                    ranges.parse_spec(args.spec)
+                except NvtourError:
+                    pass  # not a range: the file is missing
+                else:
+                    raise NvtourError(EXIT_USAGE, "focus --steps: give a plain FILE, without a range")
+            ranges.require_file(path)
+        return "focus_steps", {**base, "file": path, "context": args.context, "dim": args.dim or None}
     if c == "focus":
+        if not args.spec:
+            raise NvtourError(EXIT_USAGE, "focus: give FILE:L1-L2 (or --steps)")
         path, l1, l2, query = ranges.parse_spec(args.spec)
         ranges.require_file(path)
         rs = [focus_range(l1, l2, query)] + [focus_range(*ranges.parse_range_or_query(r)) for r in args.more]
@@ -724,6 +745,19 @@ def fmt_moved(s: Mapping[str, Any]) -> str:
     if s.get("orig_l1") is not None and (s["orig_l1"], s.get("orig_l2")) != (s["l1"], s["l2"]):
         return f"  (was {fmt_range(s['orig_l1'], s.get('orig_l2') or s['orig_l1'])})"
     return ""
+
+
+def fmt_focus(f: Mapping[str, Any], workspace: str, status: bool = False) -> str:
+    """``focus: file ranges (mode)``; a focus from the steps says so in ``status`` and a file at a git
+    ref has `` @REF``. Right after the command a focus that waits for its file says so."""
+    rs = " ".join(fmt_range(a, b) for a, b in f["ranges"])
+    at = f" @{f['ref']}" if f.get("ref") else ""
+    note = ""
+    if f.get("from_steps") and status:
+        note = ", from steps"
+    elif f.get("deferred"):
+        note = "; applied when the file is shown"
+    return f"focus: {display_path(f['file'], workspace)}{at} {rs} ({f['mode']}{note})"
 
 
 def format_step(res: Mapping[str, Any], workspace: str, prefix: str = "") -> str:
@@ -771,9 +805,9 @@ def format_result(args: argparse.Namespace, res: dict[str, Any], workspace: str)
     if c == "start":
         return f"started: {res.get('title') or 'Walkthrough'}{fmt_sheet(res)}"
     if c == "focus":
-        rs = " ".join(fmt_range(a, b) for a, b in res["ranges"])
-        later = "; applied when the file is shown" if res.get("deferred") else ""
-        return f"focus: {display_path(res['file'], workspace)} {rs} ({res['mode']}{later})"
+        if args.steps:
+            return "\n".join(fmt_focus(f, workspace) for f in res["focus"])
+        return fmt_focus(res, workspace)
     if c == "unfocus":
         return f"unfocused {res.get('count', 0)} buffer(s)"
     if c == "diff":
@@ -838,8 +872,7 @@ def format_status(res: dict[str, Any], workspace: str) -> str:
     if res.get("modified_files"):
         out.append("modified: " + ", ".join(display_path(p, workspace) for p in res["modified_files"]))
     for f in res.get("focus") or []:
-        rs = " ".join(fmt_range(a, b) for a, b in f["ranges"])
-        out.append(f"focus: {display_path(f['file'], workspace)} {rs} ({f['mode']})")
+        out.append(fmt_focus(f, workspace, status=True))
     for d in res.get("diagrams") or []:
         out.append(f"diagram: {d['name']} ({d['count']} lines, {d['links']} link(s))")
     panel = res.get("panel") or {}

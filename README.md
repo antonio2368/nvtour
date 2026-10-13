@@ -40,6 +40,7 @@ Neovim in parallel. You step through the tour with `]w` / `[w`.
 | 🔎 **Ranges by text** | `FILE:/TEXT/` finds the lines by their text, so the agent does not count lines. |
 | 📑 **Chapters** | `chapter "Name"` groups the steps of a long tour under headings. `]c` / `[c` move between chapters. |
 | 📦 **A tour in one call** | `nvtour apply` reads a whole tour (steps, chapters, focus, diagrams, panel) from a TOML file on stdin. |
+| 🔭 **Focus on the steps** | `focus --steps` folds every toured file to the lines of its steps. The folds follow the steps when they change. |
 | ⚓ **Steps follow your edits** | When you edit a file during a tour, the steps move with the lines. `status` reports a step that moved or was lost. |
 
 > [!IMPORTANT]
@@ -196,6 +197,24 @@ so the step moves with the code. The range, the quickfix list, the panel and `]w
   is gone. Run `nvtour status` after files changed.
 - A diagram step whose `--expect` text is gone after `diagram NAME` is lost too.
 - Only anchors (extmarks) are used. The files and buffers are never changed.
+
+### Focus on the steps
+
+After a long tour in long files, run one command: `nvtour focus --steps [FILE] [--context N] [--dim]`.
+It folds (or, with `--dim`, dims) every toured file to the lines of its steps, plus `N` lines of context
+(default 2). With `FILE` it does only that file. The view does not move.
+
+- The focus **follows the steps**. When you add, edit, remove or move a step (also with an edit of the
+  file by you), the folds are made again. When the last step of a file is gone or lost, the focus of that
+  file ends.
+- A file that gets its first step later is not focused. Run `focus --steps` again to include it.
+- Diagram steps and lost steps do not count. A step at a git ref focuses its read-only buffer.
+- `nvtour focus FILE:L1-L2` on a file replaces its focus from the steps. `unfocus [FILE]`, `start` and
+  `clear` end it.
+- The output has one line per file: `focus: a.cpp 9-13 29-31 (fold)`. `status` adds `from steps`:
+  `(fold, from steps)`. In JSON, `focus --steps` returns `{"ok": true, "focus": [...]}`: one entry per file.
+- Exit 6 when no step is in the tour or in `FILE`. Exit 2 when you give a range with `--steps`.
+- Fold mode removes manual folds in the window of the file. Use `--dim` if you have manual folds.
 
 ### Links between steps
 
@@ -510,6 +529,7 @@ EOF
 | command | what it does |
 |---|---|
 | `focus FILE:L1-L2 [L3-L4 ...] [--context N] [--dim]` (a range can be `/TEXT/` too), `unfocus [FILE]` | fold or dim the rest of a file |
+| `focus --steps [FILE] [--context N] [--dim]` | fold or dim every toured file (or FILE) to the lines of its steps; the focus follows the steps (see [Focus on the steps](#focus-on-the-steps)) |
 | `diff FILE (--ref REF\|--file PATH\|--stdin) [--title]`, `diff-close` | read-only diff tab |
 | `diagram NAME [FILE\|-] [--format mermaid\|dot\|easy\|text] [--link TEXT=FILE:L1[-L2]\|FILE:/text/]... [--ascii] [--header N] [--split SIDE] [--no-show]` | render a diagram above the code (see [Diagrams](#diagrams)) |
 | `clear [--keep-buffers]` | remove everything nvtour created |

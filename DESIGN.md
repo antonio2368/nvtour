@@ -151,6 +151,7 @@ nvtour chapter NAME [--at N] | nvtour chapter --remove N | nvtour chapter --list
 nvtour goto N | nvtour next | nvtour prev | nvtour first | nvtour last
 nvtour status
 nvtour focus FILE:L1-L2 [L3-L4 | /TEXT/... ...] [--context N] [--dim]
+nvtour focus --steps [FILE] [--context N] [--dim]
 nvtour unfocus [FILE]
 nvtour diff FILE (--ref GITREF | --file PATH | --stdin) [--title TEXT]
 nvtour diff-close
@@ -163,7 +164,8 @@ nvtour doctor
 
 Range syntax: `path:L1` (single line), `path:L1-L2` or `path:L1,L2`; `path:L:COL` is accepted and the
 column is ignored (unless a file literally named `path:L` exists). `focus` takes one file and one or
-more ranges; extra bare `L3-L4` arguments apply to the same file.
+more ranges; extra bare `L3-L4` arguments apply to the same file. With `--steps` the argument is a plain
+FILE (or none) and a range is exit 2 (§8, "Focus from the steps").
 
 **Ranges by text.** A range can be named by the text of its lines (plain text, not a regex):
 
@@ -259,7 +261,7 @@ msgpack) and `resolved_from` instead of `l1` and `l2`.
   clamp and say `already at last step`). `prev` before any jump goes to step 1. Prints the same
   lines as `step`. A lost step (§6, "Steps follow edits") makes `goto` fail with exit 6;
   `next`, `prev`, `first` and `last` skip it.
-- **status** — the tour (title, steps, current), focus, panel, diff tabs and installed keys. Read only.
+- **status** — the tour (title, steps, current), focus (with `from_steps`), panel, diff tabs and installed keys. Read only.
   Steps follow the edits of the user (§6, "Steps follow edits"): the lines are the current ones, a
   step that moved shows `(was L1-L2)`, a step whose lines were deleted shows `(lost: reason)`, and
   `modified: a.cpp, b.cpp` lists the files whose buffer differs from disk (`modified_files` and
@@ -298,7 +300,10 @@ M.state = {
   ns_focus = nvim_create_namespace("nvtour_focus"),
   panel = { buf = nil, win = nil, text = {}, user_closed = false },
   focus = { [bufnr] = { ranges = {...}, dim = bool, file = path,
-                        saved = { [winid] = { foldmethod=, foldenable=, foldlevel=, foldminlines= } } } },
+                        saved = { [winid] = { foldmethod=, foldenable=, foldlevel=, foldminlines= } },
+                        anchors = { { id, tail } ... },  -- nil for a focus from the steps
+                        from_steps = { context = n, dim = bool },  -- nil for a plain focus
+                        ref = "v1" } },  -- file at a git ref (a focus from the steps only)
   pending_folds = { [winid] = { [bufnr] = saved fold options } }, -- restored on BufWinEnter
   diff_tabs = { tabpage handles },
   keys = { [action] = lhs },  -- the keys that were installed
@@ -520,8 +525,8 @@ real file.
 **Lifetime.** `clear` and `start` delete the ref buffers (they delete every `nvtour://` buffer) and
 empty `state.refs`. A ref buffer that no step uses after `edit`/`remove` stays until then.
 
-**Not supported for refs:** `focus` (it takes a working tree file) and `diff` (it compares the
-working tree buffer). Language servers: most configurations do not attach to `nofile` buffers; one
+**Not supported for refs:** `focus FILE:...` (it takes a working tree file; `focus --steps` does focus
+the ref buffers of steps) and `diff` (it compares the working tree buffer). Language servers: most configurations do not attach to `nofile` buffers; one
 that does can show diagnostics for the old code.
 
 ### Links between steps
@@ -616,7 +621,7 @@ The user can edit a buffer during a tour. The extmarks of a step move with the e
   (not `rerender_all`: an edit in one file of a tour across 10 files does not draw the other 9), then
   the quickfix list and the panel are updated. The current step in another buffer is drawn again when
   the step after it is in this buffer (its "next" line shows the line). The focus ranges of the buffer
-  have anchors too; when they changed, the folds are made again (after `InsertLeave` while the user
+  have anchors too (a focus from the steps does not: §8); when they changed, the folds are made again (after `InsertLeave` while the user
   types). The callbacks call through `_G.nvtour`, so they survive a runtime upgrade.
   `on_lines` returns `true` (detach) when the buffer has no more steps and no focus: this is how
   `clear` detaches.
@@ -778,6 +783,32 @@ range (the first one and each extra one) can be a text range (§4, "Ranges by te
   them on the next `BufWinEnter` of that buffer in that window (another buffer's options are never
   touched). Clear `ns_focus` extmarks, drop the state. FILE is compared with the stored path (no
   `bufnr()` pattern). With no FILE, unfocus all.
+
+**Focus from the steps.** `focus --steps [FILE] [--context N] [--dim]` (`H.focus_steps`) focuses every
+toured file, or only FILE, on the ranges of its steps. It groups `state.tour.steps` by buffer (diagram
+steps and lost steps are skipped; ref buffers are included, as they are normal buffers with folds) and
+calls `focus_buf(buf, file, ranges, ctx, dim, move, from_steps)` once per buffer. `H.focus` calls the same
+function once, so there is one implementation of the folds and the dim. `move` is `false`: the view stays.
+The result is `{ ok, focus = { per file: file, ref, ranges, mode, deferred } }`; the CLI prints one
+`focus: file ranges (mode)` line per entry (`file @REF` for a ref buffer). No step in the tour or in FILE
+is exit 6; a range together with `--steps` is exit 2 (in the CLI).
+- **Sticky.** `focus_buf` sets `state.focus[buf].from_steps = { context, dim }`. `refocus_steps(buf)`
+  reads the ranges of the steps again (`step_ranges`, `merge_ranges`) and, when they changed, makes the
+  folds (`refold`) or the dim marks (`draw_dim`) again. It runs from `rerender_all` for every buffer that
+  has such a focus (so `step`, `edit`, `remove` and `apply` work with it, and an `edit` that
+  moves a step to another file changes both files) and from `sync_fire` when the steps of a buffer
+  moved or were lost (a user edit, §6). When no step is left in the buffer, `refocus_steps` calls
+  `unfocus_buf`. When the ranges are the same, nothing is done, so the folds that the user opened stay.
+- **No anchors of its own.** A plain focus has anchors for its ranges. A focus from the steps has none
+  (`anchors = nil`; `sync_focus` and `reanchor_buf` skip it): its ranges come from `step.l1` and `step.l2`,
+  which `sync_step` reads from the anchors of the steps. Two sets of anchors would fight about the same
+  lines: after an edit the two sets could give different ranges, and the folds would follow the one that
+  was read last.
+- **Scope.** Only the buffers that were focused stay in sync. A file that gets its first step after
+  `focus --steps` is not focused; run the command again (it is safe to repeat: it restores the fold
+  options and takes them again). `focus FILE:...` on the buffer replaces the focus (it is no longer
+  from the steps); `unfocus`, `start`, `clear` and `reset` end it. `status` shows `from_steps = true`
+  and the text `(fold, from steps)` or `(dim, from steps)`. `apply` has no `focus --steps` key.
 
 ## 9. Read-only diff
 
