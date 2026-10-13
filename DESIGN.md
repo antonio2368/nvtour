@@ -146,6 +146,7 @@ nvtour edit N [FILE:L1[-L2] | FILE:/TEXT/... [--ref GITREF] | L1[-L2] | /TEXT/..
             [--label TEXT] [--role ROLE] [--expect TEXT]... [--via TEXT] [--from N]
             [--suggest TEXT | --suggest -] [--jump]
 nvtour remove N
+nvtour chapter NAME [--at N] | nvtour chapter --remove N | nvtour chapter --list
 nvtour goto N | nvtour next | nvtour prev | nvtour first | nvtour last
 nvtour status
 nvtour focus FILE:L1-L2 [L3-L4 | /TEXT/... ...] [--context N] [--dim]
@@ -234,6 +235,17 @@ msgpack) and `resolved_from` instead of `l1` and `l2`.
   `FILE:L1[-L2] --ref GITREF` on that ref. `--ref` without a location is a usage error (exit 2).
   `edit --sheet SHEET#STEP` changes the sheet link, `--sheet ''` removes it. Links stay with their
   steps when the steps are renumbered; `edit` without `--sheet` keeps the link.
+- **chapter** — a heading in front of a step (§5, "Chapters"; §7; §11). `chapter NAME` is pending: it
+  takes the next step that is added, at any place (also with `step --at`). `--at N` puts it in front of
+  step N; N equal to steps + 1 is pending and a larger N is exit 6 (like `step --at`). Another chapter at
+  that step gets the new name (at most one chapter starts at a step, and one is pending). `--remove N`
+  removes the chapter that starts at step N (N = steps + 1: the pending chapter) and is exit 6 when there is
+  none. `--list` prints the chapters in tour order. Each action prints one line: `chapter "Name" at step 3`,
+  `chapter "Name" pending (next step)` (with `, replacing "Old"` when a name was replaced), `removed chapter
+  at step 3`, `removed pending chapter`; `--list` prints one `chapter ...` line per chapter, or `no chapters`.
+  `--json` has `name`, `step` (a number, `null` when pending), `pending`, `replaced`, `removed` and the
+  list `chapters = [{ name, step }]`. The name is cut to one line (white space becomes one space). Exactly
+  one of NAME, `--remove` and `--list` is needed (exit 2), and `--at` goes with NAME only.
 - **goto / next / prev / first / last** — move the current step (wraps at ends is **not** desired;
   clamp and say `already at last step`). `prev` before any jump goes to step 1. Prints the same
   lines as `step`. A lost step (§6, "Steps follow edits") makes `goto` fail with exit 6;
@@ -244,7 +256,9 @@ msgpack) and `resolved_from` instead of `l1` and `l2`.
   `modified: a.cpp, b.cpp` lists the files whose buffer differs from disk (`modified_files` and
   per step `modified`, `orig_l1`, `orig_l2`, `lost`, `lost_reason` in `--json`).
   A step with a sheet link has `sheet` (`SHEET#STEP`) in `--json` and `↔ sheet SHEET#STEP` in the text;
-  `tour_sheet` and the line `sheet: SHEET` show the sheet of the tour.
+  `tour_sheet` and the line `sheet: SHEET` show the sheet of the tour. `chapters = [{ name, step }]` is
+  in `--json` (`step` is `null` when pending); the text has a line `## Name` before the step that starts the
+  chapter, and `## Name (pending: the next step added)` at the end for a pending chapter.
 - **focus / unfocus** — §8.
 - **diff / diff-close** — §9.
 - **diagram** — renders a diagram into a read-only buffer that steps can point to (`step --diagram`);
@@ -270,7 +284,7 @@ printed on stderr as `warning: ...`.
 ```lua
 M.VERSION = (...) or "dev" -- source hash passed by the client
 M.state = {
-  tour = { title = "", steps = {}, current = 0, qf_id = nil },
+  tour = { title = "", steps = {}, current = 0, qf_id = nil, chapters = {} },
   ns_steps = nvim_create_namespace("nvtour_steps"),
   ns_focus = nvim_create_namespace("nvtour_focus"),
   panel = { buf = nil, win = nil, text = {}, user_closed = false },
@@ -305,6 +319,26 @@ gave. `query` is the text range that gave the lines (nil when the agent gave num
 but not used after the step was made. A step made by an older runtime has none of these fields; every
 use of them accepts `nil`.
 `diagram` is the name of the diagram of a step on a diagram (§10), else nil.
+
+### Chapters
+
+`tour.chapters = { { name, step = <step table> | nil } }`. A chapter is a heading in front of a step; it
+holds that step and the steps after it up to the next chapter. The steps before the first chapter are in
+no chapter. Like `from`, a chapter points at the step table, so an insert or a remove needs no
+renumbering. The list is in tour order, pending chapter (no `step`) last; `sort_chapters()` restores the
+order when a pending chapter takes a step. At most one chapter starts at a step and one is pending
+(`set_chapter(name, step)` replaces the name). When a step is removed, its chapter moves to the step now at
+that index; with no such step, or when that step starts a chapter already, it is dropped. `start`
+and `clear` set a new list. `set_chapter(name, step)` is also `M.set_chapter` for other code (the
+batch `apply`). A tour made by an older runtime has no `chapters` field: `chapters()` creates it on
+first use, so a reload during a tour is safe.
+
+`]c` and `[c` (`next_chapter`, `prev_chapter`) use the first step of each chapter that is not lost
+(a chapter of lost steps only is skipped). `]c` goes to the first start after the current step. `[c`
+goes to the last start before the current step: inside a chapter, not at its first step, that is the
+start of the chapter (as `[[` goes to the start of the section); at the first step of a chapter it is the
+chapter before. At the end they answer `already in the last chapter` / `already at the first chapter`;
+with no chapter, `no chapters` (exit 6 in the result, a warning for a key).
 `suggest` is a list of lines (nil when there is no suggestion).
 `ref` and `sha` are nil for a step on the working tree. `from` is the step table of a `--from N`
 link (not a number, so it stays correct when steps are inserted or removed); a link to a removed
@@ -663,6 +697,7 @@ Rendered content:
 ```
 # <title or "Walkthrough">                    2/3      ← progress: virt_text, NvtourPanelProgress
 
+## Why does it fail?                                    ← chapter: NvtourPanelChapter (link: Title)
 src/a.cpp                                               ← NvtourPanelFile
 ▶ 1. ✗ 412-415  dangling iterator  ↔ arch#cache      ← sheet link (--sheet): NvtourVia
     ↓ the cleanup thread erases the entry               ← --via of step 2: NvtourVia
@@ -678,14 +713,20 @@ src/a.cpp
 ```
 
 Steps keep the tour order; a file name line starts each run of steps in the same file (for a ref
-step: in the same file at the same commit, shown as `path @ref`). `N. <mark>`
+step: in the same file at the same commit, shown as `path @ref`). A chapter is a line `## Name`
+before its first step (and after an empty line, unless it is the first line); the file name line
+starts again after it. The link line (`↓ [from N: ]via`) of the first step of a chapter stays: it
+comes after the heading and before the file name line (a heading ends the run of a file, but not the
+link from the step before). `<CR>` on the chapter line goes to the first step of the chapter. The winbar
+shows `Name · 3/12 ...` for a step in a chapter; the name is shown only when the left part fits with it
+(the label is cut after the name is left out). `N. <mark>`
 is highlighted with `NvtourSign<Role>`; marks: `✗` fault, `→` flow, `✓` fix, `○` context, `•` info.
 A step without a label shows the first line of its note (markers removed, cut to 60 cells); the
 quickfix item text uses the same. Before the first jump the progress is `N step(s)`. The footer line
-lists only the keys that were installed; the keys are inline code so markdown does not read
+lists only the keys that were installed (the chapter keys: only when there are chapters); the keys are inline code so markdown does not read
 `[W first · ]W` as a link. A step with a `--via` or `--from` link gets a line `↓ [from N: ]<via>`
 before it, and before its file name line, so a link to another file shows before the file changes.
-`<CR>` on a file name line or a link line jumps to the step after it. The panel opens in the tab of the tour
+`<CR>` on a chapter line, a file name line or a link line jumps to the step after it. The panel opens in the tab of the tour
 window; a panel window left in another tab is closed first.
 
 Paths shown relative to `W` (passed from Python as `workspace`). The current step line gets an
@@ -857,11 +898,16 @@ and skip that key. `vim.g.nvtour_keys` is read (missing entries use the defaults
 ```lua
 DEFAULT_KEYS = {
   next = "]w", prev = "[w", first = "[W", last = "]W", panel = "<leader>wp", clear = "<leader>wc",
+  next_chapter = "]c", prev_chapter = "[c",
 }
 ```
 
+`]c` and `[c` are keys of Vim too (next and previous change). They are free when `maparg` is empty, which a
+built-in key is, so nvtour takes them; in a window in diff mode they run the built-in key
+(`normal! ]c`), so `nvtour diff` tabs keep working.
+
 User commands (defined on load, always available): `:NvtourNext`, `:NvtourPrev`, `:NvtourFirst`,
-`:NvtourLast`, `:NvtourGoto N`, `:NvtourPanel`, `:NvtourClear`.
+`:NvtourLast`, `:NvtourNextChapter`, `:NvtourPrevChapter`, `:NvtourGoto N`, `:NvtourPanel`, `:NvtourClear`.
 
 The quickfix list also works (`:cnext`, `:cprev`, `:copen`); it moves the cursor only, not the
 current step.
@@ -934,4 +980,3 @@ exit code.
   supports the kitty graphics protocol. Not for alacritty.
 - MCP stdio wrapper exposing the same commands as tools.
 - tmux: focus the pane running the selected nvim.
-- Step groups / chapters in the panel for long concept tours.

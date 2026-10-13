@@ -38,6 +38,7 @@ Neovim in parallel. You step through the tour with `]w` / `[w`.
 | 🗺️ **Diagrams as steps** | Renders Mermaid or Graphviz to Unicode text above the code. Steps can point to its lines, and `<CR>` on a label opens the code. |
 | ✅ **Self-checking ranges** | `--expect TEXT` stops a wrong line number before it shows the wrong code. |
 | 🔎 **Ranges by text** | `FILE:/TEXT/` finds the lines by their text, so the agent does not count lines. |
+| 📑 **Chapters** | `chapter "Name"` groups the steps of a long tour under headings. `]c` / `[c` move between chapters. |
 | ⚓ **Steps follow your edits** | When you edit a file during a tour, the steps move with the lines. `status` reports a step that moved or was lost. |
 
 > [!IMPORTANT]
@@ -84,8 +85,8 @@ Then ask your agent to *"walk me through this bug in nvim"*.
   the note through the range, so they do not look like code.
 - **Links:** `◇ b.cpp @origin/master (1a2b3c4d5e6f)` in the frame when the file or version changed, and
   below the range `╶─ → next 4 · c.cpp:10: <why>`. See [Links between steps](#links-between-steps).
-- **Winbar:** the position in the tour and where `]w` goes next.
-- **Panel:** the steps by file, the keys, and the summary.
+- **Winbar:** the position in the tour (with the chapter name) and where `]w` goes next.
+- **Panel:** the steps by file and chapter, the keys, and the summary.
 
 ### Roles
 
@@ -218,6 +219,47 @@ there, and where you are. The current step shows both:
   `--via` link. You know where `]w` goes, and why, before you press it.
 - **In the panel,** each link is a line `↓ [from N: ]text` before the step, so the panel reads as a chain.
 - **Jumplist:** each jump adds the previous position to the jumplist, so `<C-o>` goes back.
+
+### Chapters
+
+A tour of more than 8 steps is easier to follow in groups. A chapter is a heading in front of a step. It
+holds that step and the steps after it, up to the next chapter.
+
+```bash
+nvtour chapter "Why does it fail?"            # pending: the next step added starts the chapter
+nvtour step src/cache.cpp:88 --label erase
+nvtour step src/cache.cpp:120 --label race
+nvtour chapter "How do we fix it?"
+nvtour step src/cache.cpp:140 --label lock
+nvtour chapter "Fixes" --at 2                 # a heading in front of step 2 (it exists already)
+nvtour chapter --list
+nvtour chapter --remove 2
+```
+
+- **`chapter "Name"`** is pending: the next step that is added starts the chapter, wherever that step is
+  inserted (also with `step --at`). Only one chapter can be pending; a second name replaces the first.
+- **`chapter "Name" --at N`** puts the heading in front of step N. `--at` equal to the number of steps + 1 is
+  pending. A larger number is exit 6. If a chapter starts at step N already, the new name replaces the old
+  name.
+- **`chapter --remove N`** removes the chapter that starts at step N (the steps stay). With N equal to the
+  number of steps + 1 it removes the pending chapter. `chapter --list` shows the chapters in tour order, and
+  `status` shows them too (`--json`: `chapters = [{ name, step }]`, `step` is `null` when pending).
+- **A chapter follows its step.** An insert or a `remove` of another step does not move the heading. When the
+  step of a chapter is removed, the heading moves to the step that is now at that place. When there is no such
+  step, or that step starts a chapter already, the chapter is dropped.
+- **In the panel** a chapter is a line `## Name` (group `NvtourPanelChapter`) before its first step. The file
+  name line starts again after it. The `↓ via` line of that step stays: it is after the heading and before the
+  file name. `<CR>` on the line goes to the first step of the chapter. The progress
+  text stays `3/12`.
+- **In the winbar** the name is shown before the position: `Name · 3/12`. When the window is narrow, the
+  name is the first part that is left out.
+- **Keys:** `]c` goes to the first step of the next chapter. `[c` goes to the first step of the chapter that
+  you are in. When you are at that step already, it goes to the chapter before. A chapter whose steps are
+  all lost is skipped. In a window in diff mode, `]c` and `[c` keep the meaning of Vim (next or previous
+  change). Without chapters they show `no chapters`.
+- `step`, `goto` and the other commands print the same one line as before. `--json` has `chapter` (the name)
+  for the step that is shown.
+- `start` and `clear` remove all chapters.
 
 ### Sheets
 
@@ -368,6 +410,7 @@ nvtour step src/cache.cpp:31-38 --label "load from the store" --via 'a miss call
 | `edit N [FILE:L1[-L2]\|FILE:/TEXT/ [--ref GITREF]] [--note] [--label] [--role] [--expect] [--via] [--from N] [--suggest] [--sheet SHEET#STEP] [--jump]` | change a step (`''` removes a label, note, link text, suggestion, sheet link or the `--expect` texts; a new `--expect` list replaces the old one; `--from 0` links from the step before again; a new location without `--ref` is on the working tree) |
 | `step L1[-L2] --diagram NAME [...]`, `edit N L1[-L2] --diagram NAME` | a step on lines of a diagram |
 | `remove N` | remove a step |
+| `chapter "NAME" [--at N]`, `chapter --remove N`, `chapter --list` | a heading in front of step N, or of the next step added; remove one; list them (see [Chapters](#chapters)) |
 | `panel [TEXT\|-\|--file PATH] [--toggle] [--clear]` | side panel text |
 
 **Navigation and state**
@@ -405,16 +448,17 @@ is skipped.
 |---|---|
 | `]w` / `[w` | next / previous step |
 | `]W` / `[W` | last / first step |
+| `]c` / `[c` | first step of the next chapter / of this chapter (or the one before) |
 | `<leader>wp` | toggle panel |
 | `<leader>wc` | clear everything |
 
-**In the panel:** `<CR>` jumps to the step under the cursor (on a file name or a link line: the step after it), `q` closes the
-panel.
+**In the panel:** `<CR>` jumps to the step under the cursor (on a chapter line, a file name or a link line: the
+step after it), `q` closes the panel.
 
 **In a diagram:** `<CR>` on an underlined link text opens its code; elsewhere it moves down as usual.
 
-**Commands:** `:NvtourNext`, `:NvtourPrev`, `:NvtourFirst`, `:NvtourLast`, `:NvtourGoto N`, `:NvtourPanel`,
-`:NvtourClear`.
+**Commands:** `:NvtourNext`, `:NvtourPrev`, `:NvtourFirst`, `:NvtourLast`, `:NvtourNextChapter`,
+`:NvtourPrevChapter`, `:NvtourGoto N`, `:NvtourPanel`, `:NvtourClear`.
 
 **Quickfix:** the list `nvtour: <title>` works too (`:cnext`, `:cprev`), but it only moves the cursor. It does
 not change the current step of the tour.
@@ -426,7 +470,8 @@ not change the current step of the tour.
 Set these in `init.lua` before the first step:
 
 ```lua
-vim.g.nvtour_keys = { next = "]w", prev = "[w", first = "[W", last = "]W", panel = "<leader>wp", clear = "<leader>wc" }
+vim.g.nvtour_keys = { next = "]w", prev = "[w", first = "[W", last = "]W", panel = "<leader>wp", clear = "<leader>wc",
+                      next_chapter = "]c", prev_chapter = "[c" }
 vim.g.nvtour_auto_panel = false               -- do not open the panel on the first step
 vim.g.nvtour_steal_focus = "unless_terminal"  -- "always" | "never"; default keeps the focus in a terminal window
 vim.g.nvtour_winbar = false                   -- do not show the tour position in the winbar of the tour window
@@ -437,7 +482,7 @@ vim.g.nvtour_sheet_cmd = "sheet"              -- the command for steps with --sh
 ```
 
 - **Winbar:** set only in a window that has no winbar of its own (from you or a plugin). `clear` removes it.
-  When the window is narrow, the "next" part is shortened or left out.
+  When the window is narrow, the "next" part is shortened or left out, and the chapter name goes first.
 - **Windows:** files are shown in a normal file window, never in a terminal, quickfix, help or other special
   window. When you type in a terminal window (for example a Claude Code split), the tour moves the file window
   but the terminal keeps the focus.
@@ -467,6 +512,7 @@ In the names below, `{...}` is one of `Fault`, `Flow`, `Fix`, `Context`, `Info`.
 | `NvtourNoteBg` | the band behind all nvtour lines (`nvtour_note_style = "band"`) |
 | `NvtourDim`, `NvtourFlash` | `focus --dim`, the flash after a jump |
 | `NvtourPanelCurrent`, `NvtourPanelFile`, `NvtourPanelProgress` | panel |
+| `NvtourPanelChapter` | the `## Name` line of a chapter in the panel, and the name in the winbar (links to `Title`) |
 | `NvtourLost` | `✗ lost` of a step whose lines were deleted (links to `DiagnosticError`) |
 
 The groups are defined with `default = true`, so a plain `vim.api.nvim_set_hl(0, "NvtourSignFault", {...})`

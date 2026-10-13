@@ -180,6 +180,13 @@ def build_parser() -> argparse.ArgumentParser:
     p = cmd("remove", "remove step N")
     p.add_argument("n", type=int)
 
+    p = cmd("chapter", "start a chapter (a heading) at a step, remove one, or list them")
+    p.add_argument("name", nargs="?", help="the name of the chapter")
+    p.add_argument("--at", type=int, metavar="N", help="start the chapter at step N (default: the next step added; "
+                   "steps + 1 is the same)")
+    p.add_argument("--remove", type=int, metavar="N", help="remove the chapter that starts at step N")
+    p.add_argument("--list", action="store_true", help="list the chapters in tour order")
+
     cmd("status", "show the tour, focus, panel and keys")
 
     p = cmd("goto", "go to step N")
@@ -393,6 +400,15 @@ def build_request(args: argparse.Namespace, workspace: str) -> tuple[str, dict[s
                            "split": args.split, "show": not args.no_show}
     if c == "remove":
         return "remove", {"n": args.n}
+    if c == "chapter":
+        modes = [args.name is not None, args.remove is not None, args.list]
+        if sum(modes) != 1:
+            raise NvtourError(EXIT_USAGE, 'chapter: give a name ("Name"), or --remove N, or --list')
+        if args.at is not None and args.name is None:
+            raise NvtourError(EXIT_USAGE, "chapter: --at goes with a name")
+        if args.name is not None and not args.name.strip():
+            raise NvtourError(EXIT_USAGE, "chapter: the name is empty")
+        return "chapter", {"name": args.name, "at": args.at, "remove": args.remove, "list": args.list or None}
     if c == "goto":
         return "goto", {"n": args.n}
     if c == "clear":
@@ -462,6 +478,8 @@ def format_result(args: argparse.Namespace, res: dict[str, Any], workspace: str)
         return f"removed step {res['removed']}; {res['total']} step(s) left"
     if c == "status":
         return format_status(res, workspace)
+    if c == "chapter":
+        return format_chapter(args, res)
     if c == "start":
         return f"started: {res.get('title') or 'Walkthrough'}{fmt_sheet(res)}"
     if c == "focus":
@@ -485,8 +503,24 @@ def format_result(args: argparse.Namespace, res: dict[str, Any], workspace: str)
     return json.dumps(res)
 
 
+def fmt_chapter(c: Mapping[str, Any]) -> str:
+    """``chapter "Name" at step 3`` or ``chapter "Name" pending (next step)``."""
+    where = f"at step {c['step']}" if c.get("step") else "pending (next step)"
+    return f'chapter "{c["name"]}" {where}'
+
+
+def format_chapter(args: argparse.Namespace, res: Mapping[str, Any]) -> str:
+    """One short line per action; ``--list`` has one line per chapter, in tour order."""
+    if args.list:
+        return "\n".join(fmt_chapter(c) for c in res.get("chapters") or []) or "no chapters"
+    if args.remove is not None:
+        return "removed pending chapter" if res.get("pending") else f"removed chapter at step {res['removed']}"
+    replaced = f', replacing "{res["replaced"]}"' if res.get("replaced") else ""
+    return fmt_chapter(res) + replaced
+
+
 def format_keys(keys: Mapping[str, str] | None) -> str:
-    order = ["next", "prev", "first", "last", "panel", "clear"]
+    order = ["next", "prev", "first", "last", "panel", "clear", "next_chapter", "prev_chapter"]
     return ", ".join(f"{keys[k]} {k}" for k in order if keys and keys.get(k)) or "(none installed)"
 
 
@@ -496,7 +530,10 @@ def format_status(res: dict[str, Any], workspace: str) -> str:
     out = [f"tour: {title} ({res['total']} step(s), current {res['current'] or '-'})"]
     if res.get("tour_sheet"):
         out.append(f"sheet: {res['tour_sheet']}")
+    heads = {c["step"]: c["name"] for c in res.get("chapters") or [] if c.get("step")}
     for s in res.get("steps") or []:
+        if s["n"] in heads:
+            out.append(f"  ## {heads[s['n']]}")
         mark = "▶" if s["n"] == res["current"] else " "
         label = f" {s['label']}" if s.get("label") else ""
         out.append(f"  {mark} {s['n']}. {fmt_loc(s, workspace)} [{s['role']}]{label}{fmt_sheet(s)}{fmt_moved(s)}")
@@ -507,6 +544,9 @@ def format_status(res: dict[str, Any], workspace: str) -> str:
         if s.get("suggest"):
             n = len(s["suggest"])
             out.append(f"       + suggested: {n} line{'' if n == 1 else 's'}")
+    for c in res.get("chapters") or []:
+        if not c.get("step"):
+            out.append(f"  ## {c['name']} (pending: the next step added)")
     if res.get("modified_files"):
         out.append("modified: " + ", ".join(display_path(p, workspace) for p in res["modified_files"]))
     for f in res.get("focus") or []:

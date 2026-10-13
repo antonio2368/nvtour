@@ -17,7 +17,7 @@ vim.o.hidden = true
 
 local function new_state()
   return {
-    tour = { title = "", steps = {}, current = 0, qf_id = nil },
+    tour = { title = "", steps = {}, current = 0, qf_id = nil, chapters = {} },
     ns_steps = api.nvim_create_namespace("nvtour_steps"),
     ns_focus = api.nvim_create_namespace("nvtour_focus"),
     ns_panel = api.nvim_create_namespace("nvtour_panel"),
@@ -55,8 +55,16 @@ for k, v in pairs(new_state()) do
 end
 M.state = S
 
-local DEFAULT_KEYS =
-  { next = "]w", prev = "[w", first = "[W", last = "]W", panel = "<leader>wp", clear = "<leader>wc" }
+local DEFAULT_KEYS = {
+  next = "]w",
+  prev = "[w",
+  first = "[W",
+  last = "]W",
+  panel = "<leader>wp",
+  clear = "<leader>wc",
+  next_chapter = "]c",
+  prev_chapter = "[c",
+}
 
 ---------------------------------------------------------------------------
 -- Highlights
@@ -133,6 +141,7 @@ local function define_highlights(force)
   set("NvtourDiagramLine", { fg = blend(fg, bg, 0.55) }) -- the box and arrow characters of a diagram
   set("NvtourDiagramLink", { fg = hl_attr("Directory", "fg") or fg, underline = true })
   set("NvtourPanelFile", { link = "Directory" })
+  set("NvtourPanelChapter", { link = "Title" }) -- the "## Name" line of a chapter (also in the winbar)
   set("NvtourPanelProgress", { link = "Comment" })
   set("NvtourLost", { link = "DiagnosticError" }) -- the "✗ lost" of a step whose lines are gone
   -- Lets init.lua re-apply overrides after a reload or colorscheme change:
@@ -1147,14 +1156,15 @@ end
 
 local step_goto -- forward declaration
 
-local KEY_ORDER = { "next", "prev", "first", "last", "panel", "clear" }
+local KEY_ORDER = { "next", "prev", "first", "last", "panel", "clear", "next_chapter", "prev_chapter" }
 
---- "]w next · [w prev · ..." for the keys that are installed.
+--- "]w next · [w prev · ..." for the keys that are installed (the chapter keys: when there are chapters).
 local function keys_line()
   local parts = {}
+  local chaptered = S.tour.chapters and #S.tour.chapters > 0
   for _, name in ipairs(KEY_ORDER) do
-    if S.keys[name] then
-      parts[#parts + 1] = "`" .. S.keys[name] .. "` " .. name
+    if S.keys[name] and (chaptered or not name:find("chapter", 1, true)) then
+      parts[#parts + 1] = "`" .. S.keys[name] .. "` " .. name:gsub("_", " ")
     end
   end
   return table.concat(parts, " · ")
@@ -1184,6 +1194,108 @@ local function sheet_label(link)
   return link.sheet .. "#" .. link.step
 end
 
+---------------------------------------------------------------------------
+-- Chapters
+---------------------------------------------------------------------------
+
+-- A chapter is a heading in front of a step: { name, step = <step table> | nil }. It points at the
+-- step table, so inserts and removes need no renumbering. A chapter without a step is pending: it
+-- takes the next step that is added. The list is kept in tour order (pending last), and at most one
+-- chapter starts at a step (and one is pending).
+
+--- The list of chapters; a tour made by an older runtime has none yet.
+local function chapters()
+  if not S.tour.chapters then
+    S.tour.chapters = {}
+  end
+  return S.tour.chapters
+end
+
+--- The chapter that starts at `step` (nil: none); with no step, the pending chapter.
+local function chapter_at(step)
+  for _, c in ipairs(chapters()) do
+    if c.step == step then
+      return c
+    end
+  end
+end
+
+--- Put the chapters in tour order again; a chapter whose step is not in the tour is dropped.
+local function sort_chapters()
+  local by, out = {}, {}
+  for _, c in ipairs(chapters()) do
+    if c.step then
+      by[c.step] = c
+    end
+  end
+  for _, s in ipairs(S.tour.steps) do
+    out[#out + 1] = by[s]
+  end
+  out[#out + 1] = chapter_at(nil)
+  S.tour.chapters = out
+end
+
+--- Start a chapter `name` at `step` (nil: pending). A chapter that already starts there gets the
+--- new name. Returns the chapter and the name it replaced.
+local function set_chapter(name, step)
+  local c = chapter_at(step)
+  if c then
+    local old = c.name
+    c.name = name
+    return c, old
+  end
+  c = { name = name, step = step }
+  table.insert(chapters(), c)
+  sort_chapters()
+  return c
+end
+M.set_chapter = set_chapter
+
+local function drop_chapter(chapter)
+  for i, c in ipairs(chapters()) do
+    if c == chapter then
+      table.remove(chapters(), i)
+      return
+    end
+  end
+end
+
+--- The chapter that `step` is in: the last one that starts at or before it (nil: none).
+local function chapter_of(step)
+  local by = {}
+  for _, c in ipairs(chapters()) do
+    if c.step then
+      by[c.step] = c
+    end
+  end
+  local found
+  for _, s in ipairs(S.tour.steps) do
+    found = by[s] or found
+    if s == step then
+      return found
+    end
+  end
+end
+
+--- Where each chapter can be entered, in tour order: { { chapter, n } }, n being the first step of the
+--- chapter that is not lost. A chapter of lost steps only is left out.
+local function chapter_starts()
+  local starts, steps, list = {}, S.tour.steps, chapters()
+  for i, c in ipairs(list) do
+    if c.step then
+      local nxt = list[i + 1]
+      local last = (nxt and nxt.step) and nxt.step.n - 1 or #steps
+      for n = c.step.n, last do
+        if not steps[n].lost then
+          starts[#starts + 1] = { chapter = c, n = n }
+          break
+        end
+      end
+    end
+  end
+  return starts
+end
+
 local function render_panel()
   if not valid_buf(S.panel.buf) then
     return
@@ -1202,8 +1314,26 @@ local function render_panel()
   -- step at a git ref: the same file at the same commit, "path @ref").
   -- A step with a --via or --from link gets a line "↓ [from N: ]via" before it (and before its
   -- file name line, so a link to another file is shown before the file changes).
-  local prev
+  local prev -- the step before, for the link line
+  local prev_doc -- the step before in the same run of a file, for the file name line (a heading ends the run)
+  local starts = {}
+  for _, c in ipairs(chapters()) do
+    if c.step then
+      starts[c.step] = c
+    end
+  end
   for _, s in ipairs(steps) do
+    local chapter = starts[s]
+    if chapter then
+      -- The heading comes first, then the link line of the step (if any), then the file name line again.
+      if #lines > 2 then
+        lines[#lines + 1] = ""
+      end
+      lines[#lines + 1] = "## " .. chapter.name
+      map[#lines] = s.n -- <CR> on the heading jumps to the first step of the chapter
+      hls[#hls + 1] = { #lines, 0, -1, "NvtourPanelChapter" }
+      prev_doc = nil
+    end
     local via = s.via and s.via ~= "" and s.via:gsub("%s+", " ") or nil
     if prev and (via or explicit_from(s)) then
       local src = source_of(s)
@@ -1217,12 +1347,12 @@ local function render_panel()
       end
       hls[#hls + 1] = { #lines, #lead + #from, -1, "NvtourVia" }
     end
-    if not (prev and same_doc(s, prev)) then
+    if not (prev_doc and same_doc(s, prev_doc)) then
       lines[#lines + 1] = doc_name(s)
       map[#lines] = s.n -- <CR> on the file name jumps to its first step
       hls[#hls + 1] = { #lines, 0, -1, "NvtourPanelFile" }
     end
-    prev = s
+    prev, prev_doc = s, s
     local mark = (s.n == S.tour.current) and "▶ " or "  "
     local head = ("%d. %s"):format(s.n, ROLE_MARK[s.role] or "•")
     local range = fmt_range(s)
@@ -2336,6 +2466,13 @@ function M.winbar()
   local label = (step.label and step.label ~= "") and (" · " .. step.label) or ""
   -- In a %{} item the window of the bar is the current window (g:statusline_winid is not set).
   local width = api.nvim_win_get_width(api.nvim_get_current_win())
+  -- The chapter ("Name · 3/12") is the first part to go: it is shown only when the whole left
+  -- side fits with it, before the label is cut.
+  local chapter = chapter_of(step)
+  chapter = chapter and (chapter.name .. " · ") or ""
+  if vim.fn.strdisplaywidth(" nvtour " .. chapter .. pos .. at .. label) > width - 1 then
+    chapter = ""
+  end
   local max_label = width - vim.fn.strdisplaywidth(" nvtour " .. pos .. at) - 1
   if vim.fn.strdisplaywidth(label) > max_label then
     label = max_label > 4 and (vim.fn.strcharpart(label, 0, max_label - 1) .. "…") or ""
@@ -2358,7 +2495,7 @@ function M.winbar()
   else
     rights = { "last step" .. (S.keys.first and (" · " .. S.keys.first .. " first") or ""), "last step", "" }
   end
-  local room = width - vim.fn.strdisplaywidth(" nvtour " .. pos .. at .. label) - 3
+  local room = width - vim.fn.strdisplaywidth(" nvtour " .. chapter .. pos .. at .. label) - 3
   local right = ""
   for _, r in ipairs(rights) do
     if vim.fn.strdisplaywidth(r) <= room then
@@ -2366,7 +2503,8 @@ function M.winbar()
       break
     end
   end
-  local out = (" nvtour %%#NvtourSign%s#%s%%*%s%s"):format(cap(step.role), pos, sl_escape(at), sl_escape(label))
+  local head = chapter ~= "" and ("%#NvtourPanelChapter#" .. sl_escape(chapter) .. "%*") or ""
+  local out = (" nvtour %s%%#NvtourSign%s#%s%%*%s%s"):format(head, cap(step.role), pos, sl_escape(at), sl_escape(label))
   return out .. "%=" .. sl_escape(right) .. (right ~= "" and " " or "")
 end
 
@@ -2385,6 +2523,11 @@ local function set_winbar(win)
     S.winbars[win] = loc == WINBAR and "" or loc
   end
   api.nvim_set_option_value("winbar", WINBAR, { scope = "local", win = win })
+end
+
+--- Draw the winbars again: their text can change without a jump (a chapter was added or removed).
+local function redraw_winbars()
+  pcall(vim.cmd, "redrawstatus!")
 end
 
 local function clear_winbars()
@@ -2518,6 +2661,22 @@ local function key_actions()
     end,
     last = function()
       run("last")
+    end,
+    -- ]c and [c are also the keys of vim to move between changes: in a window in diff mode they
+    -- keep that meaning.
+    next_chapter = function()
+      if vim.wo.diff then
+        pcall(vim.cmd, "normal! " .. vim.v.count1 .. "]c")
+      else
+        run("next_chapter")
+      end
+    end,
+    prev_chapter = function()
+      if vim.wo.diff then
+        pcall(vim.cmd, "normal! " .. vim.v.count1 .. "[c")
+      else
+        run("prev_chapter")
+      end
     end,
     panel = function()
       run("panel", { toggle = true })
@@ -2746,7 +2905,7 @@ local function reset(keep_panel)
     qf_id = nil
   end
   -- The list is reused by the next tour, so the 10-deep quickfix stack does not fill up.
-  S.tour = { title = "", steps = {}, current = 0, qf_id = qf_id }
+  S.tour = { title = "", steps = {}, current = 0, qf_id = qf_id, chapters = {} }
   S.refs = {} -- their buffers are deleted below with the other nvtour:// buffers
   S.diagrams = {} -- the same
   S.diagram_split = nil
@@ -2814,6 +2973,7 @@ local function step_result(step, extra)
     sha = step.sha,
     diagram = step.diagram,
     sheet = step.sheet and sheet_label(step.sheet) or nil,
+    chapter = (chapter_of(step) or {}).name,
     resolved_from = step.resolved_from,
     lost = step.lost or nil,
     text = step_text(step),
@@ -3065,6 +3225,11 @@ H.step = function(a)
     error(err, 0)
   end
   table.insert(steps, at, step)
+  local pending = chapter_at(nil)
+  if pending then
+    pending.step = step -- the next step added, wherever it is inserted
+    sort_chapters()
+  end
   if at < #steps and not do_jump and S.tour.current >= at then
     S.tour.current = S.tour.current + 1
   end
@@ -3172,6 +3337,17 @@ H.remove = function(a)
   local step = step_at(a.n)
   del_anchor(step)
   table.remove(S.tour.steps, step.n)
+  local chapter = chapter_at(step)
+  if chapter then
+    -- The heading moves to the step that is now at this place; with none (or one with a chapter
+    -- of its own) it is dropped.
+    local nxt = S.tour.steps[step.n]
+    if nxt and not chapter_at(nxt) then
+      chapter.step = nxt
+    else
+      drop_chapter(chapter)
+    end
+  end
   local cur = S.tour.current
   if cur == step.n then
     S.tour.current = 0 -- nothing is shown as current until the next navigation
@@ -3182,6 +3358,56 @@ H.remove = function(a)
   update_qf()
   render_panel()
   return { ok = true, removed = step.n, total = #S.tour.steps, current = S.tour.current }
+end
+
+--- The chapters as the CLI shows them, in tour order: { { name, step = n | nil } } (nil: pending).
+local function chapter_list()
+  local list = {}
+  for _, c in ipairs(chapters()) do
+    list[#list + 1] = { name = c.name, step = c.step and c.step.n or vim.NIL }
+  end
+  return list
+end
+
+H.chapter = function(a)
+  local steps = S.tour.steps
+  if a.list then
+    return { ok = true, chapters = chapter_list() }
+  end
+  if a.remove then
+    local step = steps[a.remove] -- #steps + 1 is the pending chapter
+    local chapter = (a.remove >= 1 and a.remove <= #steps + 1) and chapter_at(step) or nil
+    if not chapter then
+      fail(
+        a.remove == #steps + 1 and "no pending chapter"
+          or ("no chapter starts at step %d (tour has %d steps)"):format(a.remove, #steps),
+        6
+      )
+    end
+    drop_chapter(chapter)
+    render_panel()
+    redraw_winbars()
+    return { ok = true, removed = a.remove, name = chapter.name, pending = step == nil, chapters = chapter_list() }
+  end
+  local name = vim.trim(((a.name or ""):gsub("%s+", " "))) -- a heading is one line
+  if name == "" then
+    fail("the chapter needs a name", 2)
+  end
+  local at = a.at
+  if at and (at < 1 or at > #steps + 1) then
+    fail(("--at %d is out of range (tour has %d steps)"):format(at, #steps), 6)
+  end
+  local chapter, old = set_chapter(name, at and steps[at] or nil)
+  render_panel()
+  redraw_winbars()
+  return {
+    ok = true,
+    name = name,
+    step = chapter.step and chapter.step.n or nil,
+    pending = chapter.step == nil,
+    replaced = old,
+    chapters = chapter_list(),
+  }
 end
 
 --- The number of the first step that is not lost, from step `n` (not included) in direction `dir`
@@ -3237,6 +3463,50 @@ end
 H.last = function()
   sync_all()
   return step_goto(live_step(#S.tour.steps + 1, -1) or #S.tour.steps)
+end
+
+--- Go to the first step of the next chapter. Where `[c` goes: the start of the chapter the current
+--- step is in, when it is not at that start, else the start of the chapter before.
+local function chapter_jump(dir)
+  sync_all()
+  local starts = chapter_starts()
+  if #starts == 0 then
+    for _, c in ipairs(chapters()) do
+      if c.step then
+        fail("every step of the chapters is lost", 6)
+      end
+    end
+    fail("no chapters", 6)
+  end
+  local n = S.tour.current
+  if dir > 0 then
+    for _, st in ipairs(starts) do
+      if st.n > n then
+        return step_goto(st.n)
+      end
+    end
+  elseif n == 0 then
+    return step_goto(starts[1].n)
+  else
+    for i = #starts, 1, -1 do
+      if starts[i].n < n then
+        return step_goto(starts[i].n)
+      end
+    end
+  end
+  local msg = dir > 0 and "already in the last chapter" or "already at the first chapter"
+  if S.tour.steps[n] then
+    return step_result(S.tour.steps[n], { message = msg })
+  end
+  fail(msg, 6)
+end
+
+H.next_chapter = function()
+  return chapter_jump(1)
+end
+
+H.prev_chapter = function()
+  return chapter_jump(-1)
 end
 
 ---------------------------------------------------------------------------
@@ -3571,6 +3841,7 @@ H.status = function()
     current = S.tour.current,
     total = #S.tour.steps,
     steps = steps,
+    chapters = chapter_list(),
     modified_files = #modified > 0 and modified or nil,
     focus = focus,
     diagrams = diagrams,
@@ -3790,6 +4061,12 @@ end)
 ucmd("NvtourGoto", function(o)
   return dispatch("goto", { n = tonumber(o.args) or 0 })
 end, { nargs = 1 })
+ucmd("NvtourNextChapter", function()
+  return dispatch("next_chapter", {})
+end)
+ucmd("NvtourPrevChapter", function()
+  return dispatch("prev_chapter", {})
+end)
 ucmd("NvtourPanel", function()
   return dispatch("panel", { toggle = true })
 end)

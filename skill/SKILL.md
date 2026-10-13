@@ -52,6 +52,10 @@ Use this when the user asks about code ("this", "here", "this chunk") but gives 
 - `nvtour status` shows the tour, focus, panel and keys. Use it after an error or when you lost track. Do not `clear` and start again.
 - Steps follow the edits of the user. After the user edits files, run `nvtour status`: a step `(was 88-90)` moved and is fine. A step `(lost)` needs `nvtour edit N FILE:L1-L2`. A `modified: a.cpp` line means the buffer differs from disk: line numbers from `rg` can be wrong in that file.
 
+## Chapters
+
+- For a tour of more than 8 steps, group the steps: run `nvtour chapter "Why does it fail?"` before the first step of each group (the next step you add starts the chapter). Use 3 to 6 steps per chapter, and name each chapter after the question that it answers. The user moves between chapters with `]c` / `[c`. `nvtour chapter --list` shows them; `nvtour chapter "Name" --at N` and `nvtour chapter --remove N` fix them.
+
 ## Writing notes
 
 - Note: at most 3 short sentences. Label: at most 6 words.
