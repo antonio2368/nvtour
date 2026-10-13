@@ -324,6 +324,7 @@ M.state = {
   reloaded = { [bufnr] = true },  -- the content was replaced; the steps are anchored again
   follow_timers = { [winid] = uv timer },  -- the debounced check of the follow mode (§6, "Follow the cursor")
   follow_jump = { win, buf, line },  -- where the last jump put the cursor; the follow check ignores it
+  peek = { win, buf, step, group, maps },  -- the open peek float (§6, "Peek a step"); {} when there is none
 }
 ```
 
@@ -684,6 +685,37 @@ current step stays. A jump moves the cursor to `l1` of its step; the check ignor
 (`state.follow_jump`), else a smaller step that starts on the same line would take the current step
 from the step of the jump. `status` has `follow`.
 
+### Peek a step
+
+A step that is not current has a one-line note. `peek` shows all of a step in a float at the cursor,
+without a change of the current step (`make_current` is not called: no redraw of the steps, no winbar,
+panel, quickfix or sheet change). The key (`peek` in `DEFAULT_KEYS`), `K` in the panel and
+`:NvtourPeek [N]` all call `H.peek({ n })`. The step is `n`, else the step of the panel line (when the
+current window is the panel), else the one under the cursor (`peek.step_at_cursor`: `sync_buf`, then the
+same choice as follow mode: greatest `l1`, then smallest `l2`; lost steps do not count). No step:
+`nvtour: no step here`. `n` out of range: `fail` (exit code 6; a warning in the user command). When a float
+is open, `H.peek` closes it first; the same step again (or no step) only closes: that is the toggle.
+
+`peek.lines(step, width)` builds the lines with the functions of `render_step`, which return chunk lists:
+`arrival_lines` (the `◇` line is added when the arrival lines have none, because the peek is about one
+step), `note_chunks(note, width, true)` (plain, no prefix), `suggest_lines` in the frame `peek.box`
+(`frame` uses the same function, so the frame of the suggestion is the same in both places), and
+`next_lines`. A lost step gets a `✗ lost` line first. The chunks become the lines of a scratch buffer
+`nvtour://peek` (`bufhidden = wipe`) with one extmark per chunk (`ns` `nvtour_peek`). The window is
+`nvim_open_win(buf, false, { relative = "cursor", row = 1, col = 0, border = "rounded", style = "minimal",
+focusable = false, zindex = 60, title = "N/T label" })`, `winhighlight = FloatBorder:NvtourFrame<Role>`. The
+text width is `vim.g.nvtour_note_width`, else the window width minus the gutter and the border, at most
+100 (the panel is narrow: the editor width). The height is the number of lines, at most half the window.
+
+`S.peek = { win, buf, step, group, maps }` exists while it is open. One augroup `nvtour_peek` (created on
+open, deleted on close) has `CursorMoved`, `CursorMovedI`, `BufLeave`, `WinLeave` and `WinClosed` of the
+source window. They close the float with `vim.schedule` (not all windows can be closed inside an autocmd).
+A cursor event closes only when the cursor is not where it was at the open: a `CursorMoved` that was queued
+before the key must not close the float that the key opened. `<Esc>` and `q` are buffer-local maps in the
+source buffer while it is open; the entry of `maparg` with `buffer = 1` (a map of the user) is not
+replaced, and the maps are removed on close. `peek.close` is the one place that undoes all of it; `reset`
+(`clear` and `start`) calls it. It reads only `S.peek`, so it also closes a float of an older runtime.
+
 ### Frame and band
 
 All virtual lines of a step (link lines, the note, the collapsed note) must not look like code. Both
@@ -777,7 +809,8 @@ window; a panel window left in another tab is closed first.
 
 Paths shown relative to `W` (passed from Python as `workspace`). The current step line gets an
 extmark `line_hl_group = NvtourPanelCurrent`. Buffer-local normal-mode maps in the panel: `<CR>`
-jumps to the step under the cursor (in the tour window, not the panel), `q` closes the panel and
+jumps to the step under the cursor (in the tour window, not the panel), `K` peeks at that step (§6,
+"Peek a step"; the float is anchored at the panel cursor), `q` closes the panel and
 sets `panel.user_closed = true`. `panel --toggle` or `panel TEXT` reopen it and reset
 `user_closed`.
 
@@ -970,9 +1003,12 @@ and skip that key. `vim.g.nvtour_keys` is read (missing entries use the defaults
 ```lua
 DEFAULT_KEYS = {
   next = "]w", prev = "[w", first = "[W", last = "]W", panel = "<leader>wp", clear = "<leader>wc",
-  next_chapter = "]c", prev_chapter = "[c",
+  next_chapter = "]c", prev_chapter = "[c", peek = "<leader>wk",
 }
 ```
+
+`peek` shows the full content of the step under the cursor in a float (§6, "Peek a step"). While the float
+is open, `<Esc>` and `q` are mapped (buffer-local) to close it; they are removed on close.
 
 `]c` and `[c` are keys of Vim too (next and previous change). They are free when `maparg` is empty, which a
 built-in key is, so nvtour takes them; in a window in diff mode they run the built-in key
@@ -980,7 +1016,8 @@ built-in key is, so nvtour takes them; in a window in diff mode they run the bui
 
 User commands (defined on load, always available): `:NvtourNext`, `:NvtourPrev`, `:NvtourFirst`,
 `:NvtourLast`, `:NvtourNextChapter`, `:NvtourPrevChapter`, `:NvtourGoto N`, `:NvtourPanel`, `:NvtourClear`,
-`:NvtourFollow` (flips `vim.g.nvtour_follow_cursor` and says the new state; see "Follow the cursor").
+`:NvtourPeek [N]` (peeks step N, default the step under the cursor; see "Peek a step"), `:NvtourFollow`
+(flips `vim.g.nvtour_follow_cursor` and says the new state; see "Follow the cursor").
 
 The quickfix list also works (`:cnext`, `:cprev`, `:copen`); it moves the cursor only, not the
 current step.
@@ -993,7 +1030,7 @@ current step.
    `winbar` are set locally, saved and restored per window (the panel's own window options are not
    restored: nvtour closes that window). Highlight groups use `default = true`.
 3a. Never replace a modified buffer that cannot be hidden (that would run `'autowrite'`).
-3. Never close windows/tabs we did not create (panel window, diff tabs only).
+3. Never close windows/tabs we did not create (panel window, diff tabs and the peek float only).
 4. Never touch an nvim instance the user did not select (no broadcasting).
 5. Every command has one timeout budget for all its RPC calls; a hang never blocks the agent for
    more than `--timeout` seconds (plus the 2 s discovery probes, which run in parallel). A command

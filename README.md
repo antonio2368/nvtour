@@ -41,6 +41,7 @@ Neovim in parallel. You step through the tour with `]w` / `[w`.
 | 📑 **Chapters** | `chapter "Name"` groups the steps of a long tour under headings. `]c` / `[c` move between chapters. |
 | 📦 **A tour in one call** | `nvtour apply` reads a whole tour (steps, chapters, focus, diagrams, panel) from a TOML file on stdin. |
 | 🔭 **Focus on the steps** | `focus --steps` folds every toured file to the lines of its steps. The folds follow the steps when they change. |
+| 👀 **Peek at a step** | `<leader>wk` shows the full note and suggested code of the step under the cursor in a float, without leaving the current step. |
 | ⚓ **Steps follow your edits** | When you edit a file during a tour, the steps move with the lines. `status` reports a step that moved or was lost. |
 
 > [!IMPORTANT]
@@ -214,6 +215,30 @@ index and the linked sheet step follow. Nothing scrolls, nothing flashes, and no
   current step can change without a key.
 - Default off, because the sheet viewer would jump each time the cursor crosses a step, and the note
   under the cursor would change while you edit.
+
+### Peek at a step
+
+The note of a step that is not current is cut to one line. Press `<leader>wk` on a line of such a step to read
+all of it. A float opens at the cursor with the full content of the step: the `◇` line (file and version),
+the note with its `` `code` `` and `**bold**`, the suggested code with syntax colours in the `suggested`
+frame, and the `→ next` line. The border has the colour of the role, and the title shows `N/T label`.
+
+- The float closes when the cursor moves, when you leave the window or the buffer, with `<Esc>` or `q`,
+  or when you press the key again. Only one float is open at a time.
+- The step does not become the current step. The note under the code, the winbar, the panel and the sheet
+  do not change. With the [follow mode](#follow-the-cursor) on, the cursor still has to move to change the
+  current step.
+- When ranges are nested, the innermost step wins. A line without a step shows `nvtour: no step here`.
+- `<Esc>` and `q` are mapped in the buffer only while the float is open. A buffer-local `<Esc>` or `q` of
+  yours stays as it is, and the other key closes the float.
+- In the panel, `K` on a step line peeks that step, at the panel cursor.
+- `:NvtourPeek [N]` peeks step N (default: the step under the cursor). A number out of range gives a
+  warning. A step that is lost has no lines in the code, so only the panel and `:NvtourPeek N` can peek it:
+  the float then shows `✗ lost`.
+- Diagram steps and steps at a git ref work in the same way.
+- The float is as wide as the window text area (at most 100 cells), or `vim.g.nvtour_note_width`, and at
+  most half as high as the window. In the panel it uses the width of the editor.
+- The float shows a scratch buffer `nvtour://peek`. No file buffer is written.
 
 ### Focus on the steps
 
@@ -571,16 +596,17 @@ is skipped.
 | `]W` / `[W` | last / first step |
 | `]c` / `[c` | first step of the next chapter / of this chapter (or the one before) |
 | `<leader>wp` | toggle panel |
+| `<leader>wk` | peek at the step under the cursor in a float (see [Peek at a step](#peek-at-a-step)) |
 | `<leader>wc` | clear everything |
 
 **In the panel:** `<CR>` jumps to the step under the cursor (on a chapter line, a file name or a link line: the
-step after it), `q` closes the panel.
+step after it), `K` peeks at that step, `q` closes the panel.
 
 **In a diagram:** `<CR>` on an underlined link text opens its code; elsewhere it moves down as usual.
 
 **Commands:** `:NvtourNext`, `:NvtourPrev`, `:NvtourFirst`, `:NvtourLast`, `:NvtourNextChapter`,
-`:NvtourPrevChapter`, `:NvtourGoto N`, `:NvtourPanel`, `:NvtourClear`, `:NvtourFollow` (turn
-[follow mode](#follow-the-cursor) on or off).
+`:NvtourPrevChapter`, `:NvtourGoto N`, `:NvtourPanel`, `:NvtourClear`, `:NvtourPeek [N]` (see
+[Peek at a step](#peek-at-a-step)), `:NvtourFollow` (turn [follow mode](#follow-the-cursor) on or off).
 
 **Quickfix:** the list `nvtour: <title>` works too (`:cnext`, `:cprev`), but it only moves the cursor. It does
 not change the current step of the tour.
@@ -593,7 +619,7 @@ Set these in `init.lua` before the first step:
 
 ```lua
 vim.g.nvtour_keys = { next = "]w", prev = "[w", first = "[W", last = "]W", panel = "<leader>wp", clear = "<leader>wc",
-                      next_chapter = "]c", prev_chapter = "[c" }
+                      next_chapter = "]c", prev_chapter = "[c", peek = "<leader>wk" }
 vim.g.nvtour_auto_panel = false               -- do not open the panel on the first step
 vim.g.nvtour_steal_focus = "unless_terminal"  -- "always" | "never"; default keeps the focus in a terminal window
 vim.g.nvtour_winbar = false                   -- do not show the tour position in the winbar of the tour window

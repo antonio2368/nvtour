@@ -1020,6 +1020,8 @@ def test_zz_safety_files_untouched(cli, nv, sandbox, pristine):
     ok(cli("diff", "a.txt", "--stdin", stdin="changed\n"))
     ok(cli("diff-close"))
     ok(cli("unfocus"))
+    nv.command("NvtourPeek 1")  # the peek float shows a buffer nvtour://peek: the only one that is written
+    assert any(b.name == "nvtour://peek" for b in nv.buffers)
     ok(cli("clear"))
     for b in nv.buffers:
         if b.name.endswith(".txt"):

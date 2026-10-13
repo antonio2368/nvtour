@@ -46,6 +46,7 @@ local function new_state()
     reloaded = {}, -- [buf] = true: the content was replaced (:e!); the steps are anchored again
     follow_timers = {}, -- [win] = the debounce timer of the follow mode (see "Follow the cursor")
     follow_jump = {}, -- { win, buf, line }: where the last jump put the cursor; follow ignores it
+    peek = {}, -- { win, buf, step, ... } while a peek float is open (see "Peek a step"); {} when closed
   }
 end
 
@@ -66,6 +67,7 @@ local DEFAULT_KEYS = {
   clear = "<leader>wc",
   next_chapter = "]c",
   prev_chapter = "[c",
+  peek = "<leader>wk",
 }
 
 ---------------------------------------------------------------------------
@@ -1168,7 +1170,7 @@ end
 
 local step_goto -- forward declaration
 
-local KEY_ORDER = { "next", "prev", "first", "last", "panel", "clear", "next_chapter", "prev_chapter" }
+local KEY_ORDER = { "next", "prev", "first", "last", "panel", "clear", "next_chapter", "prev_chapter", "peek" }
 
 --- "]w next · [w prev · ..." for the keys that are installed (the chapter keys: when there are chapters).
 local function keys_line()
@@ -1448,6 +1450,14 @@ local function map_panel_keys(buf)
   end)
   map("q", function()
     _G.nvtour.dispatch("panel", { toggle = true })
+  end)
+  map("K", function()
+    local res = _G.nvtour.dispatch("peek", {}) -- the step of the line, anchored at the panel cursor
+    if not res.ok then
+      notify(res.error, vim.log.levels.WARN)
+    elseif res.message then
+      notify(res.message)
+    end
   end)
 end
 
@@ -1947,6 +1957,33 @@ local function note_width_limit()
   end
 end
 
+-- The peek float (see "Peek a step") keeps its functions in one table: a Lua chunk has at most 200
+-- local variables. Its frame of the suggested code is the one of the step, so `frame` shares it.
+local peek = {}
+
+--- The rows of the frame around `lines` (chunk lists): "╭ suggested ───╮", "│ code │", "╰───╯", `inner`
+--- cells wide, in the border group `B`. `kind` is "suggest" (with the title) or "block" (without).
+function peek.box(lines, B, role, kind, inner)
+  -- The suggestion has a title in its top border: "╭ suggested ───╮".
+  local title = kind == "suggest" and " suggested " or ""
+  local out = {
+    {
+      { "╭", B },
+      { title, "NvtourLabel" .. cap(role) },
+      { ("─"):rep(math.max(0, inner - 2 - vim.fn.strdisplaywidth(title))) .. "╮", B },
+    },
+  }
+  for _, line in ipairs(lines) do
+    local chunks, w = clip_chunks(line, inner - 4) -- code does not wrap: a long line is cut
+    local cells = { { "│ ", B } }
+    vim.list_extend(cells, chunks)
+    cells[#cells + 1] = { (" "):rep(math.max(0, inner - 4 - w)) .. " │", B }
+    out[#out + 1] = cells
+  end
+  out[#out + 1] = { { "╰" .. ("─"):rep(inner - 2) .. "╯", B } }
+  return out
+end
+
 local function frame(lines, win, role, current, kind)
   if not valid_win(win) then
     return { virt_lines = lines } -- drawn again in the window when the buffer is shown (BufWinEnter)
@@ -1965,21 +2002,9 @@ local function frame(lines, win, role, current, kind)
   end
   local out = {}
   if kind == "block" or kind == "suggest" then
-    -- The suggestion has a title in its top border: "╭ suggested ───╮".
-    local title = kind == "suggest" and " suggested " or ""
-    out[1] = row({
-      { "╭", B },
-      { title, "NvtourLabel" .. cap(role) },
-      { ("─"):rep(math.max(0, inner - 2 - vim.fn.strdisplaywidth(title))) .. "╮", B },
-    })
-    for _, line in ipairs(lines) do
-      local chunks, w = clip_chunks(line, inner - 4) -- code does not wrap: a long line is cut
-      local cells = { { "│ ", B } }
-      vim.list_extend(cells, chunks)
-      cells[#cells + 1] = { (" "):rep(math.max(0, inner - 4 - w)) .. " │", B }
+    for _, cells in ipairs(peek.box(lines, B, role, kind, inner)) do
       out[#out + 1] = row(cells)
     end
-    out[#out + 1] = row({ { "╰" .. ("─"):rep(inner - 2) .. "╯", B } })
   else
     for i, line in ipairs(lines) do
       if kind == "collapsed" and line[1] and line[1][1] == "╶ " then
@@ -2740,6 +2765,9 @@ local function key_actions()
     panel = function()
       run("panel", { toggle = true })
     end,
+    peek = function()
+      run("peek")
+    end,
     clear = function()
       run("clear")
     end,
@@ -2961,6 +2989,7 @@ end
 local function reset(keep_panel)
   sheet_cancel()
   follow.cancel_all()
+  peek.close()
   for buf in pairs(S.sync_timers) do
     sync_cancel(buf)
   end
@@ -3239,6 +3268,174 @@ api.nvim_create_autocmd("CursorMoved", {
   end,
 })
 
+---------------------------------------------------------------------------
+-- Peek a step
+---------------------------------------------------------------------------
+
+-- `peek` (a key, `K` in the panel, :NvtourPeek [N]) shows the full content of a step in a float at
+-- the cursor: the "◇" line, the note, the suggested code and the "next" line, made by the same
+-- functions as the lines under the code. The step does not become the current step: nothing in the
+-- tour changes. The float shows a scratch buffer nvtour://peek, which is the only buffer written.
+-- S.peek = { win, buf, step, group, maps } exists while the float is open.
+
+--- Close the peek float: the float and its buffer, the autocmds and the keys of the source buffer.
+function peek.close()
+  local p = S.peek
+  S.peek = {}
+  if p.group then
+    pcall(api.nvim_del_augroup_by_id, p.group)
+  end
+  for _, m in ipairs(p.maps or {}) do
+    pcall(vim.keymap.del, "n", m[2], { buffer = m[1] })
+  end
+  if valid_win(p.win) then
+    pcall(api.nvim_win_close, p.win, true)
+  end
+  if valid_buf(p.buf) then
+    pcall(api.nvim_buf_delete, p.buf, { force = true })
+  end
+end
+
+--- Close the float `win` after the current event (a window cannot always be closed inside an autocmd).
+function peek.close_later(win)
+  vim.schedule(function()
+    if S.peek.win == win then
+      peek.close()
+    end
+  end)
+end
+
+--- The cells of the text of the float shown from window `win`: the width of the window without the
+--- gutter and the border, at most 100, or vim.g.nvtour_note_width. The panel is narrow: it takes the
+--- width of the editor.
+function peek.width(win)
+  local limit = note_width_limit()
+  if limit then
+    return math.min(limit, 100)
+  end
+  local info = vim.fn.getwininfo(win)[1]
+  local avail = win == S.panel.win and vim.o.columns - 2 or info.width - info.textoff
+  return math.max(30, math.min(100, avail - 2))
+end
+
+--- The lines of the float for `step`, as chunk lists. Without a "◇" line from the arrival lines
+--- (the file is the one of the step before) the file is shown anyway: the peek is about one step.
+function peek.lines(step, width)
+  local R = cap(step.role)
+  local out = arrival_lines(step, width)
+  if not (out[1] and out[1][1][1] == "◇ ") then
+    out = vim.list_extend(link_lines("◇ ", version_segs(step, S.tour.steps[step.n - 1] or {}), width), out)
+  end
+  if step.lost then
+    out[#out + 1] = { { "✗ lost", "NvtourLost" }, { " · its lines were deleted", "NvtourVia" } }
+  end
+  if step.note and step.note ~= "" then
+    vim.list_extend(out, note_chunks(step.note, width, true))
+  end
+  if step.suggest and valid_buf(step.buf) then
+    vim.list_extend(out, peek.box(suggest_lines(step, 4), "NvtourFrame" .. R, step.role, "suggest", width))
+  end
+  return vim.list_extend(out, next_lines(step, width))
+end
+
+--- Open the float of `step` at the cursor of window `win` (the current window).
+function peek.open(step, win)
+  peek.close()
+  local R = cap(step.role)
+  local width = peek.width(win)
+  local lines, text = peek.lines(step, width), {}
+  for i, chunks in ipairs(lines) do
+    local parts = {}
+    for _, c in ipairs(chunks) do
+      parts[#parts + 1] = (c[1]:gsub("\n", " "))
+    end
+    text[i] = table.concat(parts)
+  end
+  for _, b in ipairs(api.nvim_list_bufs()) do
+    if api.nvim_buf_get_name(b) == "nvtour://peek" then
+      pcall(api.nvim_buf_delete, b, { force = true }) -- left by an older runtime
+    end
+  end
+  local buf = api.nvim_create_buf(false, true)
+  api.nvim_buf_set_name(buf, "nvtour://peek")
+  vim.bo[buf].bufhidden = "wipe"
+  vim.bo[buf].swapfile = false
+  api.nvim_buf_set_lines(buf, 0, -1, false, text)
+  vim.bo[buf].modifiable = false
+  local ns = api.nvim_create_namespace("nvtour_peek")
+  for i, chunks in ipairs(lines) do
+    local col = 0
+    for _, c in ipairs(chunks) do
+      if type(c[2]) == "string" and #c[1] > 0 then
+        api.nvim_buf_set_extmark(buf, ns, i - 1, col, { end_col = col + #c[1], hl_group = c[2], priority = 150 })
+      end
+      col = col + #c[1]
+    end
+  end
+  local label = (step.label and step.label ~= "") and (" " .. step.label) or ""
+  local float = api.nvim_open_win(buf, false, {
+    relative = "cursor",
+    row = 1,
+    col = 0,
+    width = width,
+    height = math.max(1, math.min(#text, math.floor(api.nvim_win_get_height(win) / 2))),
+    style = "minimal",
+    border = "rounded",
+    title = { { (" %d/%d%s "):format(step.n, #S.tour.steps, label), "NvtourLabel" .. R } },
+    focusable = false,
+    zindex = 60,
+  })
+  vim.wo[float].wrap = false
+  vim.wo[float].winhighlight = "FloatBorder:NvtourFrame" .. R
+  local src = api.nvim_win_get_buf(win)
+  local cursor = api.nvim_win_get_cursor(win)
+  local group = api.nvim_create_augroup("nvtour_peek", { clear = true })
+  S.peek = { win = float, buf = buf, step = step, group = group, maps = {} }
+  -- Opening the float moves nothing. A CursorMoved that is still queued from the keys before
+  -- (the user pressed `j`, then the peek key) finds the cursor where it was: only a move closes.
+  api.nvim_create_autocmd({ "CursorMoved", "CursorMovedI" }, {
+    group = group,
+    callback = function()
+      local w = api.nvim_get_current_win()
+      local pos = api.nvim_win_get_cursor(w)
+      if w ~= win or pos[1] ~= cursor[1] or pos[2] ~= cursor[2] then
+        peek.close_later(float)
+      end
+    end,
+  })
+  api.nvim_create_autocmd({ "BufLeave", "WinLeave", "WinClosed" }, {
+    group = group,
+    callback = function(ev)
+      if ev.event ~= "WinClosed" or tonumber(ev.match) == win then
+        peek.close_later(float)
+      end
+    end,
+  })
+  -- <Esc> and q close it, for the time it is open; a buffer-local key of the user stays as it is.
+  for _, lhs in ipairs({ "<Esc>", "q" }) do
+    local old = api.nvim_buf_call(src, function()
+      return vim.fn.maparg(lhs, "n", false, true)
+    end)
+    if type(old) ~= "table" or old.buffer ~= 1 then
+      vim.keymap.set("n", lhs, function()
+        peek.close()
+      end, { buffer = src, nowait = true, silent = true, desc = "nvtour: close the peek" })
+      table.insert(S.peek.maps, { src, lhs })
+    end
+  end
+end
+
+--- The step that holds the cursor of window `win`; in the panel, the step of the line.
+function peek.step_at_cursor(win)
+  local line = api.nvim_win_get_cursor(win)[1]
+  if win == S.panel.win then
+    return S.tour.steps[S.panel.line_map[line] or 0]
+  end
+  local buf = api.nvim_win_get_buf(win)
+  sync_buf(buf)
+  return follow.step_at(buf, line)
+end
+
 local H = {}
 
 H.start = function(a)
@@ -3250,6 +3447,34 @@ H.start = function(a)
   ensure_started()
   render_panel()
   return { ok = true, title = S.tour.title, sheet = S.tour.sheet, keys = installed_keys() }
+end
+
+--- Peek a step: step `a.n`, or the step under the cursor. The same step again closes the float.
+H.peek = function(a)
+  local steps = S.tour.steps
+  local win = api.nvim_get_current_win()
+  local step
+  if a.n ~= nil then
+    if a.n < 1 or a.n > #steps then
+      fail(("no such step %s (tour has %d)"):format(tostring(a.n), #steps), 6)
+    end
+    step = steps[a.n]
+  else
+    step = peek.step_at_cursor(win)
+  end
+  local was = S.peek.step
+  if valid_win(S.peek.win) then
+    peek.close()
+    if step == nil or step == was then
+      return { ok = true, closed = true }
+    end
+  end
+  if not step then
+    return { ok = true, message = "nvtour: no step here" }
+  end
+  sync_step(step)
+  peek.open(step, win)
+  return { ok = true, n = step.n }
 end
 
 --- Renumber the steps and render all of them again (after an insert, edit or remove).
@@ -4581,6 +4806,9 @@ end)
 ucmd("NvtourClear", function()
   return dispatch("clear", {})
 end)
+ucmd("NvtourPeek", function(o)
+  return dispatch("peek", { n = o.args ~= "" and (tonumber(o.args) or 0) or nil })
+end, { nargs = "?" })
 ucmd("NvtourFollow", function()
   local on = not follow.on()
   vim.g.nvtour_follow_cursor = on
