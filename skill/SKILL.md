@@ -39,6 +39,7 @@ Use this when the user asks about code ("this", "here", "this chunk") but gives 
 ## Line numbers
 
 - Get line numbers from `rg -n` or `sed -n 'A,Bp'` output, not from memory.
+- Prefer `FILE:/text/` over line numbers from `rg`: `nvtour step a.cpp:/Cache::get/` is the line that has the text, `/text/+N` adds N lines, `/start/../end/` is a block, and `\/` is a slash in the text. The text is plain, not a regex. Quote it when it has spaces. On several matches nvtour fails with exit 6 and lists the lines: pick one with `@N` (the N-th) or `~L` (nearest to line L). `focus`, `edit`, `step --diagram NAME /label/` and `diagram --link 'TEXT=FILE:/text/'` take it too. Keep `--expect` for the exact expression.
 - Each `step` prints the first highlighted line (`  412| ...`). Check it.
 - Add `--expect TEXT` (a substring of the range) to make a wrong range fail with exit 6 instead of highlighting the wrong code. The user sees `TEXT` underlined, so pick the exact expression the note is about (for example `it->second`).
 - When the note names more than one part of the range, give `--expect` for each one (at most 3): `--expect 'refresh(key)' --expect 'it->second'`. Each text must be in the range.

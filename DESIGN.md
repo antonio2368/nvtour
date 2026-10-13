@@ -138,21 +138,21 @@ nvtour instances [--prune]
 nvtour attach [PID|SOCKET] [--clear]
 nvtour where
 nvtour start [TITLE]
-nvtour step FILE:L1[-L2] [--ref GITREF] [--note TEXT | --note -] [--label TEXT] [--role ROLE]
+nvtour step FILE:L1[-L2] | FILE:/TEXT/... [--ref GITREF] [--note TEXT | --note -] [--label TEXT] [--role ROLE]
             [--expect TEXT]... [--via TEXT] [--from N] [--suggest TEXT | --suggest -] [--at N]
             [--jump | --no-jump]
-nvtour step L1[-L2] --diagram NAME [the same options]
-nvtour edit N [FILE:L1[-L2] [--ref GITREF] | L1[-L2] --diagram NAME] [--note TEXT | --note -]
+nvtour step L1[-L2] | /TEXT/... --diagram NAME [the same options]
+nvtour edit N [FILE:L1[-L2] | FILE:/TEXT/... [--ref GITREF] | L1[-L2] | /TEXT/... --diagram NAME] [--note TEXT | --note -]
             [--label TEXT] [--role ROLE] [--expect TEXT]... [--via TEXT] [--from N]
             [--suggest TEXT | --suggest -] [--jump]
 nvtour remove N
 nvtour goto N | nvtour next | nvtour prev | nvtour first | nvtour last
 nvtour status
-nvtour focus FILE:L1-L2 [L3-L4 ...] [--context N] [--dim]
+nvtour focus FILE:L1-L2 [L3-L4 | /TEXT/... ...] [--context N] [--dim]
 nvtour unfocus [FILE]
 nvtour diff FILE (--ref GITREF | --file PATH | --stdin) [--title TEXT]
 nvtour diff-close
-nvtour diagram NAME [FILE|-] [--format mermaid|dot|easy|text] [--link TEXT=FILE:L1[-L2]]... [--ascii]
+nvtour diagram NAME [FILE|-] [--format mermaid|dot|easy|text] [--link TEXT=FILE:L1[-L2] | TEXT=FILE:/TEXT/...]... [--ascii]
                [--header N] [--split above|below|left|right|full] [--no-show]
 nvtour panel [TEXT | --file PATH | -] [--toggle] [--clear]
 nvtour clear [--keep-buffers]
@@ -162,6 +162,40 @@ nvtour doctor
 Range syntax: `path:L1` (single line), `path:L1-L2` or `path:L1,L2`; `path:L:COL` is accepted and the
 column is ignored (unless a file literally named `path:L` exists). `focus` takes one file and one or
 more ranges; extra bare `L3-L4` arguments apply to the same file.
+
+**Ranges by text.** A range can be named by the text of its lines (plain text, not a regex):
+
+```
+FILE:/TEXT/                 the line that contains TEXT
+FILE:/TEXT/+N               that line and N lines after it
+FILE:/START/../END/         from the START line to the first END line at or after it, inclusive
+FILE:/TEXT/@N               the N-th line with TEXT (from 1)
+FILE:/TEXT/~L               the line with TEXT nearest to line L (a tie: the earlier line)
+FILE:/TEXT/@N+2, FILE:/A/@2../B/+1    combined: @N or ~L after START (not both), +N last
+```
+
+Grammar after the file: `/START/ [@N | ~L] [../END/] [+N]`; `+N` goes on the last line, so it is the
+end of `END` too. `\/` is a slash in `TEXT`; other backslashes are literal. `TEXT` and `END` are not
+empty. The parse rule (`ranges.parse_spec`): a spec is a text range when it has a `:/` and the rest
+after it reads as a well formed query. The first such `:/` splits, so `TEXT` can contain `:`
+(`a.cpp:/Cache::get/`) and a path can contain `:/` (the candidates are tried from the left). With no
+such `:/`, the old rules apply (`FILE:L1[-L2]`, `L1,L2`, `L:COL`, last `:` splits). A bad text range
+(for example a missing closing `/`) is exit 6 with the reason. A slash in `TEXT` that is not
+escaped can be read as the end of the text, or as another `:/` split: write `\/`.
+
+Errors are exit 6: several lines match and there is no `@N` or `~L` (the message lists the matching
+lines, at most 10, as `  N| text`); no match (`text 'T' not found in FILE (N lines)`); `@N` beyond the
+number of matches; `END` not found at or after the `START` line. The resolved lines go through the
+normal range checks (`+N` beyond the end of the file is exit 6).
+
+Python (`ranges.py`): `parse_spec(spec) -> Spec(path, l1, l2, query)` (numbers or `query`, never both),
+`query = { start, end, plus, nth, near }` (`end`, `nth` and `near` are None when absent);
+`parse_file_range` is built on it and refuses a query; `parse_range_or_query(text)` is for the extra
+`focus` arguments and for `--diagram` steps; `format_query` gives the canonical text (the field
+`resolved_from`); `resolve_query(lines, query, name)` is the Python twin of the Lua function. The two
+resolvers are small and run on the same table of cases in `tests/test_query.py` (same results, same
+messages). `cli.location()` sends `query` (without the absent keys: nested nils do not survive
+msgpack) and `resolved_from` instead of `l1` and `l2`.
 
 ### Commands
 
@@ -262,11 +296,14 @@ M.state = {
 ```
 
 Each step: `{ n, file, buf, l1, l2, role, label, note, expect, via, from, suggest, ref, sha, diagram, extmark_ids = {},
-anchor, anchor_buf, lost, lost_reason, orig_l1, orig_l2 }`.
+anchor, anchor_buf, lost, lost_reason, orig_l1, orig_l2, query, resolved_from }`.
 `anchor` is the id of the anchor extmark (in `ns_anchor`, in buffer `anchor_buf`); a step on a diagram has none.
 `l1` and `l2` are the lines that the anchor had at the last sync. `lost` is true when the lines of
 the step are gone, and `lost_reason` says why. `orig_l1` and `orig_l2` are the lines that the agent
-gave. A step made by an older runtime has none of these fields; every use of them accepts `nil`.
+gave. `query` is the text range that gave the lines (nil when the agent gave numbers) and
+`resolved_from` its text (`/TEXT/...`, the field of the same name in the step result); both are kept
+but not used after the step was made. A step made by an older runtime has none of these fields; every
+use of them accepts `nil`.
 `diagram` is the name of the diagram of a step on a diagram (§10), else nil.
 `suggest` is a list of lines (nil when there is no suggestion).
 `ref` and `sha` are nil for a step on the working tree. `from` is the step table of a `--from N`
@@ -384,6 +421,15 @@ For a step at `l1..l2` in buffer `buf` (0-based rows internally):
 
 Validation (exit 6 from Python after the Lua check): file must exist and be readable (for `--ref`:
 must exist at that ref); `1 ≤ l1 ≤ l2 ≤ line count`.
+
+Text ranges (§4, "Ranges by text"): `checked_range(a, l1, l2, expect)` loads the buffer of the location
+(the file, the blob of `--ref`, or the diagram) and, when `a.query` is set, first calls the pure
+function `resolve_query(lines, q, name)` on all the lines of that buffer (also exposed as
+`M._resolve_query`, so tests can call it through `exec_lua`). It returns `l1, l2`, which replace
+the numbers before the range checks and the `--expect` check; `checked_range` returns them with the
+buffer. `H.step` and `H.edit` store `query` and `resolved_from` in the step; `step_result` returns
+`resolved_from`. The text is searched in the buffer, so unsaved edits count, and once: after that the
+step has an anchor like any other.
 
 ### Steps at a git ref
 
@@ -653,7 +699,9 @@ closed (do not reopen automatically for steps if `user_closed`).
 
 ## 8. Focus
 
-`focus FILE:L1-L2 [L3-L4 ...] [--context N] [--dim]` — show only the given ranges of one file.
+`focus FILE:L1-L2 [L3-L4 ...] [--context N] [--dim]` — show only the given ranges of one file. Each
+range (the first one and each extra one) can be a text range (§4, "Ranges by text"); the CLI sends
+`{ query = ... }` instead of `{ l1, l2 }` and `H.focus` resolves it on the lines of the buffer, once.
 
 - Ranges are extended by `N` context lines (default 2), merged if overlapping, clamped to the
   buffer.
@@ -723,8 +771,11 @@ diagram to the code and back.
   nothing, or times out → exit 6 with its stderr.
 - The output is cleaned: colour escape codes removed (they would show as raw text in a buffer), tabs
   expanded, trailing blanks and blank first and last lines removed. An empty diagram is exit 6.
-- `--link TEXT=FILE:L1[-L2]` (split at the last `=`, so TEXT can contain `=`): TEXT must occur in the
-  rendered lines and the range must exist in FILE, else exit 6 (the same idea as `--expect`).
+- `--link TEXT=FILE:L1[-L2]` (split at the last `=` that leaves a readable range, so TEXT can contain
+  `=`): TEXT must occur in the rendered lines and the range must exist in FILE, else exit 6 (the same
+  idea as `--expect`). The range can be a text range, `--link 'TEXT=FILE:/text/'`: the CLI resolves it
+  with `ranges.resolve_query` on the lines of FILE (read as nvim shows them), and the message of an
+  error starts with `--link 'TEXT':`.
 - `--header N`: line N is the header line (§10, header line); 0 is none. Without it, a Mermaid
   `sequenceDiagram` (after `%%` comments and `---` front matter) whose first rendered line starts
   with `┌` or `+` and the second with `│` or `|` has header line 2, the participant names; other
@@ -779,7 +830,8 @@ not redraw its winbar, so `WinScrolled` redraws the winbar of each scrolled diag
 a header (`nvim__redraw`, else `redrawstatus!`). One line only: a float with the full box would
 cover diagram lines, and needs its own lifetime.
 
-**Steps on a diagram.** `step --diagram NAME L1[-L2]` (`--ref` with it is exit 2; an unknown name is
+**Steps on a diagram.** `step --diagram NAME L1[-L2]` or `/TEXT/...` (the text is searched in the
+rendered lines; `--ref` with it is exit 2; an unknown name is
 exit 6). The CLI sends `diagram = NAME` and `file = nvtour://diagram/NAME`. Everything else is as
 on a file: range, note, roles, `--expect` (exit 6 names `diagram NAME:L`), `--via`, links, panel,
 quickfix (`bufnr`), winbar, jump and scroll. Where a step shows its file, a diagram step shows
@@ -846,7 +898,7 @@ current step.
   nvtour/cli.py           # argparse, subcommands, output
   nvtour/discover.py      # socket scan, probe, score, pin cache
   nvtour/client.py        # pynvim attach with timeout, ensure_lua_loaded, call(cmd, args)
-  nvtour/ranges.py        # FILE:L1-L2 parsing, path resolution
+  nvtour/ranges.py        # FILE:L1-L2 and FILE:/TEXT/ parsing, resolve_query, path resolution
   nvtour/gitutil.py       # toplevel, git show
   nvtour/diagram.py       # diagram renderers, output cleaning, --link targets
   nvtour/lua/nvtour.lua   # the runtime (package data)

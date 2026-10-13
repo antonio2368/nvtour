@@ -37,6 +37,7 @@ Neovim in parallel. You step through the tour with `]w` / `[w`.
 | 🔀 **Read-only diffs** | Shows a file against a git ref, another file or stdin. |
 | 🗺️ **Diagrams as steps** | Renders Mermaid or Graphviz to Unicode text above the code. Steps can point to its lines, and `<CR>` on a label opens the code. |
 | ✅ **Self-checking ranges** | `--expect TEXT` stops a wrong line number before it shows the wrong code. |
+| 🔎 **Ranges by text** | `FILE:/TEXT/` finds the lines by their text, so the agent does not count lines. |
 | ⚓ **Steps follow your edits** | When you edit a file during a tour, the steps move with the lines. `status` reports a step that moved or was lost. |
 
 > [!IMPORTANT]
@@ -135,6 +136,45 @@ How the steps behave:
   `**bold**` (the markers are hidden).
 - **A jump scrolls** so that the note and the range are in view: centred when they fit, else the note at the
   top, and never past the end of the file. The range flashes briefly after a jump.
+
+### Ranges by text
+
+Line numbers go wrong when the file changes. Name the code instead: `FILE:/TEXT/` is the line that
+contains `TEXT` (plain text, not a regex).
+
+```bash
+nvtour step src/a.cpp:/Cache::get/ --label "the lookup"
+nvtour step src/a.cpp:'/it->second = value/+2'     # that line and 2 lines after it
+nvtour step src/a.cpp:/try/../catch/               # from the try line to the first catch line after it
+nvtour step src/a.cpp:/erase/@2                    # the 2nd line that has "erase"
+nvtour step src/a.cpp:/erase/~120                  # the line with "erase" that is nearest to line 120
+```
+
+| Form | Lines |
+|---|---|
+| `FILE:/TEXT/` | the line with `TEXT` |
+| `FILE:/TEXT/+N` | that line and `N` lines after it |
+| `FILE:/START/../END/` | from the `START` line to the first `END` line at or after it |
+| `FILE:/TEXT/@N` | the `N`-th line with `TEXT` (from 1) |
+| `FILE:/TEXT/~L` | the line with `TEXT` that is nearest to line `L` (a tie: the earlier line) |
+| `FILE:/TEXT/@N+2`, `FILE:/A/@2../B/+1` | the parts can be combined: `@N` or `~L` after `START`, `+N` at the end |
+
+- **A slash in `TEXT`:** write `\/`. Other backslashes stay as they are.
+- **A colon in `TEXT`** is fine (`a.cpp:/Cache::get/`). The text range starts at the first `:/` that is
+  followed by a well formed `/TEXT/...`. Else the last `:` splits as before (`FILE:L1-L2`, `FILE:L:COL`).
+- **Quotes:** a `TEXT` with spaces or shell characters needs quotes: `'a.cpp:/it->second = 1/'`.
+- **Several lines have `TEXT`** and there is no `@N` or `~L`: exit 6. The message lists the lines
+  (at most 10, with number and text), so you can choose with `@N` or `~L`.
+- **No line has `TEXT`:** exit 6, `text 'TEXT' not found in FILE (N lines)`. `@N` with `N` more than the
+  number of matches, or an `END` that is not found after `START`, is exit 6 too.
+- **Where it works:** `step`, `edit` (the new location), `focus` (the first range and each extra range:
+  `focus a.cpp:/try/../catch/ /cleanup/+3`), `diagram --link 'TEXT=FILE:/text/'`, and `step --diagram NAME
+  /label/` (the text is searched in the rendered lines). Also with `--ref`: the text is searched in the
+  file at that ref.
+- **The result:** the CLI prints the lines it found, as for any step: `step 2/3: a.cpp:412-415 ...` and the
+  first line. With `--json` the field `resolved_from` has the text range (`/Cache::get/`).
+- The text is searched once, when the command runs. After that the step follows your edits like any step
+  (see below). `--expect` still checks the exact expression in the found lines.
 
 ### Steps follow your edits
 
@@ -294,7 +334,7 @@ nvtour step src/cache.cpp:31-38 --label "load from the store" --via 'a miss call
 - **Steps on a diagram** (`step --diagram NAME L1[-L2]`) work as on a file: notes, roles, `--expect`,
   `--via`, the panel and the keys. `]w` goes from the diagram to the code and back. Code steps never use
   the diagram window, so the diagram stays in view above the code.
-- **Links:** `--link TEXT=FILE:L1[-L2]` underlines TEXT. `<CR>` on it opens the range in the code window;
+- **Links:** `--link TEXT=FILE:L1[-L2]` (or `TEXT=FILE:/text/`) underlines TEXT. `<CR>` on it opens the range in the code window;
   `<C-o>` goes back. TEXT must be in the diagram and the range in the file, else exit 6.
 - **Window:** by default a split above the code, as high as the diagram (at most 60 % of the code
   window). `--split above|below|left|right` puts it on another side; left or right, the code and the
@@ -324,8 +364,8 @@ nvtour step src/cache.cpp:31-38 --label "load from the store" --via 'a miss call
 | command | what it does |
 |---|---|
 | `start [TITLE] [--sheet SHEET]` | start a new tour (keeps an open panel); `--sheet`: the sheet of the tour |
-| `step FILE:L1[-L2] [--ref GITREF] [--note TEXT\|-] [--label] [--role] [--expect TEXT]... [--via TEXT] [--from N] [--suggest TEXT\|-] [--at N] [--sheet SHEET#STEP] [--jump\|--no-jump]` | add a step (`--ref`: on the file at that git ref; `--via`: why the tour goes there from the step before, or from step `--from N`; `--suggest`: the code that would replace the range; `--sheet`: show that step of a [sheet](#sheets) when the step becomes current) |
-| `edit N [FILE:L1[-L2] [--ref GITREF]] [--note] [--label] [--role] [--expect] [--via] [--from N] [--suggest] [--sheet SHEET#STEP] [--jump]` | change a step (`''` removes a label, note, link text, suggestion, sheet link or the `--expect` texts; a new `--expect` list replaces the old one; `--from 0` links from the step before again; a new location without `--ref` is on the working tree) |
+| `step FILE:L1[-L2]\|FILE:/TEXT/ [--ref GITREF] [--note TEXT\|-] [--label] [--role] [--expect TEXT]... [--via TEXT] [--from N] [--suggest TEXT\|-] [--at N] [--sheet SHEET#STEP] [--jump\|--no-jump]` | add a step (`--ref`: on the file at that git ref; `--via`: why the tour goes there from the step before, or from step `--from N`; `--suggest`: the code that would replace the range; `--sheet`: show that step of a [sheet](#sheets) when the step becomes current) |
+| `edit N [FILE:L1[-L2]\|FILE:/TEXT/ [--ref GITREF]] [--note] [--label] [--role] [--expect] [--via] [--from N] [--suggest] [--sheet SHEET#STEP] [--jump]` | change a step (`''` removes a label, note, link text, suggestion, sheet link or the `--expect` texts; a new `--expect` list replaces the old one; `--from 0` links from the step before again; a new location without `--ref` is on the working tree) |
 | `step L1[-L2] --diagram NAME [...]`, `edit N L1[-L2] --diagram NAME` | a step on lines of a diagram |
 | `remove N` | remove a step |
 | `panel [TEXT\|-\|--file PATH] [--toggle] [--clear]` | side panel text |
@@ -342,13 +382,14 @@ nvtour step src/cache.cpp:31-38 --label "load from the store" --via 'a miss call
 
 | command | what it does |
 |---|---|
-| `focus FILE:L1-L2 [L3-L4 ...] [--context N] [--dim]`, `unfocus [FILE]` | fold or dim the rest of a file |
+| `focus FILE:L1-L2 [L3-L4 ...] [--context N] [--dim]` (a range can be `/TEXT/` too), `unfocus [FILE]` | fold or dim the rest of a file |
 | `diff FILE (--ref REF\|--file PATH\|--stdin) [--title]`, `diff-close` | read-only diff tab |
-| `diagram NAME [FILE\|-] [--format mermaid\|dot\|easy\|text] [--link TEXT=FILE:L1[-L2]]... [--ascii] [--header N] [--split SIDE] [--no-show]` | render a diagram above the code (see [Diagrams](#diagrams)) |
+| `diagram NAME [FILE\|-] [--format mermaid\|dot\|easy\|text] [--link TEXT=FILE:L1[-L2]\|FILE:/text/]... [--ascii] [--header N] [--split SIDE] [--no-show]` | render a diagram above the code (see [Diagrams](#diagrams)) |
 | `clear [--keep-buffers]` | remove everything nvtour created |
 
 **Ranges:** `FILE:L1`, `FILE:L1-L2`, `FILE:L1,L2` and `FILE:L:COL` (the column is ignored, so compiler and
-`rg --column` output works as is).
+`rg --column` output works as is). By text: `FILE:/TEXT/`, `FILE:/TEXT/+N`, `FILE:/START/../END/`,
+`FILE:/TEXT/@N`, `FILE:/TEXT/~L` (see [Ranges by text](#ranges-by-text)).
 
 **Global flags:** `--json`, `--socket PATH`, `--workspace DIR`, `--timeout SECONDS`. They are also accepted
 after the subcommand.

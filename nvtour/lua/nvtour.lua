@@ -2814,6 +2814,7 @@ local function step_result(step, extra)
     sha = step.sha,
     diagram = step.diagram,
     sheet = step.sheet and sheet_label(step.sheet) or nil,
+    resolved_from = step.resolved_from,
     lost = step.lost or nil,
     text = step_text(step),
     keys = installed_keys(),
@@ -2908,11 +2909,69 @@ local function rerender_all()
   end
 end
 
+--- Lines (l1, l2) that the text range `q` selects in the list `lines`; `name` is for the messages.
+--- q = { start, end, plus, nth, near } (see ranges.py, which has the same function in Python).
+local function resolve_query(lines, q, name)
+  local hits = {}
+  for n, line in ipairs(lines) do
+    if line:find(q.start, 1, true) then
+      hits[#hits + 1] = n
+    end
+  end
+  if #hits == 0 then
+    fail(("text '%s' not found in %s (%d lines)"):format(q.start, name, #lines), 6)
+  end
+  local l1
+  if q.nth then
+    if q.nth > #hits then
+      fail(("text '%s' has %d match(es) in %s, but @%d was asked"):format(q.start, #hits, name, q.nth), 6)
+    end
+    l1 = hits[q.nth]
+  elseif q.near then
+    l1 = hits[1]
+    for _, n in ipairs(hits) do
+      if math.abs(n - q.near) < math.abs(l1 - q.near) then
+        l1 = n
+      end
+    end
+  elseif #hits > 1 then
+    local shown = {}
+    for i = 1, math.min(#hits, 10) do
+      shown[i] = ("  %d| %s"):format(hits[i], vim.fn.strcharpart(lines[hits[i]], 0, 100))
+    end
+    if #hits > 10 then
+      shown[#shown + 1] = ("  ... and %d more"):format(#hits - 10)
+    end
+    fail(("text '%s' matches %d lines in %s; choose one with @N or ~L:\n%s"):format(q.start, #hits, name, table.concat(shown, "\n")), 6)
+  else
+    l1 = hits[1]
+  end
+  local l2 = l1
+  if q["end"] then
+    l2 = nil
+    for n = l1, #lines do
+      if lines[n]:find(q["end"], 1, true) then
+        l2 = n
+        break
+      end
+    end
+    if not l2 then
+      fail(("end text '%s' not found in %s after line %d (%d lines)"):format(q["end"], name, l1, #lines), 6)
+    end
+  end
+  return l1, l2 + (q.plus or 0)
+end
+M._resolve_query = resolve_query
+
 --- Load the buffer of location `a` and check that l1-l2 exists and (with `expect`, a list) contains
---- each expected text.
+--- each expected text. A text range `a.query` gives l1 and l2 (the arguments are not used then).
+--- Returns the buffer and the checked l1 and l2.
 local function checked_range(a, l1, l2, expect)
   local buf = loc_buf(a)
   local count = api.nvim_buf_line_count(buf)
+  if a.query then
+    l1, l2 = resolve_query(api.nvim_buf_get_lines(buf, 0, -1, false), a.query, doc_name(a))
+  end
   if l1 < 1 or l2 < l1 then
     fail(("bad range %d-%d"):format(l1, l2), 6)
   end
@@ -2935,7 +2994,7 @@ local function checked_range(a, l1, l2, expect)
       fail(("--expect %q not found in %s:%s%s; line %d is %q"):format(expect, doc_path(a), range, at, l1, first), 6)
     end
   end
-  return buf
+  return buf, l1, l2
 end
 
 H.step = function(a)
@@ -2944,8 +3003,7 @@ H.step = function(a)
   if not ROLES[role] then
     fail("unknown role: " .. tostring(role), 2)
   end
-  local l1, l2 = a.l1, a.l2 or a.l1
-  local buf = checked_range(a, l1, l2, a.expect)
+  local buf, l1, l2 = checked_range(a, a.l1 or 0, a.l2 or a.l1 or 0, a.expect)
   local link = resolve_sheet(a.sheet, a.sheet_env)
   local steps = S.tour.steps
   local at = a.at or (#steps + 1)
@@ -2982,6 +3040,8 @@ H.step = function(a)
     from = from,
     sheet = link,
     expect = expect_list(a.expect),
+    query = a.query, -- the text range the lines came from (nil: the agent gave line numbers)
+    resolved_from = a.resolved_from,
     orig_l1 = l1, -- the range given by the agent, for the report when the step moves
     orig_l2 = l2,
     extmark_ids = {},
@@ -3044,14 +3104,15 @@ H.edit = function(a)
   local moved = a.file ~= nil
   sync_step(step) -- without a new location the step keeps the lines it has now, not the old ones
   local loc = a.file
-      and { file = a.file, ref = a.sha and a.ref or nil, sha = a.sha, rel = a.rel, lines = a.lines, diagram = a.diagram }
+      and { file = a.file, ref = a.sha and a.ref or nil, sha = a.sha, rel = a.rel, lines = a.lines, diagram = a.diagram, query = a.query }
     or { file = step.file, ref = step.ref, sha = step.sha, diagram = step.diagram }
   local l1, l2 = a.l1 or step.l1, a.l2 or a.l1 or step.l2
   local buf = step.buf
   if moved or not step.lost then -- a lost step has no lines to check; only a new location gives it some
-    buf = checked_range(loc, l1, l2, a.expect)
+    buf, l1, l2 = checked_range(loc, l1, l2, a.expect)
   end
   if moved then
+    step.query, step.resolved_from = a.query, a.resolved_from
     del_anchor(step)
     step.lost, step.lost_reason = nil, nil
   end
@@ -3188,6 +3249,10 @@ H.focus = function(a)
   local count = api.nvim_buf_line_count(buf)
   local ranges = {}
   for _, r in ipairs(a.ranges or {}) do
+    if r.query then -- a text range: the lines it selects now
+      local l1, l2 = resolve_query(api.nvim_buf_get_lines(buf, 0, -1, false), r.query, relpath(a.file))
+      r = { l1, l2 }
+    end
     if r[1] < 1 or r[2] < r[1] or r[2] > count then
       fail(("bad range %d-%d for %s (%d lines)"):format(r[1], r[2], a.file, count), 6)
     end

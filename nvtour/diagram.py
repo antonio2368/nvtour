@@ -124,16 +124,33 @@ def header_row(source: str, fmt: str, lines: list[str]) -> int:
 
 
 def parse_link(spec: str, lines: list[str]) -> dict[str, Any]:
-    """Parse ``TEXT=FILE:L1[-L2]``; TEXT must occur in the diagram ``lines`` and the range in FILE."""
-    text, sep, target = spec.rpartition("=")
-    if not sep or not text:
-        raise NvtourError(EXIT_USAGE, f"bad --link {spec!r}: expected TEXT=FILE:L1[-L2]")
+    """Parse ``TEXT=FILE:L1[-L2]`` or ``TEXT=FILE:/TEXT/``; TEXT must occur in the diagram ``lines``
+    and the range in FILE (a text range is resolved here, in the lines of FILE)."""
+    # The target may contain '=' (a text range): the last '=' that leaves a readable target splits.
+    pos, error = spec.rfind("="), None
+    while pos > 0:
+        text, target = spec[:pos], spec[pos + 1:]
+        try:
+            parsed = ranges.parse_spec(target)
+            break
+        except NvtourError as exc:
+            error = error or exc
+            pos = spec.rfind("=", 0, pos)
+    else:
+        if error is None:
+            raise NvtourError(EXIT_USAGE, f"bad --link {spec!r}: expected TEXT=FILE:L1[-L2]")
+        raise error
     if not any(text in line for line in lines):
         raise NvtourError(EXIT_BAD_FILE, f"--link text {text!r} is not in the diagram")
-    path, l1, l2 = ranges.parse_file_range(target)
+    path, l1, l2, query = parsed
     ranges.require_file(path)
-    with open(path, encoding="utf-8", errors="replace") as fh:
-        count = sum(1 for _ in fh)
-    if l2 > count:
-        raise NvtourError(EXIT_BAD_FILE, f"--link {text!r}: range {l1}-{l2} is beyond end of file ({count} lines): {path}")
+    file_lines = ranges.read_lines(path)
+    if query is not None:
+        try:
+            l1, l2 = ranges.resolve_query(file_lines, query, os.path.basename(path))
+        except NvtourError as exc:
+            raise NvtourError(exc.code, f"--link {text!r}: {exc.message}") from None
+    assert l1 is not None and l2 is not None
+    if l2 > len(file_lines):
+        raise NvtourError(EXIT_BAD_FILE, f"--link {text!r}: range {l1}-{l2} is beyond end of file ({len(file_lines)} lines): {path}")
     return {"text": text, "file": path, "l1": l1, "l2": l2}

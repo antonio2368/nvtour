@@ -138,7 +138,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--sheet", metavar="SHEET", help="the sheet this tour goes with; '#STEP' links to it")
 
     p = cmd("step", "add a step (only the first step of a tour jumps to it)")
-    p.add_argument("spec", metavar="FILE:L1[-L2]", help="the location; L1[-L2] with --diagram")
+    p.add_argument("spec", metavar="FILE:L1[-L2]|FILE:/TEXT/", help="the location, by line numbers or by text; "
+                   "L1[-L2] or /TEXT/ with --diagram")
     p.add_argument("--ref", metavar="GITREF", help="show FILE as it is at GITREF (read-only), not the working tree")
     p.add_argument("--diagram", metavar="NAME", help="put the step on lines L1[-L2] of diagram NAME")
     p.add_argument("--note", metavar="TEXT", help="note text, or - to read stdin")
@@ -160,8 +161,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = cmd("edit", "change step N (location, note, label or role)")
     p.add_argument("n", type=int)
-    p.add_argument("spec", nargs="?", metavar="FILE:L1[-L2]",
-                   help="new location (on the working tree unless --ref; L1[-L2] with --diagram)")
+    p.add_argument("spec", nargs="?", metavar="FILE:L1[-L2]|FILE:/TEXT/",
+                   help="new location (on the working tree unless --ref; L1[-L2] or /TEXT/ with --diagram)")
     p.add_argument("--ref", metavar="GITREF", help="the new location is FILE at GITREF (needs FILE:L1[-L2])")
     p.add_argument("--diagram", metavar="NAME", help="the new location is lines L1[-L2] of diagram NAME")
     p.add_argument("--note", metavar="TEXT", help="new note, - to read stdin, '' to remove")
@@ -189,8 +190,8 @@ def build_parser() -> argparse.ArgumentParser:
     cmd("last", "go to the last step")
 
     p = cmd("focus", "fold or dim everything except the given ranges")
-    p.add_argument("spec", metavar="FILE:L1-L2")
-    p.add_argument("more", nargs="*", metavar="L3-L4")
+    p.add_argument("spec", metavar="FILE:L1-L2|FILE:/TEXT/")
+    p.add_argument("more", nargs="*", metavar="L3-L4|/TEXT/")
     p.add_argument("--context", type=non_negative_int, default=2)
     p.add_argument("--dim", action="store_true")
 
@@ -212,7 +213,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("source", nargs="?", default="-", metavar="FILE|-", help="the diagram source (default: stdin)")
     p.add_argument("--format", choices=diagram.FORMATS,
                    help="source format (default: from the file extension, else mermaid)")
-    p.add_argument("--link", metavar="TEXT=FILE:L1[-L2]", action="append",
+    p.add_argument("--link", metavar="TEXT=FILE:L1[-L2]|TEXT=FILE:/TEXT/", action="append",
                    help="<CR> on TEXT in the diagram opens the range (repeat it for more links)")
     p.add_argument("--ascii", action="store_true", help="plain ASCII lines instead of Unicode box drawing")
     p.add_argument("--header", type=int, metavar="N",
@@ -301,17 +302,36 @@ def text_lines(text: str) -> list[str]:
     return lines
 
 
+def lua_query(query: dict[str, Any]) -> dict[str, Any]:
+    """A text range for Lua; absent parts are left out (nested nils do not survive msgpack)."""
+    return {k: v for k, v in query.items() if v is not None}
+
+
+def query_args(query: dict[str, Any]) -> dict[str, Any]:
+    """Step location args of a text range, in place of ``l1`` and ``l2``."""
+    return {"query": lua_query(query), "resolved_from": ranges.format_query(query)}
+
+
+def focus_range(l1: int | None, l2: int | None, query: dict[str, Any] | None) -> list[int] | dict[str, Any]:
+    """One focus range: ``[l1, l2]``, or ``{query}`` for a text range."""
+    return {"query": lua_query(query)} if query else [l1, l2]  # type: ignore[list-item]
+
+
 def location(spec: str, ref: str | None, diagram_name: str | None = None) -> dict[str, Any]:
     """Lua args for a step location: ``FILE:L1[-L2]`` on the working tree or at ``ref``, or
-    ``L1[-L2]`` of a diagram."""
+    ``L1[-L2]`` of a diagram. A text range (``FILE:/TEXT/``) gives ``query`` (the Lua runtime finds
+    the lines in the buffer) and ``resolved_from`` instead of ``l1`` and ``l2``."""
     if diagram_name is not None:
         if ref is not None:
             raise NvtourError(EXIT_USAGE, "--ref and --diagram cannot be used together")
-        l1, l2 = ranges.parse_range(spec)
+        l1, l2, query = ranges.parse_range_or_query(spec)
         name = diagram.check_name(diagram_name)
-        return {"diagram": name, "file": diagram.buffer_name(name), "l1": l1, "l2": l2}
-    path, l1, l2 = ranges.parse_file_range(spec)
-    loc: dict[str, Any] = {"file": path, "l1": l1, "l2": l2}
+        loc: dict[str, Any] = {"diagram": name, "file": diagram.buffer_name(name)}
+        loc.update(query_args(query) if query else {"l1": l1, "l2": l2})
+        return loc
+    path, l1, l2, query = ranges.parse_spec(spec)
+    loc = {"file": path}
+    loc.update(query_args(query) if query else {"l1": l1, "l2": l2})
     if ref is None:
         ranges.require_file(path)
     else:
@@ -380,9 +400,9 @@ def build_request(args: argparse.Namespace, workspace: str) -> tuple[str, dict[s
     if c in ("next", "prev", "first", "last", "where", "diff-close", "status"):
         return c, {}
     if c == "focus":
-        path, l1, l2 = ranges.parse_file_range(args.spec)
+        path, l1, l2, query = ranges.parse_spec(args.spec)
         ranges.require_file(path)
-        rs = [[l1, l2]] + [list(ranges.parse_range(r)) for r in args.more]
+        rs = [focus_range(l1, l2, query)] + [focus_range(*ranges.parse_range_or_query(r)) for r in args.more]
         return "focus", {**base, "file": path, "ranges": rs, "context": args.context, "dim": args.dim or None}
     if c == "unfocus":
         return "unfocus", {"file": ranges.resolve_path(args.file) if args.file else None}

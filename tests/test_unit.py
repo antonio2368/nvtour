@@ -6,7 +6,7 @@ import pytest
 
 from nvtour import cli, discover
 from nvtour.errors import EXIT_BAD_FILE, EXIT_USAGE, NvtourError
-from nvtour.ranges import parse_file_range, parse_range
+from nvtour.ranges import format_query, parse_file_range, parse_query, parse_range, parse_range_or_query, parse_spec
 
 
 def test_parse_single_and_range(tmp_path):
@@ -44,6 +44,91 @@ def test_file_literally_named_with_a_line_number(tmp_path):
 def test_parse_file_range_needs_colon():
     with pytest.raises(NvtourError):
         parse_file_range("nocolon")
+
+
+def q(start, end=None, plus=0, nth=None, near=None):
+    return {"start": start, "end": end, "plus": plus, "nth": nth, "near": near}
+
+
+QUERIES = [
+    ("/foo/", q("foo")),
+    ("/two words/", q("two words")),
+    ("/foo/+3", q("foo", plus=3)),
+    ("/foo/@2", q("foo", nth=2)),
+    ("/foo/~40", q("foo", near=40)),
+    ("/foo/@2+2", q("foo", nth=2, plus=2)),
+    ("/foo/~7+1", q("foo", near=7, plus=1)),
+    ("/a/../b/", q("a", end="b")),
+    ("/a/@2../b/", q("a", end="b", nth=2)),
+    ("/a/~9../b/+4", q("a", end="b", near=9, plus=4)),
+    ("/a\\/b/", q("a/b")),  # an escaped slash is part of the text
+    ("/http:\\/\\/x/", q("http://x")),
+    ("/Cache::get/", q("Cache::get")),
+    ("/ x /", q(" x ")),
+    ("/\\n/", q("\\n")),  # other backslashes stay as they are
+]
+
+
+@pytest.mark.parametrize("text,expected", QUERIES)
+def test_parse_query_table(text, expected):
+    assert parse_query(text) == expected
+    assert parse_query(format_query(expected)) == expected  # the canonical text reads back the same
+
+
+@pytest.mark.parametrize("bad", ["foo", "/foo", "//", "/foo/@0", "/foo/~0", "/foo/@2~3", "/foo/+", "/a/+1../b/",
+                                 "/a/../", "/a/../b", "/foo/x", "/foo/@", "/a\\/"])
+def test_parse_query_errors(bad):
+    with pytest.raises(ValueError):
+        parse_query(bad)
+
+
+def test_parse_spec_text_forms(tmp_path):
+    f = tmp_path / "a.cpp"
+    f.write_text("x")
+    assert parse_spec(f"{f}:/foo/") == (str(f), None, None, q("foo"))
+    assert parse_spec(f"{f}:/Cache::get/@2+1") == (str(f), None, None, q("Cache::get", nth=2, plus=1))
+    assert parse_spec(f"{f}:/a/../b/") == (str(f), None, None, q("a", end="b"))
+    assert parse_spec(f"{f}:/a\\/b/") == (str(f), None, None, q("a/b"))
+    assert parse_spec("a.cpp:/Cache::get/", str(tmp_path))[0] == str(tmp_path / "a.cpp")
+
+
+def test_parse_spec_numbers_still_work(tmp_path):
+    f = tmp_path / "f.cpp"
+    f.write_text("x")
+    assert parse_spec(f"{f}:7") == (str(f), 7, 7, None)
+    assert parse_spec(f"{f}:7-9") == (str(f), 7, 9, None)
+    assert parse_spec(f"{f}:12:5") == (str(f), 12, 12, None)  # L:COL
+    assert parse_spec(f"{f}:12-14:5") == (str(f), 12, 14, None)
+
+
+def test_parse_spec_path_with_colon(tmp_path):
+    d = tmp_path / "dir:/sub"
+    d.mkdir(parents=True)
+    f = d / "f.cpp"
+    f.write_text("x")
+    # ':/' is in the path, but "/sub/f.cpp:5" is not a query: the last ':' splits
+    assert parse_spec(f"{f}:5") == (str(f), 5, 5, None)
+    assert parse_spec(f"{f}:5:2") == (str(f), 5, 5, None)
+    # a query after such a path still works
+    assert parse_spec(f"{f}:/foo/") == (str(f), None, None, q("foo"))
+
+
+def test_parse_spec_bad_text_range_is_reported(tmp_path):
+    with pytest.raises(NvtourError) as e:
+        parse_spec(f"{tmp_path}/a.cpp:/foo")
+    assert e.value.code == EXIT_BAD_FILE and "'/' is missing" in e.value.message
+
+
+def test_parse_file_range_refuses_a_query(tmp_path):
+    with pytest.raises(NvtourError):
+        parse_file_range(f"{tmp_path}/a.cpp:/foo/")
+
+
+def test_parse_range_or_query():
+    assert parse_range_or_query("3-5") == (3, 5, None)
+    assert parse_range_or_query("/a/../b/") == (None, None, q("a", end="b"))
+    with pytest.raises(NvtourError):
+        parse_range_or_query("/a")
 
 
 W = "/home/u/proj"
