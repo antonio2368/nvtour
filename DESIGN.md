@@ -117,7 +117,7 @@ live instance.
 | code | meaning | stderr content |
 |---|---|---|
 | 0 | ok | |
-| 2 | usage error | argparse message (or invalid `--timeout`/`--context`, stdin is a terminal) |
+| 2 | usage error | argparse message (or invalid `--timeout`/`--context`, stdin is a terminal, a bad tour file: §15) |
 | 3 | no unique match | table of live instances (pid, cwd, score) + hint: `open nvim in <W>` or `nvtour attach <pid>` |
 | 4 | no live nvim at all, or `--socket` path missing | `no running nvim found; open nvim in <W> and retry` / `socket not found: P` |
 | 5 | RPC failure or timeout, nvim waiting for input | message with the phase; `waiting for input ... not run` |
@@ -137,14 +137,15 @@ Global flags (before the subcommand): `--socket PATH`, `--workspace DIR`, `--jso
 nvtour instances [--prune]
 nvtour attach [PID|SOCKET] [--clear]
 nvtour where
-nvtour start [TITLE]
+nvtour marks [--wait SECONDS] [--clear]
+nvtour start [TITLE] [--sheet SHEET]
 nvtour step FILE:L1[-L2] | FILE:/TEXT/... [--ref GITREF] [--note TEXT | --note -] [--label TEXT] [--role ROLE]
             [--expect TEXT]... [--via TEXT] [--from N] [--suggest TEXT | --suggest -] [--at N]
-            [--jump | --no-jump]
+            [--sheet SHEET#STEP] [--jump | --no-jump]
 nvtour step L1[-L2] | /TEXT/... --diagram NAME [the same options]
 nvtour edit N [FILE:L1[-L2] | FILE:/TEXT/... [--ref GITREF] | L1[-L2] | /TEXT/... --diagram NAME] [--note TEXT | --note -]
             [--label TEXT] [--role ROLE] [--expect TEXT]... [--via TEXT] [--from N]
-            [--suggest TEXT | --suggest -] [--jump]
+            [--suggest TEXT | --suggest -] [--sheet SHEET#STEP] [--jump]
 nvtour remove N
 nvtour apply [FILE | -] [--append] [--check] [--no-jump]
 nvtour chapter NAME [--at N] | nvtour chapter --remove N | nvtour chapter --list
@@ -316,7 +317,8 @@ M.state = {
   tour = { title = "", steps = {}, current = 0, qf_id = nil, chapters = {} },
   ns_steps = nvim_create_namespace("nvtour_steps"),
   ns_focus = nvim_create_namespace("nvtour_focus"),
-  panel = { buf = nil, win = nil, text = {}, user_closed = false },
+  ns_panel = nvim_create_namespace("nvtour_panel"),
+  panel = { buf = nil, win = nil, text = {}, user_closed = false, line_map = {} },  -- line_map: panel line -> step
   focus = { [bufnr] = { ranges = {...}, dim = bool, file = path,
                         saved = { [winid] = { foldmethod=, foldenable=, foldlevel=, foldminlines= } },
                         anchors = { { id, tail } ... },  -- nil for a focus from the steps
@@ -324,8 +326,13 @@ M.state = {
                         ref = "v1" } },  -- file at a git ref (a focus from the steps only)
   pending_folds = { [winid] = { [bufnr] = saved fold options } }, -- restored on BufWinEnter
   diff_tabs = { tabpage handles },
+  keymaps = { [lhs] = true },  -- the lhs of every key that we mapped (tour keys and mark keys)
   keys = { [action] = lhs },  -- the keys of the tour that were installed (KEYS.tour)
+  keymaps_installed = false,  -- the tour keys are installed
+  workspace = nil,  -- W, passed from Python (paths in the panel are relative to it)
+  warned = {},  -- keys that gave a warning already (one warning per key)
   mark_keys = { [action] = lhs },  -- the keys of the marks that were installed (KEYS.always)
+  mark_keymaps_installed = false,  -- the mark keys are installed
   marks = { { id, buf, file, ref, sha, diagram, l1, l2, kind, text, truncated, comment, at, extmark, tail } },
   ns_marks = nvim_create_namespace("nvtour_marks"),  -- the extmark and sign of each mark (§5, "Marks")
   mark_seq = n,  -- the id of the next mark
@@ -338,6 +345,7 @@ M.state = {
   ns_diagram = nvim_create_namespace("nvtour_diagram"),  -- the colours of diagram lines and links
   diagrams = { [name] = { name, file, buf, lines, header, links = { { text, file, l1, l2 } } } },  -- §10
   diagram_split = nil,  -- the last `diagram --split` (§10)
+  sheet_pending = {},  -- { timer, step }: the debounced `sheet goto` (§6, "Sheet link")
   ns_anchor = nvim_create_namespace("nvtour_anchor"),  -- one extmark per step (§6, "Steps follow edits")
   attached = { [bufnr] = true },  -- buffers with our nvim_buf_attach
   sync_timers = { [bufnr] = uv timer },  -- the debounced sync after an edit
@@ -348,7 +356,7 @@ M.state = {
 }
 ```
 
-Each step: `{ n, file, buf, l1, l2, role, label, note, expect, via, from, suggest, ref, sha, diagram, extmark_ids = {},
+Each step: `{ n, file, buf, l1, l2, role, label, note, expect, via, from, suggest, sheet, ref, sha, diagram, extmark_ids = {},
 anchor, anchor_buf, lost, lost_reason, orig_l1, orig_l2, query, resolved_from }`.
 `anchor` is the id of the anchor extmark (in `ns_anchor`, in buffer `anchor_buf`); a step on a diagram has none.
 `l1` and `l2` are the lines that the anchor had at the last sync. `lost` is true when the lines of
@@ -853,7 +861,7 @@ src/b.cpp
 src/a.cpp
   3. ✓ 430      the fix
 
-`]w` next · `[w` prev · `[W` first · `]W` last · `<leader>wp` panel · `<leader>wc` clear · `<CR>` jump · `q` close
+`]w` next · `[w` prev · `[W` first · `]W` last · `<leader>wp` panel · `<leader>wc` clear · `<leader>wk` peek · `<CR>` jump · `q` close
 
 ---
 <free markdown text set via `nvtour panel`>
@@ -1071,6 +1079,9 @@ visual mode, and are free only when `maparg` is empty in both modes. Global norm
 **only if `vim.fn.maparg(lhs, "n") == ""`**; otherwise `vim.notify` a warning once, return it in `warnings`,
 and skip that key. `vim.g.nvtour_keys` is read (missing entries use the defaults), never written.
 
+The actions are in two sets. `KEYS.tour` is `next`, `prev`, `first`, `last`, `panel`, `clear`, `next_chapter`,
+`prev_chapter` and `peek`. `KEYS.always` is `mark` and `mark_note`.
+
 ```lua
 DEFAULT_KEYS = {
   next = "]w", prev = "[w", first = "[W", last = "]W", panel = "<leader>wp", clear = "<leader>wc",
@@ -1147,18 +1158,19 @@ Install: `pip install --user --break-system-packages -e ~/projects/nvtour` → `
 ```
 ---
 name: nvtour
-description: Give a visual, read-only walkthrough of code inside the user's running Neovim while explaining a bug or a concept in chat — jump, highlight, annotate with virtual-text notes, fold to the relevant parts, show read-only diffs and text diagrams (Mermaid/Graphviz) linked to the code, keep a step panel. Use when the user explicitly asks to explain, walk through, show, or visualize something "in nvim" / "in the editor". Also use it, without asking first, when the user asks about code ("this chunk", "this function", "here", "what does this do"), gives no file, line or pasted code, and "this" does not point to something earlier in the chat: read their nvim cursor or selection to find the location and answer in chat. Never edits files.
+description: Give a visual, read-only walkthrough of code inside the user's running Neovim while explaining a bug or a concept in chat — jump, highlight, annotate with virtual-text notes, fold to the relevant parts, show read-only diffs and text diagrams (Mermaid/Graphviz) linked to the code, apply a whole tour from a TOML file, keep a step panel, read the places the user marked. Use when the user explicitly asks to explain, walk through, show, or visualize something "in nvim" / "in the editor". Also use it, without asking first, when the user asks about code ("this chunk", "this function", "here", "what does this do"), gives no file, line or pasted code, and "this" does not point to something earlier in the chat: read their nvim cursor or selection to find the location and answer in chat. Never edits files.
 ---
 ```
 
 Body (concise, imperative): see `skill/SKILL.md`. It covers point and ask (`attach` and `where`
 when no location is given, the previous-selection caveat, the `@REF`, `modified` and no-file
 flags, an answer in chat and a tour only on an explicit request in nvim), the workflow (attach,
-start, one step per point or, for 3 steps or more, the whole tour in one `apply` call, panel summary; only
-the first step moves the view), how to get line
-numbers right (`rg -n`, the echoed line, `--expect`), fixing a tour (`edit`, `remove`, `--at`,
-`status`), note style and roles, focus and its manual-fold caveat, diffs, and what to do on each
-exit code.
+start, one step per point or, for 3 steps or more, the whole tour in one `apply` call with a TOML example, panel
+summary; only the first step moves the view), how to get line numbers right (`FILE:/text/` first, the echoed
+line, `--expect`), fixing a tour (`edit`, `remove`, `--at`, `status`, steps that moved or were lost after edits,
+the questions that the user asks during a tour), chapters, marks (`marks --wait --clear`), note style and roles,
+links, sheets, focus (`focus --steps`) and its manual-fold caveat, old code, suggestions, diagrams, diffs, and what to
+do on each exit code.
 
 ## 14. Future
 
@@ -1166,6 +1178,7 @@ exit code.
   supports the kitty graphics protocol. Not for alacritty.
 - MCP stdio wrapper exposing the same commands as tools.
 - tmux: focus the pane running the selected nvim.
+- `nvtour save`: write the tour as a tour file (§15) from `status --json`.
 
 ## 15. Tour file format (`apply`)
 

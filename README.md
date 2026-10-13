@@ -41,7 +41,7 @@ Neovim in parallel. You step through the tour with `]w` / `[w`.
 | 📑 **Chapters** | `chapter "Name"` groups the steps of a long tour under headings. `]c` / `[c` move between chapters. |
 | 📦 **A tour in one call** | `nvtour apply` reads a whole tour (steps, chapters, focus, diagrams, panel) from a TOML file on stdin. |
 | 🔭 **Focus on the steps** | `focus --steps` folds every toured file to the lines of its steps. The folds follow the steps when they change. |
-| 👀 **Peek at a step** | `<leader>wk` shows the full note and suggested code of the step under the cursor in a float, without leaving the current step. |
+| 👀 **Follow and peek** | `<leader>wk` shows the full note and suggested code of the step under the cursor in a float, without leaving the current step. With `vim.g.nvtour_follow_cursor`, the step under the cursor becomes the current step. |
 | 📌 **Marks from you** | `<leader>wm` marks the line or selection under the cursor. The agent reads your marks with `nvtour marks`. |
 | ⚓ **Steps follow your edits** | When you edit a file during a tour, the steps move with the lines. `status` reports a step that moved or was lost. |
 
@@ -129,7 +129,7 @@ nvtour panel - <<'EOF'
 EOF
 ```
 
-How the steps behave:
+An agent makes the same tour in one call with [`nvtour apply`](#tour-files-apply). How the steps behave:
 
 - **Only the first step jumps.** The others are added without moving the view, so the finished tour is at
   step 1. `step --jump` forces a jump; `--no-jump` suppresses it for the first step too.
@@ -141,6 +141,88 @@ How the steps behave:
   `**bold**` (the markers are hidden).
 - **A jump scrolls** so that the note and the range are in view: centred when they fit, else the note at the
   top, and never past the end of the file. The range flashes briefly after a jump.
+
+### Tour files (`apply`)
+
+For a tour of 3 steps or more, write the whole tour as a file and run it in one call. One call is faster
+than many calls, and nothing is done when one step is wrong: the old tour stays as it was.
+
+```sh
+nvtour apply - <<'EOF'
+title = "Dangling iterator in cleanup"
+sheet = "arch"                        # optional, like start --sheet
+panel = """
+**Cause**: use after erase. **Fix**: copy the value before `erase()`.
+"""
+
+[[focus]]                             # optional, like nvtour focus
+file = "src/a.cpp"
+ranges = ["400-440", "/evict/../}/"]
+dim = false
+context = 2
+
+[[diagram]]                           # optional, like nvtour diagram
+name = "read"
+format = "mermaid"                    # or: file = "docs/read.mmd"
+source = """
+sequenceDiagram
+  C->>K: get
+"""
+links = ["get=src/cache.cpp:/Cache::get/+8"]
+split = "above"
+
+[[step]]
+at = "src/a.cpp:/it->second/"        # FILE:L1[-L2] or any text range
+role = "fault"
+label = "dangling iterator"
+note = "The iterator is used after `erase()` invalidated it."
+expect = ["it->second"]              # list or one string
+suggest = """
+        it->second.expires_at += ttl;
+"""                                  # string with new lines, or a list of lines
+sheet = "#evict"                     # SHEET#STEP or #STEP
+chapter = "The bug"                  # starts a chapter at this step
+
+[[step]]
+at = "src/a.cpp:/it->second/"
+ref = "origin/master"                # optional: the file at a git ref (not with diagram)
+role = "context"
+label = "the old code"
+
+[[step]]
+at = "2"                             # with diagram: L1[-L2] or a text range of the diagram
+diagram = "read"                     # optional: a step on a diagram (not with ref)
+label = "the read"
+via = "the cleanup thread runs `evict()`"
+from = 1                             # optional: the link comes from step 1 (an earlier step)
+EOF
+```
+
+- **The file** is TOML (`tomllib`), or JSON when the first character that is not white space is `{`. The
+  JSON object has the same keys. nvtour never writes a tour file. `apply FILE` reads a file, and `apply -`
+  (the default) reads stdin. Stdin from a terminal is exit 2.
+- **The keys** of `[[focus]]`, `[[diagram]]` and `[[step]]` are the options of `focus`, `diagram` and `step`.
+  `[[diagram]]` also takes `ascii`, `header` and `show` (`show = false` is `--no-show`), and needs one of
+  `source` and `file`. A step must have `at`; a focus must have `file` and `ranges`. `ref` and `diagram` do
+  not go together on one step. `suggest` and `expect` take a string or a list. A chapter is a key of the
+  step (`chapter = "Name"`): there is no `[[chapter]]` table. The steps are added in the order of the file, so `at` is a location, not a number.
+- **Unknown keys** and wrong types are exit 2, and the message names the entry. The entries are numbered
+  from 1 in the order of the file: `step[3]: unknown key "lable" (did you mean "label"?)`.
+- **Everything is checked first,** in nvim: files, ranges, text ranges, `expect`, `from`, sheet links,
+  chapter names and the lines of diagram steps. A failure is exit 6 (or 2) with the entry in front, for
+  example `step[4]: --expect "it->second" not found in src/a.cpp:402; line 402 is "..."`. Nothing is
+  changed: the old tour, its diagrams and its focus stay. (Buffers that were loaded stay loaded, as after a
+  failed `step`.)
+- **A new tour is the default.** `apply` does what `start` does, adds the diagrams, the focus, the steps and
+  the panel text, and jumps to step 1. `--no-jump` leaves the view where it is.
+- **`--append`** adds the steps to the current tour. The file has no `title` and no `sheet` then (exit 2).
+  `from` is a step number of the final tour: the steps that are there come first, so the first new step is
+  `steps + 1`. A new step can be on a diagram of the tour. `apply --append` jumps to the first new step,
+  unless you give `--no-jump`.
+- **`--check`** does all the checks and prints the resolved steps. It draws nothing and changes nothing.
+- **Output:** the two lines of `step` for each step, then `panel: N lines`, `chapters: N` and
+  `jumped to step 1`. With `--check` each step line starts with `ok ` and the last line is
+  `check: N steps ok`. `--json` has `steps`, `total`, `panel_lines`, `chapters`, `jumped_to` and `current`.
 
 ### Ranges by text
 
@@ -179,7 +261,52 @@ nvtour step src/a.cpp:/erase/~120                  # the line with "erase" that 
 - **The result:** the CLI prints the lines it found, as for any step: `step 2/3: a.cpp:412-415 ...` and the
   first line. With `--json` the field `resolved_from` has the text range (`/Cache::get/`).
 - The text is searched once, when the command runs. After that the step follows your edits like any step
-  (see below). `--expect` still checks the exact expression in the found lines.
+  (see [Steps follow your edits](#steps-follow-your-edits)). `--expect` still checks the exact expression in the found lines.
+
+### Chapters
+
+A tour of more than 8 steps is easier to follow in groups. A chapter is a heading in front of a step. It
+holds that step and the steps after it, up to the next chapter.
+
+```bash
+nvtour chapter "Why does it fail?"            # pending: the next step added starts the chapter
+nvtour step src/cache.cpp:88 --label erase
+nvtour step src/cache.cpp:120 --label race
+nvtour chapter "How do we fix it?"
+nvtour step src/cache.cpp:140 --label lock
+nvtour chapter "Fixes" --at 2                 # a heading in front of step 2 (it exists already)
+nvtour chapter --list
+nvtour chapter --remove 2
+```
+
+- **`chapter "Name"`** is pending: the next step that is added starts the chapter, wherever that step is
+  inserted (also with `step --at`). Only one chapter can be pending; a second name replaces the first.
+- **`chapter "Name" --at N`** puts the heading in front of step N. `--at` equal to the number of steps + 1 is
+  pending. A larger number is exit 6. If a chapter starts at step N already, the new name replaces the old
+  name.
+- **`chapter --remove N`** removes the chapter that starts at step N (the steps stay). With N equal to the
+  number of steps + 1 it removes the pending chapter. `chapter --list` shows the chapters in tour order, and
+  `status` shows them too (`--json`: `chapters = [{ name, step }]`, `step` is `null` when pending).
+- **A chapter follows its step.** An insert or a `remove` of another step does not move the heading. When the
+  step of a chapter is removed, the heading moves to the step that is now at that place. When there is no such
+  step, or that step starts a chapter already, the chapter is dropped.
+- **In the code** the first step of each chapter shows its name: a line `## Name` (group `NvtourPanelChapter`)
+  is the first line above the note, before the `◇` and `↔ sheet` lines. A step that is not current shows the
+  same line above its one-line note, so you see each chapter start while you scroll. A long name is cut with `…`,
+  and the peek float shows the line too.
+- **In the panel** a chapter is a line `## Name` (group `NvtourPanelChapter`) before its first step. The file
+  name line starts again after it. The `↓ via` line of that step stays: it is after the heading and before the
+  file name. `<CR>` on the line goes to the first step of the chapter. The progress
+  text stays `3/12`.
+- **In the winbar** the name is shown before the position: `Name · 3/12`. When the window is narrow, the
+  name is the first part that is left out.
+- **Keys:** `]c` goes to the first step of the next chapter. `[c` goes to the first step of the chapter that
+  you are in. When you are at that step already, it goes to the chapter before. A chapter whose steps are
+  all lost is skipped. In a window in diff mode, `]c` and `[c` keep the meaning of Vim (next or previous
+  change). Without chapters they show `no chapters`.
+- `step`, `goto` and the other commands print the same one line as before. `--json` has `chapter` (the name)
+  for the step that is shown.
+- `start` and `clear` remove all chapters.
 
 ### Steps follow your edits
 
@@ -200,10 +327,13 @@ so the step moves with the code. The range, the quickfix list, the panel and `]w
 - A diagram step whose `--expect` text is gone after `diagram NAME` is lost too.
 - Only anchors (extmarks) are used. The files and buffers are never changed.
 
-### Follow the cursor
+### Follow and peek
 
-Set `vim.g.nvtour_follow_cursor = true` (default off), or run `:NvtourFollow` to turn it on and off. Then the
-step that holds your cursor becomes the current step. Its full note, the winbar, the panel, the quickfix
+Two user-side features help you read a tour at your own pace. Follow mode changes the current step when the
+cursor moves. Peek shows one step in a float without a change of the current step.
+
+**Follow the cursor.** Set `vim.g.nvtour_follow_cursor = true` (default off), or run `:NvtourFollow` to turn
+it on and off. Then the step that holds your cursor becomes the current step. Its full note, the winbar, the panel, the quickfix
 index and the linked sheet step follow. Nothing scrolls, nothing flashes, and no message is shown.
 
 - Only normal-mode moves count (`CursorMoved`), after a pause of 100 ms. Moves in the panel do not count.
@@ -217,17 +347,15 @@ index and the linked sheet step follow. Nothing scrolls, nothing flashes, and no
 - Default off, because the sheet viewer would jump each time the cursor crosses a step, and the note
   under the cursor would change while you edit.
 
-### Peek at a step
-
-The note of a step that is not current is cut to one line. Press `<leader>wk` on a line of such a step to read
-all of it. A float opens at the cursor with the full content of the step: the `◇` line (file and version),
+**Peek at a step.** The note of a step that is not current is cut to one line. Press `<leader>wk` on a line
+of such a step to read all of it. A float opens at the cursor with the full content of the step: the `◇` line (file and version),
 the note with its `` `code` `` and `**bold**`, the suggested code with syntax colours in the `suggested`
 frame, and the `→ next` line. The border has the colour of the role, and the title shows `N/T label`.
 
 - The float closes when the cursor moves, when you leave the window or the buffer, with `<Esc>` or `q`,
   or when you press the key again. Only one float is open at a time.
 - The step does not become the current step. The note under the code, the winbar, the panel and the sheet
-  do not change. With the [follow mode](#follow-the-cursor) on, the cursor still has to move to change the
+  do not change. With the follow mode (above) on, the cursor still has to move to change the
   current step.
 - When ranges are nested, the innermost step wins. A line without a step shows `nvtour: no step here`.
 - `<Esc>` and `q` are mapped in the buffer only while the float is open. A buffer-local `<Esc>` or `q` of
@@ -322,51 +450,6 @@ there, and where you are. The current step shows both:
   `--via` link. You know where `]w` goes, and why, before you press it.
 - **In the panel,** each link is a line `↓ [from N: ]text` before the step, so the panel reads as a chain.
 - **Jumplist:** each jump adds the previous position to the jumplist, so `<C-o>` goes back.
-
-### Chapters
-
-A tour of more than 8 steps is easier to follow in groups. A chapter is a heading in front of a step. It
-holds that step and the steps after it, up to the next chapter.
-
-```bash
-nvtour chapter "Why does it fail?"            # pending: the next step added starts the chapter
-nvtour step src/cache.cpp:88 --label erase
-nvtour step src/cache.cpp:120 --label race
-nvtour chapter "How do we fix it?"
-nvtour step src/cache.cpp:140 --label lock
-nvtour chapter "Fixes" --at 2                 # a heading in front of step 2 (it exists already)
-nvtour chapter --list
-nvtour chapter --remove 2
-```
-
-- **`chapter "Name"`** is pending: the next step that is added starts the chapter, wherever that step is
-  inserted (also with `step --at`). Only one chapter can be pending; a second name replaces the first.
-- **`chapter "Name" --at N`** puts the heading in front of step N. `--at` equal to the number of steps + 1 is
-  pending. A larger number is exit 6. If a chapter starts at step N already, the new name replaces the old
-  name.
-- **`chapter --remove N`** removes the chapter that starts at step N (the steps stay). With N equal to the
-  number of steps + 1 it removes the pending chapter. `chapter --list` shows the chapters in tour order, and
-  `status` shows them too (`--json`: `chapters = [{ name, step }]`, `step` is `null` when pending).
-- **A chapter follows its step.** An insert or a `remove` of another step does not move the heading. When the
-  step of a chapter is removed, the heading moves to the step that is now at that place. When there is no such
-  step, or that step starts a chapter already, the chapter is dropped.
-- **In the code** the first step of each chapter shows its name: a line `## Name` (group `NvtourPanelChapter`)
-  is the first line above the note, before the `◇` and `↔ sheet` lines. A step that is not current shows the
-  same line above its one-line note, so you see each chapter start while you scroll. A long name is cut with `…`,
-  and the peek float shows the line too.
-- **In the panel** a chapter is a line `## Name` (group `NvtourPanelChapter`) before its first step. The file
-  name line starts again after it. The `↓ via` line of that step stays: it is after the heading and before the
-  file name. `<CR>` on the line goes to the first step of the chapter. The progress
-  text stays `3/12`.
-- **In the winbar** the name is shown before the position: `Name · 3/12`. When the window is narrow, the
-  name is the first part that is left out.
-- **Keys:** `]c` goes to the first step of the next chapter. `[c` goes to the first step of the chapter that
-  you are in. When you are at that step already, it goes to the chapter before. A chapter whose steps are
-  all lost is skipped. In a window in diff mode, `]c` and `[c` keep the meaning of Vim (next or previous
-  change). Without chapters they show `no chapters`.
-- `step`, `goto` and the other commands print the same one line as before. `--json` has `chapter` (the name)
-  for the step that is shown.
-- `start` and `clear` remove all chapters.
 
 ### Sheets
 
@@ -496,88 +579,6 @@ nvtour step src/cache.cpp:31-38 --label "load from the store" --via 'a miss call
 - `diagram` again with the same name replaces the lines. `--no-show` does not open the window. `clear` and
   `start` delete the diagrams, so make them after `start`.
 
-### Tour files (`apply`)
-
-For a tour of 3 steps or more, write the whole tour as a file and run it in one call. One call is faster
-than many calls, and nothing is done when one step is wrong: the old tour stays as it was.
-
-```sh
-nvtour apply - <<'EOF'
-title = "Dangling iterator in cleanup"
-sheet = "arch"                        # optional, like start --sheet
-panel = """
-**Cause**: use after erase. **Fix**: copy the value before `erase()`.
-"""
-
-[[focus]]                             # optional, like nvtour focus
-file = "src/a.cpp"
-ranges = ["400-440", "/evict/../}/"]
-dim = false
-context = 2
-
-[[diagram]]                           # optional, like nvtour diagram
-name = "read"
-format = "mermaid"                    # or: file = "docs/read.mmd"
-source = """
-sequenceDiagram
-  C->>K: get
-"""
-links = ["get=src/cache.cpp:/Cache::get/+8"]
-split = "above"
-
-[[step]]
-at = "src/a.cpp:/it->second/"        # FILE:L1[-L2] or any text range
-role = "fault"
-label = "dangling iterator"
-note = "The iterator is used after `erase()` invalidated it."
-expect = ["it->second"]              # list or one string
-suggest = """
-        it->second.expires_at += ttl;
-"""                                  # string with new lines, or a list of lines
-sheet = "#evict"                     # SHEET#STEP or #STEP
-chapter = "The bug"                  # starts a chapter at this step
-
-[[step]]
-at = "src/a.cpp:/it->second/"
-ref = "origin/master"                # optional: the file at a git ref (not with diagram)
-role = "context"
-label = "the old code"
-
-[[step]]
-at = "2"                             # with diagram: L1[-L2] or a text range of the diagram
-diagram = "read"                     # optional: a step on a diagram (not with ref)
-label = "the read"
-via = "the cleanup thread runs `evict()`"
-from = 1                             # optional: the link comes from step 1 (an earlier step)
-EOF
-```
-
-- **The file** is TOML (`tomllib`), or JSON when the first character that is not white space is `{`. The
-  JSON object has the same keys. nvtour never writes a tour file. `apply FILE` reads a file, and `apply -`
-  (the default) reads stdin. Stdin from a terminal is exit 2.
-- **The keys** of `[[focus]]`, `[[diagram]]` and `[[step]]` are the options of `focus`, `diagram` and `step`.
-  `[[diagram]]` also takes `ascii`, `header` and `show` (`show = false` is `--no-show`), and needs one of
-  `source` and `file`. A step must have `at`; a focus must have `file` and `ranges`. `ref` and `diagram` do
-  not go together on one step. `suggest` and `expect` take a string or a list. A chapter is a key of the
-  step (`chapter = "Name"`): there is no `[[chapter]]` table. The steps are added in the order of the file, so `at` is a location, not a number.
-- **Unknown keys** and wrong types are exit 2, and the message names the entry. The entries are numbered
-  from 1 in the order of the file: `step[3]: unknown key "lable" (did you mean "label"?)`.
-- **Everything is checked first,** in nvim: files, ranges, text ranges, `expect`, `from`, sheet links,
-  chapter names and the lines of diagram steps. A failure is exit 6 (or 2) with the entry in front, for
-  example `step[4]: --expect "it->second" not found in src/a.cpp:402; line 402 is "..."`. Nothing is
-  changed: the old tour, its diagrams and its focus stay. (Buffers that were loaded stay loaded, as after a
-  failed `step`.)
-- **A new tour is the default.** `apply` does what `start` does, adds the diagrams, the focus, the steps and
-  the panel text, and jumps to step 1. `--no-jump` leaves the view where it is.
-- **`--append`** adds the steps to the current tour. The file has no `title` and no `sheet` then (exit 2).
-  `from` is a step number of the final tour: the steps that are there come first, so the first new step is
-  `steps + 1`. A new step can be on a diagram of the tour. `apply --append` jumps to the first new step,
-  unless you give `--no-jump`.
-- **`--check`** does all the checks and prints the resolved steps. It draws nothing and changes nothing.
-- **Output:** the two lines of `step` for each step, then `panel: N lines`, `chapters: N` and
-  `jumped to step 1`. With `--check` each step line starts with `ok ` and the last line is
-  `check: N steps ok`. `--json` has `steps`, `total`, `panel_lines`, `chapters`, `jumped_to` and `current`.
-
 ---
 
 ## 📖 Command reference
@@ -608,7 +609,7 @@ EOF
 | command | what it does |
 |---|---|
 | `goto N`, `next`, `prev`, `first`, `last` | navigate (a lost step: `goto` is exit 6, the others skip it) |
-| `status` | the tour, focus, panel, diff tabs and installed keys; steps that moved `(was L1-L2)` or are lost `(lost)`; `modified:` files |
+| `status` | the tour, focus, panel, diff tabs and installed keys; chapters; steps that moved `(was L1-L2)` or are lost `(lost)`; `modified:` files; `follow: on` and `marks: N` when they apply |
 | `where` | cursor, live or previous selection (exact text), visible range of the user's file window |
 | `marks [--wait SECONDS] [--clear]` | the places that the user marked with `<leader>wm`; `--wait`: wait for a mark (exit 6 after the time); `--clear`: remove what is printed (see [Marks](#marks)) |
 
@@ -643,7 +644,7 @@ is skipped. The tour keys are set when a tour starts and removed by `clear`. The
 | `]W` / `[W` | last / first step |
 | `]c` / `[c` | first step of the next chapter / of this chapter (or the one before) |
 | `<leader>wp` | toggle panel |
-| `<leader>wk` | peek at the step under the cursor in a float (see [Peek at a step](#peek-at-a-step)) |
+| `<leader>wk` | peek at the step under the cursor in a float (see [Peek at a step](#follow-and-peek)) |
 | `<leader>wm` / `<leader>wM` | mark the cursor line or the selection for the agent / the same, then ask for a comment (see [Marks](#marks)); normal and visual mode; always installed, also without a tour |
 | `<leader>wc` | clear everything |
 
@@ -654,7 +655,7 @@ step after it), `K` peeks at that step, `q` closes the panel.
 
 **Commands:** `:NvtourNext`, `:NvtourPrev`, `:NvtourFirst`, `:NvtourLast`, `:NvtourNextChapter`,
 `:NvtourPrevChapter`, `:NvtourGoto N`, `:NvtourPanel`, `:NvtourClear`, `:NvtourPeek [N]` (see
-[Peek at a step](#peek-at-a-step)), `:NvtourFollow` (turn [follow mode](#follow-the-cursor) on or off),
+[Peek at a step](#follow-and-peek)), `:NvtourFollow` (turn [follow mode](#follow-and-peek) on or off),
 `:NvtourMarksClear` (remove all [marks](#marks)).
 
 **Quickfix:** the list `nvtour: <title>` works too (`:cnext`, `:cprev`), but it only moves the cursor. It does
@@ -710,6 +711,7 @@ In the names below, `{...}` is one of `Fault`, `Flow`, `Fix`, `Context`, `Info`.
 | `NvtourFrame{...}` | the frame around the note, the `╶─` lead of the "next" line |
 | `NvtourNoteBg` | the band behind all nvtour lines (`nvtour_note_style = "band"`) |
 | `NvtourDim`, `NvtourFlash` | `focus --dim`, the flash after a jump |
+| `NvtourDiagramLine`, `NvtourDiagramLink` | the box and arrow characters of a diagram, the underlined link texts |
 | `NvtourPanelCurrent`, `NvtourPanelFile`, `NvtourPanelProgress` | panel |
 | `NvtourPanelChapter` | the `## Name` line of a chapter in the panel, and the name in the winbar (links to `Title`) |
 | `NvtourLost` | `✗ lost` of a step whose lines were deleted (links to `DiagnosticError`) |
@@ -735,11 +737,11 @@ vim.api.nvim_create_autocmd("User", {
 | code | meaning |
 |:---:|---|
 | `0` | ok |
-| `2` | usage error |
+| `2` | usage error (also a bad tour file, an unknown key in it, or a range with `focus --steps`) |
 | `3` | no unique matching nvim (table of live instances on stderr) |
 | `4` | no live nvim at all, or the `--socket` path does not exist |
 | `5` | RPC failure or timeout; `waiting for input` means nvim is at a prompt and nothing ran |
-| `6` | bad file, range or `--expect`; `marks --wait`: `no marks after S s` |
+| `6` | bad file, range, text range or `--expect` (also `goto` on a lost step, or a failed entry of `apply`: `step[4]: ...`); `marks --wait`: `no marks after S s` |
 
 With `--json`, errors are printed on stdout too: `{"ok": false, "code": N, "error": "..."}`. Warnings (for
 example a key that is already mapped) are in the `warnings` list, or on stderr as `warning: ...`.

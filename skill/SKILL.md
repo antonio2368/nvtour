@@ -1,6 +1,6 @@
 ---
 name: nvtour
-description: Give a visual, read-only walkthrough of code inside the user's running Neovim while explaining a bug or a concept in chat — jump, highlight, annotate with virtual-text notes, fold to the relevant parts, show read-only diffs and text diagrams (Mermaid/Graphviz) linked to the code, keep a step panel. Use when the user explicitly asks to explain, walk through, show, or visualize something "in nvim" / "in the editor". Also use it, without asking first, when the user asks about code ("this chunk", "this function", "here", "what does this do"), gives no file, line or pasted code, and "this" does not point to something earlier in the chat: read their nvim cursor or selection to find the location and answer in chat. Never edits files.
+description: Give a visual, read-only walkthrough of code inside the user's running Neovim while explaining a bug or a concept in chat — jump, highlight, annotate with virtual-text notes, fold to the relevant parts, show read-only diffs and text diagrams (Mermaid/Graphviz) linked to the code, apply a whole tour from a TOML file, keep a step panel, read the places the user marked. Use when the user explicitly asks to explain, walk through, show, or visualize something "in nvim" / "in the editor". Also use it, without asking first, when the user asks about code ("this chunk", "this function", "here", "what does this do"), gives no file, line or pasted code, and "this" does not point to something earlier in the chat: read their nvim cursor or selection to find the location and answer in chat. Never edits files.
 ---
 
 # nvtour
@@ -27,44 +27,64 @@ Use this when the user asks about code ("this", "here", "this chunk") but gives 
 
 1. Run `nvtour attach` first.
    - Exit 3 or 4: relay the stderr message to the user verbatim and stop. Do not start nvim yourself.
-2. Run `nvtour start "<title>"`.
-3. Interleave with your chat explanation: one `nvtour step FILE:L1[-L2] ...` per point.
+2. A tour of 3 or more steps: write the whole tour as TOML and run `nvtour apply - <<'EOF' ... EOF` once. It starts the tour, adds the steps, sets the panel and jumps to step 1: do not run `start`, `step` or `panel` as well. A shorter tour: `nvtour start "<title>"`, then one `nvtour step FILE:L1[-L2] ...` per point.
+
+   ```
+   nvtour apply - <<'EOF'
+   title = "Dangling iterator in cleanup"
+   panel = "**Cause**: use after erase. **Fix**: copy the value before `erase()`."
+
+   [[step]]
+   at = "src/a.cpp:/it->second/"            # a text range (see "Line numbers")
+   chapter = "Why does it fail?"            # starts a chapter here (see "Chapters")
+   role = "fault"
+   label = "dangling iterator"
+   expect = ["it->second"]
+   note = "The iterator is used after `erase()` invalidated it."
+
+   [[step]]
+   at = "src/b.cpp:88"
+   role = "flow"
+   via = "the cleanup thread runs `evict()`"
+   note = "The cleanup thread erases the entry while the reader holds `it`."
+   EOF
+   ```
+
+   - Keys: top level `title`, `sheet`, `panel`, `[[focus]]`, `[[diagram]]`; `[[step]]` `at` (required), `role`, `label`, `note`, `expect`, `via`, `from`, `suggest`, `sheet`, `ref`, `chapter`, `diagram`.
+   - Check the echoed `step N/T` lines of every step. Run `apply --check` first when the tour is long or uses `ref`: it changes nothing, and the error names the entry (`step[4]: ...`). Use `step`, `edit` and `remove` only for fixes.
+3. Interleave with your chat explanation: one step per point.
    - Use 3 to 8 steps. One idea per step.
-   - For a tour of 3 or more steps, write the whole tour as TOML and run `nvtour apply - <<'EOF' ... EOF` once, in place of steps 2 to 4 (keys: `title`, `sheet`, `panel`, `[[step]]` with `at`, `role`, `label`, `note`, `expect`, `via`, `from`, `suggest`, `sheet`, `ref`, `chapter`, `[[focus]]`, `[[diagram]]`). Check the echoed `step N/T` lines, and run `apply --check` first when the tour is long or uses `ref`; a wrong entry changes nothing and the error names it (`step[4]: ...`). Use `step`, `edit` and `remove` only for fixes.
    - Follow reading order: cause, propagation, effect (or entry, core, exit).
    - Only the first step moves the user's view. Later steps are added without a jump, so the tour opens at step 1.
-   - When a step is in a different file from the step before it, give `--via TEXT`: why the tour goes there (see "Links").
-4. End with `nvtour panel -` holding a short markdown summary (heredoc on stdin).
+   - When a step is in a different file from the step before it, give `via` / `--via TEXT`: why the tour goes there (see "Links").
+4. End with a short markdown summary in the panel: the `panel` key, or `nvtour panel -` (heredoc on stdin).
 5. In chat, only say that the tour is open in nvim. Do not list the steps again and do not list the keys. Then continue with the rest of the reply (for example options or questions that are still open).
 
 ## Line numbers
 
-- Get line numbers from `rg -n` or `sed -n 'A,Bp'` output, not from memory.
-- Prefer `FILE:/text/` over line numbers from `rg`: `nvtour step a.cpp:/Cache::get/` is the line that has the text, `/text/+N` adds N lines, `/start/../end/` is a block, and `\/` is a slash in the text. The text is plain, not a regex. Quote it when it has spaces. On several matches nvtour fails with exit 6 and lists the lines: pick one with `@N` (the N-th) or `~L` (nearest to line L). `focus`, `edit`, `step --diagram NAME /label/` and `diagram --link 'TEXT=FILE:/text/'` take it too. Keep `--expect` for the exact expression.
+- Prefer `FILE:/text/` over numbers from `rg -n` (no `rg | cut` pipelines): `nvtour step a.cpp:/Cache::get/` is the line that has the text, `/text/+N` adds N lines, `/start/../end/` is a block, and `\/` is a slash in the text. The text is plain, not a regex. Quote it when it has spaces. On several matches nvtour fails with exit 6 and lists the lines: pick one with `@N` (the N-th) or `~L` (nearest to line L). `focus`, `edit`, `step --diagram NAME /label/` and `diagram --link 'TEXT=FILE:/text/'` take it too. In a tour file it is the same text in `at`.
+- When you use numbers, take them from `rg -n` or `sed -n 'A,Bp'` output, not from memory. `FILE:L:COL` (compiler and `rg --column` output) is accepted; the column is ignored.
 - Each `step` prints the first highlighted line (`  412| ...`). Check it.
-- Add `--expect TEXT` (a substring of the range) to make a wrong range fail with exit 6 instead of highlighting the wrong code. The user sees `TEXT` underlined, so pick the exact expression the note is about (for example `it->second`).
+- Add `--expect TEXT` (a substring of the range) to make a wrong range fail with exit 6 instead of highlighting the wrong code. A query and an expect together are fine. The user sees `TEXT` underlined, so pick the exact expression the note is about (for example `it->second`).
 - When the note names more than one part of the range, give `--expect` for each one (at most 3): `--expect 'refresh(key)' --expect 'it->second'`. Each text must be in the range.
-- `FILE:L:COL` (compiler and `rg --column` output) is accepted; the column is ignored.
 
 ## Fixing a tour
 
 - `nvtour edit N [FILE:L1-L2] [--note ...] [--label ...] [--role ...]` changes step N. `--label ''` removes the label.
 - `nvtour remove N` removes step N. `nvtour step ... --at N` inserts at position N.
-- `nvtour status` shows the tour, focus, panel and keys (and `marks: N` when the user marked places: see "Marks"). Use it after an error or when you lost track. Do not `clear` and start again.
-- The user can turn on follow mode (`status` shows `follow: on`): the current step then changes when the cursor of the user moves, without `]w`. Run `nvtour status` before you answer a follow-up question during a tour. The user can also peek at any step in a float (`<leader>wk`, or `K` in the panel) without a change of the current step, so a question can be about a step that is not current.
-- Steps follow the edits of the user. After the user edits files, run `nvtour status`: a step `(was 88-90)` moved and is fine. A step `(lost)` needs `nvtour edit N FILE:L1-L2`. A `modified: a.cpp` line means the buffer differs from disk: line numbers from `rg` can be wrong in that file.
+- `nvtour status` shows the tour, focus, panel and keys. Use it after an error or when you lost track. Do not `clear` and start again.
+- **Questions during a tour:** before you answer a question that the user asks while a tour is open, run `nvtour status` and answer relative to the current step. The user may have moved with `]w`, `<CR>` in the panel, by cursor (`follow: on`), or read another step in a peek float (`<leader>wk`, `K` in the panel) that does not change the current step. If `status` shows `marks: N`, or the user mentions "the places I marked", run `nvtour marks` and use them.
+- **Edited files:** steps follow the edits of the user. A step `(was 88-90)` moved and is fine. A step `(lost)` needs `nvtour edit N FILE:/text/`. A `modified: a.cpp` line means the buffer differs from disk: read the text from `status` or `where`, not from `sed` or `rg`.
 
 ## Chapters
 
-- For a tour of more than 8 steps, group the steps: run `nvtour chapter "Why does it fail?"` before the first step of each group (the next step you add starts the chapter). Use 3 to 6 steps per chapter, and name each chapter after the question that it answers; the first step of each chapter shows its name above the note, so do not repeat it in the note. The user moves between chapters with `]c` / `[c`. `nvtour chapter --list` shows them; `nvtour chapter "Name" --at N` and `nvtour chapter --remove N` fix them.
+- For a tour of more than 8 steps, group the steps: `chapter = "Why does it fail?"` on the first step of each group in the tour file (or `nvtour chapter "Why does it fail?"` before the first step of each group; the next step you add starts the chapter). Use 3 to 6 steps per chapter, and name each chapter after the question that it answers. The first step of each chapter shows its name above the note, so do not repeat it in the note. The user moves between chapters with `]c` / `[c`. `nvtour chapter --list` shows them; `nvtour chapter "Name" --at N` and `nvtour chapter --remove N` fix them.
 
 ## Marks (the user points at places)
 
 - When you need the user to point at several places, ask them to put the cursor on each place (or select it) and press `<leader>wm`, or `<leader>wM` to add a comment. Then run `nvtour marks --wait 110 --clear`: it returns as soon as there is a mark, and prints the file, the lines, the first lines of the text, the git ref (`@REF`) and the comment. Exit 6 (`no marks after 110 s`) means the user has not marked yet: tell them, and run it again when they say they are done.
-- If `nvtour status` shows `marks: N`, or the user says "the places I marked", run `nvtour marks` to read them. Add `--json` for the whole text of a mark.
-- A mark that shows `(lines deleted)` points at lines that the user deleted: use the saved text. A mark with `@REF` is on the file at that git ref: read `git show REF:PATH`.
-- The marks stay when you run `start` or `clear`. They belong to the user.
-- While the user types a comment (`<leader>wM`), nvim waits for input and commands fail with exit 5 `waiting for input`: retry once after a short wait.
+- To read marks that are there already, run `nvtour marks` (`--json` has the whole text of a mark). A mark with `(lines deleted)` points at lines that the user deleted: use the saved text. A mark with `@REF` is on the file at that git ref: read `git show REF:PATH`.
+- The marks stay when you run `start` or `clear`: they belong to the user.
 
 ## Writing notes
 
@@ -105,7 +125,7 @@ Use this when the user asks about code ("this", "here", "this chunk") but gives 
 ## Focus
 
 - Concept spans a long file: run `nvtour focus FILE:a-b c-d` once per file.
-- After a long tour in long files, run `nvtour focus --steps` once. It folds every toured file to the lines of its steps, and it stays in sync when you add, edit or remove steps (or the user edits). Use `--dim` when the user has manual folds. Run it again when a new file gets its first step.
+- After a long tour in long files, run `nvtour focus --steps` once. It folds every toured file to the lines of its steps, and it stays in sync when you add, edit or remove steps (or the user edits). Run it again when a new file gets its first step.
 - During a tour, focus does not move the view; the folds appear when that file is shown.
 - Fold mode removes the user's own manual folds in that window. Use `--dim` if the user has manual folds or the surrounding code matters. `nvtour unfocus` undoes it.
 
@@ -158,7 +178,7 @@ Use this when the user asks about code ("this", "here", "this chunk") but gives 
 - Never run `nvtour clear` unless the user asks or you start a new tour.
 - Never run `nvtour marks --clear` unless you have read the marks in this turn (`--clear` prints what it removes, so one call is enough).
 - Exit codes: 2 usage, 3 no unique nvim match, 4 no nvim (or `--socket` path missing), 5 RPC failure, 6 bad file, range or `--expect` (or `marks --wait` with no mark).
-- Exit 5 with `waiting for input`: nothing ran. Ask the user to press `<Esc>` or `<Enter>` in nvim, then retry once.
+- Exit 5 with `waiting for input`: nothing ran. If you asked the user to mark places, they may be typing a comment (`<leader>wM`): wait, then retry once. Else ask the user to press `<Esc>` or `<Enter>` in nvim, then retry once.
 - Exit 5 with a timeout `during dispatch`: the command may still run. Run `nvtour status` before you retry.
 - Warnings (for example a key that is already mapped) are printed on stderr as `warning: ...`.
 - Global flags: `--socket PATH`, `--workspace DIR`, `--json`, `--timeout S`.
