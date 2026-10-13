@@ -49,6 +49,7 @@ Use this when the user asks about code ("this", "here", "this chunk") but gives 
 - `nvtour edit N [FILE:L1-L2] [--note ...] [--label ...] [--role ...]` changes step N. `--label ''` removes the label.
 - `nvtour remove N` removes step N. `nvtour step ... --at N` inserts at position N.
 - `nvtour status` shows the tour, focus, panel and keys. Use it after an error or when you lost track. Do not `clear` and start again.
+- Steps follow the edits of the user. After the user edits files, run `nvtour status`: a step `(was 88-90)` moved and is fine. A step `(lost)` needs `nvtour edit N FILE:L1-L2`. A `modified: a.cpp` line means the buffer differs from disk: line numbers from `rg` can be wrong in that file.
 
 ## Writing notes
 

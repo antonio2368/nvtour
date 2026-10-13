@@ -417,6 +417,15 @@ def fmt_sheet(res: Mapping[str, Any]) -> str:
     return f"  ↔ sheet {res['sheet']}" if res.get("sheet") else ""
 
 
+def fmt_moved(s: Mapping[str, Any]) -> str:
+    """``(lost: reason)`` for a step whose lines are gone, ``(was L1-L2)`` for a step that moved."""
+    if s.get("lost"):
+        return f"  (lost: {s['lost_reason']})" if s.get("lost_reason") else "  (lost)"
+    if s.get("orig_l1") is not None and (s["orig_l1"], s.get("orig_l2")) != (s["l1"], s["l2"]):
+        return f"  (was {fmt_range(s['orig_l1'], s.get('orig_l2') or s['orig_l1'])})"
+    return ""
+
+
 def format_result(args: argparse.Namespace, res: dict[str, Any], workspace: str) -> str:
     """One-line (or short) human output for a successful command."""
     c = args.command
@@ -424,7 +433,8 @@ def format_result(args: argparse.Namespace, res: dict[str, Any], workspace: str)
         if res.get("message"):
             return str(res["message"])
         label = f" {res['label']}" if res.get("label") else ""
-        out = f"step {res['n']}/{res['total']}: {fmt_loc(res, workspace)} [{res['role']}]{label}{fmt_sheet(res)}"
+        lost = "  (lost)" if res.get("lost") else ""
+        out = f"step {res['n']}/{res['total']}: {fmt_loc(res, workspace)} [{res['role']}]{label}{fmt_sheet(res)}{lost}"
         if res.get("text") is not None:
             out += f"\n  {res['l1']}| {res['text']}"  # lets the agent see what it highlighted
         return out
@@ -469,7 +479,7 @@ def format_status(res: dict[str, Any], workspace: str) -> str:
     for s in res.get("steps") or []:
         mark = "▶" if s["n"] == res["current"] else " "
         label = f" {s['label']}" if s.get("label") else ""
-        out.append(f"  {mark} {s['n']}. {fmt_loc(s, workspace)} [{s['role']}]{label}{fmt_sheet(s)}")
+        out.append(f"  {mark} {s['n']}. {fmt_loc(s, workspace)} [{s['role']}]{label}{fmt_sheet(s)}{fmt_moved(s)}")
         if s.get("via") or s.get("from"):
             src = f"from {s['from']}" if s.get("from") else ""
             via = " ".join((s.get("via") or "").split())
@@ -477,6 +487,8 @@ def format_status(res: dict[str, Any], workspace: str) -> str:
         if s.get("suggest"):
             n = len(s["suggest"])
             out.append(f"       + suggested: {n} line{'' if n == 1 else 's'}")
+    if res.get("modified_files"):
+        out.append("modified: " + ", ".join(display_path(p, workspace) for p in res["modified_files"]))
     for f in res.get("focus") or []:
         rs = " ".join(fmt_range(a, b) for a, b in f["ranges"])
         out.append(f"focus: {display_path(f['file'], workspace)} {rs} ({f['mode']})")

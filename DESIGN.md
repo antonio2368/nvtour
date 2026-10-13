@@ -202,8 +202,13 @@ more ranges; extra bare `L3-L4` arguments apply to the same file.
   steps when the steps are renumbered; `edit` without `--sheet` keeps the link.
 - **goto / next / prev / first / last** — move the current step (wraps at ends is **not** desired;
   clamp and say `already at last step`). `prev` before any jump goes to step 1. Prints the same
-  lines as `step`.
+  lines as `step`. A lost step (§6, "Steps follow edits") makes `goto` fail with exit 6;
+  `next`, `prev`, `first` and `last` skip it.
 - **status** — the tour (title, steps, current), focus, panel, diff tabs and installed keys. Read only.
+  Steps follow the edits of the user (§6, "Steps follow edits"): the lines are the current ones, a
+  step that moved shows `(was L1-L2)`, a step whose lines were deleted shows `(lost: reason)`, and
+  `modified: a.cpp, b.cpp` lists the files whose buffer differs from disk (`modified_files` and
+  per step `modified`, `orig_l1`, `orig_l2`, `lost`, `lost_reason` in `--json`).
   A step with a sheet link has `sheet` (`SHEET#STEP`) in `--json` and `↔ sheet SHEET#STEP` in the text;
   `tour_sheet` and the line `sheet: SHEET` show the sheet of the tour.
 - **focus / unfocus** — §8.
@@ -249,10 +254,19 @@ M.state = {
   ns_diagram = nvim_create_namespace("nvtour_diagram"),  -- the colours of diagram lines and links
   diagrams = { [name] = { name, file, buf, lines, header, links = { { text, file, l1, l2 } } } },  -- §10
   diagram_split = nil,  -- the last `diagram --split` (§10)
+  ns_anchor = nvim_create_namespace("nvtour_anchor"),  -- one extmark per step (§6, "Steps follow edits")
+  attached = { [bufnr] = true },  -- buffers with our nvim_buf_attach
+  sync_timers = { [bufnr] = uv timer },  -- the debounced sync after an edit
+  reloaded = { [bufnr] = true },  -- the content was replaced; the steps are anchored again
 }
 ```
 
-Each step: `{ n, file, buf, l1, l2, role, label, note, expect, via, from, suggest, ref, sha, diagram, extmark_ids = {} }`.
+Each step: `{ n, file, buf, l1, l2, role, label, note, expect, via, from, suggest, ref, sha, diagram, extmark_ids = {},
+anchor, anchor_buf, lost, lost_reason, orig_l1, orig_l2 }`.
+`anchor` is the id of the anchor extmark (in `ns_anchor`, in buffer `anchor_buf`); a step on a diagram has none.
+`l1` and `l2` are the lines that the anchor had at the last sync. `lost` is true when the lines of
+the step are gone, and `lost_reason` says why. `orig_l1` and `orig_l2` are the lines that the agent
+gave. A step made by an older runtime has none of these fields; every use of them accepts `nil`.
 `diagram` is the name of the diagram of a step on a diagram (§10), else nil.
 `suggest` is a list of lines (nil when there is no suggestion).
 `ref` and `sha` are nil for a step on the working tree. `from` is the step table of a `--from N`
@@ -488,6 +502,62 @@ so a step id is never read as a sheet id. `start --sheet SHEET` sets the sheet o
   set. A `#STEP` link without variables in its own call uses the ones of `start --sheet`. When nvim
   runs on a remote host, set the variable in the environment of the agent (or of nvim).
 
+### Steps follow edits
+
+The user can edit a buffer during a tour. The extmarks of a step move with the edit, but the numbers
+`l1` and `l2` do not. So each step on a file (or on a git ref) has one **anchor**: an extmark in
+`ns_anchor` over its lines. `sync_step` reads the anchor back into `l1` and `l2`.
+
+- **Anchor.** `nvim_buf_set_extmark(buf, ns_anchor, l1 - 1, 0, { end_row, end_col = #line(l2),
+  right_gravity = true, end_right_gravity = false, invalidate = true, undo_restore = true })`. A line
+  inserted above the first line (`O`) moves the range down. A line inserted after the last line
+  (`o`) does not make the range longer. A line inserted inside the range makes it longer. When a
+  range ends on an empty line, its end is the start of the next line, so that the end is not read as
+  an end that moved there. When the last line of the range is deleted, nvim moves the end to column 0 of
+  the next line; that row is then the first line after the range. A step on a diagram has no anchor,
+  because `diagram NAME` replaces all its lines.
+- **Sync.** `sync_step` sets `l1` and `l2` from the anchor. It is called first in `jump`,
+  `step_goto`, `H.edit` (when no new location is given), `H.remove`, `rerender_all`, `update_qf`,
+  `render_panel`, `H.status` and `step_result`. This costs one `nvim_buf_get_extmark_by_id` per
+  step. A step that changed is `stale` until it is drawn again.
+- **Change detection.** Every buffer that gets a step is watched with `nvim_buf_attach(buf, false,
+  { on_lines, on_reload, on_detach })`. The `on_lines` callback runs with the text locked, so it only
+  starts a timer: 150 ms after the last edit (one timer per buffer, as in "Sheet link") the sync runs
+  for that buffer. When a step of it is stale, `rerender_buf` draws the steps of this buffer again
+  (not `rerender_all`: an edit in one file of a tour across 10 files does not draw the other 9), then
+  the quickfix list and the panel are updated. The current step in another buffer is drawn again when
+  the step after it is in this buffer (its "next" line shows the line). The focus ranges of the buffer
+  have anchors too; when they changed, the folds are made again (after `InsertLeave` while the user
+  types). The callbacks call through `_G.nvtour`, so they survive a runtime upgrade.
+  `on_lines` returns `true` (detach) when the buffer has no more steps and no focus: this is how
+  `clear` detaches.
+- **Reload.** `:e!`, or a reload after a change on disk (`autoread`), replaces the content, and the
+  extmarks collapse. `on_reload` and `BufReadPost` (a fallback, also for a buffer that was wiped and
+  loaded again) set `reloaded[buf]`; the next sync anchors each step of the buffer again from its
+  last `l1` and `l2`, then checks the range and each `--expect` text. A range beyond the end of the
+  file, or a missing text, makes the step lost (`lost_reason`). The file on disk is the source after a
+  reload, so the agent runs `status` after files changed.
+- **Lost steps.** Deleting all lines of the range makes the anchor invalid (an undo makes it valid
+  again, and the step is back). A lost step has no marks in its buffer; the panel shows `✗ lost`
+  after the range (`NvtourLost`, linked to `DiagnosticError`); the quickfix text ends with
+  `(lost)`. `goto N` fails with exit 6 and `step N: its lines were deleted; re-point it with: nvtour
+  edit N FILE:L1-L2`. `next`, `prev`, `first` and `last` skip a lost step with a notification (and a
+  warning in the CLI output). `edit N --note ...` without a location changes the other fields and
+  keeps the step lost; `edit N FILE:L1-L2` gives it new lines and a new anchor.
+- **Report.** `status` has per step `orig_l1`, `orig_l2` (the lines that the agent gave), `lost`,
+  `lost_reason` and `modified` (the buffer differs from disk), and the top-level list
+  `modified_files`. The text shows `(was 88-90)` after a step that moved, `(lost: reason)` after a lost
+  step, and the line `modified: a.cpp, b.cpp` after the steps. `step`/`goto` output ends with
+  `(lost)` for a lost step. A line number from `rg` on disk can differ from the buffer when the file is
+  in `modified`.
+- **Diagram steps.** `diagram NAME` for a name that exists checks the steps on it again: a step beyond
+  the new last line is still an error (nothing changes); a step whose `--expect` text is not in its
+  lines any more is lost, until a later version of the diagram has the text again.
+- **Upgrade.** `rerender_all` makes the anchor of a step that has none (a step of an older runtime, or
+  a step whose buffer was loaded again), from its `l1` and `l2`. `reset` clears `ns_anchor` in all
+  buffers and cancels the timers. `clear_step_marks` clears `ns_anchor` too. Reading or writing an
+  anchor never changes a buffer: anchors are extmarks (§12 rule 1 is the same).
+
 ### Frame and band
 
 All virtual lines of a step (link lines, the note, the collapsed note) must not look like code. Both
@@ -599,6 +669,9 @@ closed (do not reopen automatically for steps if `user_closed`).
   cursor is wrong; use `vim.cmd(("%d,%dfoldclose"):format(a, b))` per gap).
 - `--dim` mode: no folds; one extmark per line outside the ranges with `line_hl_group =
   NvtourDim` in `ns_focus`. Buffer-local, works regardless of window.
+- The ranges follow the edits of the user like the steps do: each range has an anchor in `ns_anchor`
+  (§6, "Steps follow edits"). After an edit the ranges are read back and the folds are made again;
+  a range whose lines were all deleted is dropped.
 - Focus state is per buffer. When `step` later shows that buffer in the tour window, fold-mode
   focus is re-applied (folds are window-local and may be gone). Fold the step's own range open
   (`zv` after the jump already does this).

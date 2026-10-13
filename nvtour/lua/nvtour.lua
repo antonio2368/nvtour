@@ -23,6 +23,7 @@ local function new_state()
     ns_panel = api.nvim_create_namespace("nvtour_panel"),
     ns_flash = api.nvim_create_namespace("nvtour_flash"),
     ns_diagram = api.nvim_create_namespace("nvtour_diagram"),
+    ns_anchor = api.nvim_create_namespace("nvtour_anchor"), -- one extmark per step: where its lines are now
     flash = { buf = nil, seq = 0 },
     winbars = {}, -- [winid] = the window's own local 'winbar', restored by clear
     panel = { buf = nil, win = nil, text = {}, user_closed = false, line_map = {} },
@@ -40,6 +41,9 @@ local function new_state()
     diagrams = {}, -- [name] = { name, file, buf, lines, header, links = { { text, file, l1, l2 } } }
     diagram_split = nil, -- the side of a new diagram window from the last 'diagram --split' (default "above")
     sheet_pending = {}, -- { timer, step }: the debounced 'sheet goto' that waits to start (see "Sheet link")
+    attached = {}, -- [buf] = true: buffers with an nvim_buf_attach of ours (see "Steps follow edits")
+    sync_timers = {}, -- [buf] = the debounce timer of the sync after an edit
+    reloaded = {}, -- [buf] = true: the content was replaced (:e!); the steps are anchored again
   }
 end
 
@@ -130,6 +134,7 @@ local function define_highlights(force)
   set("NvtourDiagramLink", { fg = hl_attr("Directory", "fg") or fg, underline = true })
   set("NvtourPanelFile", { link = "Directory" })
   set("NvtourPanelProgress", { link = "Comment" })
+  set("NvtourLost", { link = "DiagnosticError" }) -- the "✗ lost" of a step whose lines are gone
   -- Lets init.lua re-apply overrides after a reload or colorscheme change:
   --   vim.api.nvim_create_autocmd("User", { pattern = "NvtourHighlights", callback = function() ... end })
   pcall(api.nvim_exec_autocmds, "User", { pattern = "NvtourHighlights", modeline = false })
@@ -530,6 +535,234 @@ local function expect_list(v)
 end
 
 local render_step -- forward declaration
+local attach_buf -- forward declaration (see "Steps follow edits")
+local sync_schedule -- the same
+
+---------------------------------------------------------------------------
+-- Anchors: where the lines of a step are now
+---------------------------------------------------------------------------
+
+-- Every step on a file (or a git ref) has one extmark in ns_anchor over its lines. The marks move
+-- with the user's edits; sync_step reads them back into step.l1 and step.l2.
+
+--- Make an anchor over lines l1-l2 of `buf`. Returns its id and `tail`, true when the end could not
+--- be put on a column: an empty last line at the end of the buffer.
+--- Gravity: the start moves with a line inserted above it (O on the first line); the end stays
+--- (o on the last line does not grow the range). A range that ends on an empty line ends at the
+--- start of the next line, so that the end is not mistaken for an end that moved there.
+local function set_anchor(buf, l1, l2)
+  local count = api.nvim_buf_line_count(buf)
+  l1 = math.min(math.max(l1, 1), count)
+  l2 = math.min(math.max(l2, l1), count)
+  local last = api.nvim_buf_get_lines(buf, l2 - 1, l2, false)[1] or ""
+  local row, col, tail = l2 - 1, #last, false
+  if last == "" and l2 > l1 then
+    if l2 < count then
+      row, col = l2, 0
+    else
+      tail = true
+    end
+  end
+  local id = api.nvim_buf_set_extmark(buf, S.ns_anchor, l1 - 1, 0, {
+    end_row = row,
+    end_col = col,
+    right_gravity = true,
+    end_right_gravity = false,
+    invalidate = true, -- deleting all lines of the range marks it invalid; an undo restores it
+    undo_restore = true,
+  })
+  return id, tail
+end
+
+--- Lines l1, l2 of the anchor `id` and whether it is invalid (all its lines were deleted). nil when
+--- the mark does not exist. A deleted last line moves the end to column 0 of the next line: that
+--- row is then the last line of the range.
+local function read_anchor(buf, id, tail)
+  local ok, m = pcall(api.nvim_buf_get_extmark_by_id, buf, S.ns_anchor, id, { details = true })
+  if not ok or not m or #m == 0 then
+    return nil
+  end
+  local d = m[3]
+  local count = api.nvim_buf_line_count(buf)
+  local l1, l2 = m[1] + 1, d.end_row + 1
+  if d.end_col == 0 and d.end_row > m[1] and not (tail and d.end_row == count - 1) then
+    l2 = d.end_row
+  end
+  l1 = math.min(math.max(l1, 1), count)
+  l2 = math.min(math.max(l2, l1), count)
+  return l1, l2, d.invalid and true or false
+end
+
+--- The first problem of lines l1-l2 of `buf` as a text: the range is beyond the end, or a text of
+--- `expect` is not in it. nil when the range is fine.
+local function range_problem(buf, l1, l2, expect)
+  local count = api.nvim_buf_line_count(buf)
+  if l1 < 1 or l2 > count then
+    return ("range %d-%d is beyond the end of the file (%d lines)"):format(l1, l2, count)
+  end
+  local lines = api.nvim_buf_get_lines(buf, l1 - 1, l2, false)
+  for _, text in ipairs(expect_list(expect) or {}) do
+    local found = false
+    for _, line in ipairs(lines) do
+      if line:find(text, 1, true) then
+        found = true
+        break
+      end
+    end
+    if not found then
+      return ("--expect %q not found in the lines"):format(text)
+    end
+  end
+  return nil
+end
+
+--- True when `step` has an anchor in its buffer.
+local function anchored(step)
+  local buf = step.buf
+  if not step.anchor or step.anchor_buf ~= buf or not valid_buf(buf) or not api.nvim_buf_is_loaded(buf) then
+    return false
+  end
+  local ok, m = pcall(api.nvim_buf_get_extmark_by_id, buf, S.ns_anchor, step.anchor, {})
+  return ok and m ~= nil and #m > 0
+end
+
+--- Delete the anchor of `step` (the step keeps its lines).
+local function del_anchor(step)
+  if step.anchor and valid_buf(step.anchor_buf) then
+    pcall(api.nvim_buf_del_extmark, step.anchor_buf, S.ns_anchor, step.anchor)
+  end
+  step.anchor, step.anchor_buf, step.tail = nil, nil, nil
+end
+
+--- Anchor `step` on its lines in its buffer. A step on a diagram has no anchor: a diagram is
+--- replaced as a whole.
+local function anchor_step(step)
+  local buf = step.buf
+  if step.diagram or not valid_buf(buf) or not api.nvim_buf_is_loaded(buf) then
+    return
+  end
+  del_anchor(step)
+  step.anchor, step.tail = set_anchor(buf, step.l1, step.l2)
+  step.anchor_buf = buf
+  step.orig_l1 = step.orig_l1 or step.l1 -- a step of an older runtime has no original range yet
+  step.orig_l2 = step.orig_l2 or step.l2
+  attach_buf(buf)
+end
+
+--- Anchor `step` again from its last known lines, after its buffer was reloaded or made again. The
+--- step is lost when the lines are beyond the end of the file now or an --expect text is gone.
+local function reanchor_step(step)
+  local buf = step.buf
+  if step.diagram or not valid_buf(buf) or not api.nvim_buf_is_loaded(buf) then
+    return
+  end
+  del_anchor(step)
+  local why = range_problem(buf, step.l1, step.l2, step.expect)
+  if why then
+    step.lost, step.lost_reason = true, why
+  else
+    step.lost, step.lost_reason = nil, nil
+    anchor_step(step)
+  end
+  step.stale = true
+end
+
+--- Anchor again all steps (and the focus ranges) of `buf`, whose content was replaced.
+local function reanchor_buf(buf)
+  S.reloaded[buf] = nil
+  if not valid_buf(buf) or not api.nvim_buf_is_loaded(buf) then
+    return
+  end
+  for _, s in ipairs(S.tour.steps) do
+    if s.buf == buf and not s.diagram then
+      reanchor_step(s)
+    end
+  end
+  local f = S.focus[buf]
+  if f and f.anchors then
+    local count = api.nvim_buf_line_count(buf)
+    f.anchors = {}
+    for i, r in ipairs(f.ranges) do
+      r[1], r[2] = math.min(r[1], count), math.min(r[2], count)
+      local id, tail = set_anchor(buf, r[1], r[2])
+      f.anchors[i] = { id = id, tail = tail }
+    end
+    f.stale = true
+  end
+  attach_buf(buf)
+end
+
+--- Read the anchor of `step` into step.l1, step.l2 and step.lost. Returns true when something
+--- changed; such a step is `stale` until it is drawn again.
+local function sync_step(step)
+  local buf = step.buf
+  if step.diagram or not valid_buf(buf) or not api.nvim_buf_is_loaded(buf) then
+    return false
+  end
+  if S.reloaded[buf] then
+    reanchor_buf(buf)
+  end
+  if not step.anchor then
+    return false -- no anchor yet, or lost by a reload: only edit gives it lines again
+  end
+  local l1, l2, invalid = read_anchor(buf, step.anchor, step.tail)
+  if not l1 then
+    reanchor_step(step) -- the mark is gone (the buffer was unloaded and loaded again)
+    return true
+  end
+  local changed = false
+  if invalid then
+    if not step.lost then
+      step.lost, step.lost_reason, changed = true, "lines deleted", true
+    end
+  else
+    if step.lost then
+      step.lost, step.lost_reason, changed = nil, nil, true
+    end
+    if l1 ~= step.l1 or l2 ~= step.l2 then
+      step.l1, step.l2, changed = l1, l2, true
+    end
+  end
+  if changed then
+    step.stale = true
+  end
+  return changed
+end
+
+--- sync_step for all steps of `buf`. Returns true when a step of it is stale: changed since it was
+--- drawn.
+local function sync_buf(buf)
+  local stale = false
+  for _, s in ipairs(S.tour.steps) do
+    if s.buf == buf then
+      sync_step(s)
+      stale = stale or s.stale == true
+    end
+  end
+  return stale
+end
+
+--- sync_step for all steps. A buffer with a changed step is drawn again by the debounced sync.
+local function sync_all()
+  local seen = {}
+  for _, s in ipairs(S.tour.steps) do
+    if sync_step(s) or s.stale then
+      seen[s.buf] = true
+    end
+  end
+  for buf in pairs(seen) do
+    if valid_buf(buf) and api.nvim_buf_is_loaded(buf) then
+      sync_schedule(buf)
+    end
+  end
+end
+
+--- Make sure `step` has an anchor and its buffer is watched; after its buffer was loaded again.
+local function ensure_track(step)
+  if not step.diagram and not step.lost and not anchored(step) then
+    reanchor_step(step)
+  end
+end
 
 --- The read-only buffer with the lines of `r` (an entry of S.refs), created when it does not exist.
 --- A nofile buffer loses its lines when it is unloaded, so an unloaded one is made again; all steps
@@ -562,6 +795,7 @@ local function ensure_ref_buf(r)
     if s.sha == r.sha and s.file == r.file and s.buf ~= buf then
       s.buf = buf
       s.extmark_ids = {}
+      ensure_track(s)
       render_step(s, tour_win(buf))
     end
   end
@@ -693,7 +927,16 @@ local function step_buf(step)
     step.buf = loc_buf(step)
   elseif not valid_buf(step.buf) or not api.nvim_buf_is_loaded(step.buf) then
     step.buf = load_buf(step.file)
+    -- The other steps on the file are in the old buffer: they take the new one, with new anchors.
+    for _, s in ipairs(S.tour.steps) do
+      if s ~= step and s.file == step.file and not s.sha and not s.diagram and s.buf ~= step.buf then
+        s.buf, s.extmark_ids = step.buf, {}
+        ensure_track(s)
+        render_step(s, tour_win(step.buf))
+      end
+    end
   end
+  ensure_track(step)
   return step.buf
 end
 
@@ -786,6 +1029,9 @@ local function unfocus_buf(buf)
   end
   if valid_buf(buf) then
     api.nvim_buf_clear_namespace(buf, S.ns_focus, 0, -1)
+    for _, a in ipairs(f.anchors or {}) do
+      pcall(api.nvim_buf_del_extmark, buf, S.ns_anchor, a.id)
+    end
   end
   for win, sv in pairs(f.saved or {}) do
     if valid_win(win) and api.nvim_win_get_buf(win) == buf then
@@ -942,6 +1188,7 @@ local function render_panel()
   if not valid_buf(S.panel.buf) then
     return
   end
+  sync_all()
   local buf = S.panel.buf
   local steps = S.tour.steps
   local lines = { "# " .. ((S.tour.title ~= "" and S.tour.title) or "Walkthrough"), "" }
@@ -980,9 +1227,14 @@ local function render_panel()
     local head = ("%d. %s"):format(s.n, ROLE_MARK[s.role] or "•")
     local range = fmt_range(s)
     local line = mark .. head .. " " .. range
+    local lost_at
+    if s.lost then
+      lost_at = #line
+      line = line .. " ✗ lost"
+    end
     local title = step_title(s)
     if title ~= "" then
-      line = line .. (" "):rep(rw - #range + 2) .. title
+      line = line .. (" "):rep(s.lost and 2 or (rw - #range + 2)) .. title
     end
     local link_at
     if s.sheet then
@@ -992,6 +1244,9 @@ local function render_panel()
     lines[#lines + 1] = line
     map[#lines] = s.n
     hls[#hls + 1] = { #lines, #mark, #mark + #head, "NvtourSign" .. cap(s.role) }
+    if lost_at then
+      hls[#hls + 1] = { #lines, lost_at, lost_at + #" ✗ lost", "NvtourLost" }
+    end
     if link_at then
       hls[#hls + 1] = { #lines, link_at, -1, "NvtourVia" }
     end
@@ -1641,6 +1896,10 @@ render_step = function(step, win)
     pcall(api.nvim_buf_del_extmark, buf, ns, id)
   end
   step.extmark_ids = {}
+  step.stale = nil
+  if step.lost then
+    return -- its lines are gone: nothing to mark
+  end
   local ids = step.extmark_ids
   local function add(row, opts, col)
     ids[#ids + 1] = api.nvim_buf_set_extmark(buf, ns, row, col or 0, opts)
@@ -1751,6 +2010,7 @@ local function new_qf()
 end
 
 local function update_qf(idx)
+  sync_all()
   if not qf_valid() then
     new_qf()
   end
@@ -1760,7 +2020,7 @@ local function update_qf(idx)
     if text == "" then
       text = doc_path(s) .. ":" .. s.l1
     end
-    local item = { lnum = s.l1, end_lnum = s.l2, text = ("[%s] %s"):format(s.role, text) }
+    local item = { lnum = s.l1, end_lnum = s.l2, text = ("[%s] %s%s"):format(s.role, text, s.lost and " (lost)" or "") }
     if s.sha or s.diagram then
       item.bufnr = step_buf(s) -- the read-only version or the diagram, not a file on disk
     else
@@ -1774,6 +2034,234 @@ local function update_qf(idx)
   end
   vim.fn.setqflist({}, "r", what)
 end
+
+---------------------------------------------------------------------------
+-- Steps follow edits
+---------------------------------------------------------------------------
+
+-- The anchors move with every edit; the step fields and the marks follow after a short pause. The
+-- on_lines callback of nvim_buf_attach runs with the text locked, so it only starts a timer (the
+-- same way as the sheet link): one burst of keys is one sync, and only the edited buffer is drawn
+-- again. The callbacks call through _G, so they survive a runtime upgrade.
+local SYNC_DEBOUNCE_MS = 150
+
+local function sync_cancel(buf)
+  local timer = S.sync_timers[buf]
+  S.sync_timers[buf] = nil
+  if timer then
+    pcall(function()
+      timer:stop()
+      timer:close()
+    end)
+  end
+end
+
+--- True when a step that is not on a diagram is in `buf`.
+local function has_steps(buf)
+  for _, s in ipairs(S.tour.steps) do
+    if s.buf == buf and not s.diagram then
+      return true
+    end
+  end
+  return false
+end
+
+--- Draw the steps of `buf` again. The current step in another buffer shows the line of the step
+--- after it, so it is drawn again when that step is in `buf`.
+local function rerender_buf(buf)
+  if not valid_buf(buf) then
+    return
+  end
+  api.nvim_buf_clear_namespace(buf, S.ns_steps, 0, -1)
+  local win = tour_win(buf)
+  for _, s in ipairs(S.tour.steps) do
+    if s.buf == buf then
+      s.extmark_ids = {}
+      if api.nvim_buf_is_loaded(buf) then
+        render_step(s, win)
+      end
+      s.stale = nil
+    end
+  end
+  local cur = S.tour.steps[S.tour.current]
+  local nxt = cur and S.tour.steps[cur.n + 1]
+  if cur and cur.buf ~= buf and nxt and nxt.buf == buf and valid_buf(cur.buf) and api.nvim_buf_is_loaded(cur.buf) then
+    render_step(cur, tour_win(cur.buf))
+  end
+end
+
+--- The focus ranges of `buf` from their anchors. A range whose lines were all deleted is dropped.
+--- Returns true when the ranges changed since the folds were made.
+local function sync_focus(buf)
+  local f = S.focus[buf]
+  if not f or not f.anchors or not valid_buf(buf) or not api.nvim_buf_is_loaded(buf) then
+    return false
+  end
+  if S.reloaded[buf] then
+    reanchor_buf(buf)
+  end
+  local ranges, anchors = {}, {}
+  for i, r in ipairs(f.ranges) do
+    local a = f.anchors[i]
+    local l1, l2, invalid
+    if a then
+      l1, l2, invalid = read_anchor(buf, a.id, a.tail)
+    end
+    if l1 and not invalid then
+      if l1 ~= r[1] or l2 ~= r[2] then
+        f.stale = true
+      end
+      ranges[#ranges + 1], anchors[#anchors + 1] = { l1, l2 }, a
+    else
+      f.stale = true
+      if a then
+        pcall(api.nvim_buf_del_extmark, buf, S.ns_anchor, a.id)
+      end
+    end
+  end
+  f.ranges, f.anchors = ranges, anchors
+  return f.stale == true
+end
+
+--- Make the folds of the focus of `buf` again from its (moved) ranges, in the windows that have them.
+--- While the user types in insert mode the folds wait for InsertLeave.
+local function refold(buf)
+  local f = S.focus[buf]
+  if not f then
+    return
+  end
+  if #f.ranges == 0 then
+    unfocus_buf(buf)
+    return
+  end
+  f.stale = nil
+  if f.dim then
+    return
+  end
+  if vim.fn.mode():find("^[iR]") then
+    f.refold = true
+    return
+  end
+  f.refold = nil
+  for win in pairs(f.saved or {}) do
+    if valid_win(win) and api.nvim_win_get_buf(win) == buf then
+      apply_folds(buf, win)
+    end
+  end
+end
+
+api.nvim_create_autocmd("InsertLeave", {
+  group = aug,
+  callback = function()
+    for buf, f in pairs(S.focus) do
+      if f.refold then
+        pcall(refold, buf)
+      end
+    end
+  end,
+})
+
+--- The debounced sync of `buf`: read the anchors; when a step moved or was lost, draw its buffer
+--- again and update the quickfix list and the panel.
+local function sync_fire(buf)
+  if not valid_buf(buf) then
+    return
+  end
+  local stale = sync_buf(buf)
+  local focus = sync_focus(buf)
+  if stale then
+    rerender_buf(buf)
+    if qf_valid() then
+      update_qf()
+    end
+    render_panel()
+  end
+  if focus then
+    refold(buf)
+  end
+end
+
+--- Run sync_fire for `buf` after 150 ms without an edit.
+sync_schedule = function(buf)
+  local timer = S.sync_timers[buf]
+  if timer then
+    timer:stop()
+  else
+    timer = uv.new_timer()
+    S.sync_timers[buf] = timer
+  end
+  timer:start(
+    SYNC_DEBOUNCE_MS,
+    0,
+    vim.schedule_wrap(function()
+      if S.sync_timers[buf] ~= timer then
+        return -- cancelled or replaced
+      end
+      sync_cancel(buf)
+      pcall(sync_fire, buf)
+    end)
+  )
+end
+
+--- Called by the on_lines callback of an attached buffer. Returns true to detach: the buffer has
+--- no steps (the tour was cleared or the steps were moved away).
+function M._buf_changed(buf)
+  if not has_steps(buf) and not (S.focus[buf] and S.focus[buf].anchors) then
+    S.attached[buf] = nil
+    sync_cancel(buf)
+    return true
+  end
+  sync_schedule(buf)
+  return nil
+end
+
+--- Called by the on_reload callback: the content of the buffer was replaced (:edit, a reload after
+--- a change on disk). The extmarks have collapsed, so the steps are anchored again from their last
+--- lines at the next sync.
+function M._buf_reloaded(buf)
+  S.reloaded[buf] = true
+  sync_schedule(buf)
+end
+
+function M._buf_detached(buf)
+  S.attached[buf] = nil
+  sync_cancel(buf)
+end
+
+--- Watch `buf` for edits (once). Detaches by itself when the buffer has no more steps.
+attach_buf = function(buf)
+  if S.attached[buf] or not valid_buf(buf) or not api.nvim_buf_is_loaded(buf) then
+    return
+  end
+  local function call(name)
+    return function(_, b)
+      local m = _G.nvtour
+      if not m then
+        return true
+      end
+      return m[name](b)
+    end
+  end
+  local ok = pcall(api.nvim_buf_attach, buf, false, {
+    on_lines = call("_buf_changed"),
+    on_reload = call("_buf_reloaded"),
+    on_detach = call("_buf_detached"),
+  })
+  if ok then
+    S.attached[buf] = true
+  end
+end
+
+-- Fallback for on_reload: a buffer that is read again (the file was reloaded or the user wiped it
+-- and came back) gets its steps anchored again.
+api.nvim_create_autocmd("BufReadPost", {
+  group = aug,
+  callback = function(ev)
+    if has_steps(ev.buf) or S.focus[ev.buf] then
+      M._buf_reloaded(ev.buf)
+    end
+  end,
+})
 
 ---------------------------------------------------------------------------
 -- Winbar, flash, scrolling
@@ -2089,6 +2577,7 @@ local function clear_step_marks()
       api.nvim_buf_clear_namespace(b, S.ns_steps, 0, -1)
       api.nvim_buf_clear_namespace(b, S.ns_focus, 0, -1)
       api.nvim_buf_clear_namespace(b, S.ns_flash, 0, -1)
+      api.nvim_buf_clear_namespace(b, S.ns_anchor, 0, -1)
     end
   end
 end
@@ -2234,6 +2723,10 @@ end
 --- Remove everything nvtour created. keep_panel keeps the panel window open.
 local function reset(keep_panel)
   sheet_cancel()
+  for buf in pairs(S.sync_timers) do
+    sync_cancel(buf)
+  end
+  S.reloaded = {}
   for buf in pairs(S.focus) do
     unfocus_buf(buf)
   end
@@ -2297,7 +2790,7 @@ local function installed_keys()
 end
 
 local function step_text(step)
-  if not valid_buf(step.buf) or not api.nvim_buf_is_loaded(step.buf) then
+  if step.lost or not valid_buf(step.buf) or not api.nvim_buf_is_loaded(step.buf) then
     return nil
   end
   local line = api.nvim_buf_get_lines(step.buf, step.l1 - 1, step.l1, false)[1] or ""
@@ -2305,6 +2798,7 @@ local function step_text(step)
 end
 
 local function step_result(step, extra)
+  sync_step(step)
   local r = {
     ok = true,
     n = step.n,
@@ -2320,6 +2814,7 @@ local function step_result(step, extra)
     sha = step.sha,
     diagram = step.diagram,
     sheet = step.sheet and sheet_label(step.sheet) or nil,
+    lost = step.lost or nil,
     text = step_text(step),
     keys = installed_keys(),
   }
@@ -2331,6 +2826,7 @@ end
 
 local function jump(step)
   step_buf(step)
+  sync_step(step)
   local win = tour_win(step.buf, true)
   -- The position before the jump goes into the jumplist of the window, so <C-o> goes back to it.
   pcall(api.nvim_win_call, win, function()
@@ -2367,7 +2863,11 @@ step_goto = function(n)
   if n < 1 or n > #steps then
     fail(("no such step %d (tour has %d)"):format(n, #steps), 6)
   end
+  sync_all()
   local step = steps[n]
+  if step.lost then
+    fail(("step %d: its lines were deleted; re-point it with: nvtour edit %d FILE:L1-L2"):format(n, n), 6)
+  end
   jump(step)
   update_qf(n)
   render_panel()
@@ -2390,6 +2890,7 @@ end
 
 --- Renumber the steps and render all of them again (after an insert, edit or remove).
 local function rerender_all()
+  sync_all()
   for _, b in ipairs(api.nvim_list_bufs()) do
     if valid_buf(b) then
       api.nvim_buf_clear_namespace(b, S.ns_steps, 0, -1)
@@ -2401,6 +2902,7 @@ local function rerender_all()
   for _, s in ipairs(S.tour.steps) do
     s.extmark_ids = {}
     if valid_buf(s.buf) and api.nvim_buf_is_loaded(s.buf) then
+      ensure_track(s) -- also creates the anchor of a step made by an older runtime
       render_step(s, tour_win(s.buf))
     end
   end
@@ -2480,11 +2982,14 @@ H.step = function(a)
     from = from,
     sheet = link,
     expect = expect_list(a.expect),
+    orig_l1 = l1, -- the range given by the agent, for the report when the step moves
+    orig_l2 = l2,
     extmark_ids = {},
   }
   -- The step is added only after it rendered (and jumped); a failure leaves no half step behind.
   local prev_current = S.tour.current
   local ok, err = pcall(function()
+    anchor_step(step)
     render_step(step, tour_win(buf))
     if do_jump then
       jump(step)
@@ -2494,6 +2999,7 @@ H.step = function(a)
     for _, id in ipairs(step.extmark_ids) do
       pcall(api.nvim_buf_del_extmark, step.buf, S.ns_steps, id)
     end
+    del_anchor(step)
     S.tour.current = prev_current
     pcall(rerender_all) -- the jump may have drawn the previous current step as not current
     error(err, 0)
@@ -2535,13 +3041,26 @@ H.edit = function(a)
   end
   local link, link_given = resolve_sheet(a.sheet, a.sheet_env)
   -- A new location replaces the old one completely: without a ref it is on the working tree.
+  local moved = a.file ~= nil
+  sync_step(step) -- without a new location the step keeps the lines it has now, not the old ones
   local loc = a.file
       and { file = a.file, ref = a.sha and a.ref or nil, sha = a.sha, rel = a.rel, lines = a.lines, diagram = a.diagram }
     or { file = step.file, ref = step.ref, sha = step.sha, diagram = step.diagram }
   local l1, l2 = a.l1 or step.l1, a.l2 or a.l1 or step.l2
-  local buf = checked_range(loc, l1, l2, a.expect)
+  local buf = step.buf
+  if moved or not step.lost then -- a lost step has no lines to check; only a new location gives it some
+    buf = checked_range(loc, l1, l2, a.expect)
+  end
+  if moved then
+    del_anchor(step)
+    step.lost, step.lost_reason = nil, nil
+  end
   step.file, step.ref, step.sha, step.diagram, step.buf = loc.file, loc.ref, loc.sha, loc.diagram, buf
   step.l1, step.l2 = l1, l2
+  if moved then
+    step.orig_l1, step.orig_l2 = l1, l2
+    anchor_step(step)
+  end
   if a.role then
     step.role = a.role
   end
@@ -2588,7 +3107,9 @@ H.edit = function(a)
 end
 
 H.remove = function(a)
+  sync_all()
   local step = step_at(a.n)
+  del_anchor(step)
   table.remove(S.tour.steps, step.n)
   local cur = S.tour.current
   if cur == step.n then
@@ -2602,31 +3123,59 @@ H.remove = function(a)
   return { ok = true, removed = step.n, total = #S.tour.steps, current = S.tour.current }
 end
 
+--- The number of the first step that is not lost, from step `n` (not included) in direction `dir`
+--- (1 or -1); nil when there is none. A skipped lost step is announced.
+local function live_step(n, dir)
+  local steps = S.tour.steps
+  local i = n + dir
+  while steps[i] and steps[i].lost do
+    local msg = ("step %d is lost (its lines were deleted); skipped"):format(i)
+    notify("nvtour: " .. msg, vim.log.levels.WARN)
+    if W then
+      W[#W + 1] = msg
+    end
+    i = i + dir
+  end
+  return steps[i] and i or nil
+end
+
 H["next"] = function()
+  sync_all()
   local n, total = S.tour.current, #S.tour.steps
   if total > 0 and n >= total and n > 0 then
     return step_result(S.tour.steps[n], { message = "already at last step" })
   end
-  return step_goto(n + 1)
+  local i = live_step(n, 1)
+  if not i and n > 0 then
+    return step_result(S.tour.steps[n], { message = "already at last step" })
+  end
+  return step_goto(i or n + 1)
 end
 
 H.prev = function()
+  sync_all()
   local n = S.tour.current
   if n == 0 then
-    return step_goto(1)
+    return step_goto(live_step(0, 1) or 1)
   end
   if n == 1 and #S.tour.steps > 0 then
     return step_result(S.tour.steps[1], { message = "already at first step" })
   end
-  return step_goto(n - 1)
+  local i = live_step(n, -1)
+  if not i then
+    return step_result(S.tour.steps[n], { message = "already at first step" })
+  end
+  return step_goto(i)
 end
 
 H.first = function()
-  return step_goto(1)
+  sync_all()
+  return step_goto(live_step(0, 1) or 1)
 end
 
 H.last = function()
-  return step_goto(#S.tour.steps)
+  sync_all()
+  return step_goto(live_step(#S.tour.steps + 1, -1) or #S.tour.steps)
 end
 
 ---------------------------------------------------------------------------
@@ -2649,7 +3198,14 @@ H.focus = function(a)
   end
   unfocus_buf(buf)
   local merged = merge_ranges(ranges, a.context or 2, count)
-  S.focus[buf] = { ranges = merged, dim = a.dim and true or false, file = a.file }
+  -- The ranges follow the edits of the user like the steps do (see "Steps follow edits").
+  local anchors = {}
+  for i, r in ipairs(merged) do
+    local id, tail = set_anchor(buf, r[1], r[2])
+    anchors[i] = { id = id, tail = tail }
+  end
+  S.focus[buf] = { ranges = merged, dim = a.dim and true or false, file = a.file, anchors = anchors }
+  attach_buf(buf)
   -- Before the first step focus shows the file; during a tour the view stays on the current step
   -- and folds are applied when the file is shown (by a step or by the user).
   local move = S.tour.current == 0
@@ -2762,7 +3318,7 @@ end
 local DIAGRAM_PREFIX = "nvtour://diagram/" -- the CLI names the file of a diagram step the same way
 
 --- Make diagram `a.name` from the rendered `a.lines`, or replace its lines. Steps on it stay;
---- a step beyond the new last line is an error.
+--- a step beyond the new last line is an error, a step whose --expect text is gone is lost.
 H.diagram = function(a)
   S.workspace = a.workspace or S.workspace
   local lines = a.lines or {}
@@ -2800,6 +3356,14 @@ H.diagram = function(a)
       end)
     end
     shown = true
+  end
+  -- The new lines may not have the --expect text of a step on it any more: such a step is lost until
+  -- a later version of the diagram has the text again. (A step beyond the end is refused above.)
+  for _, s in ipairs(S.tour.steps) do
+    if s.diagram == d.name then
+      local why = range_problem(buf, s.l1, s.l2, s.expect)
+      s.lost, s.lost_reason = why and true or nil, why
+    end
   end
   rerender_all() -- set_lines moved the marks of the steps on it
   return { ok = true, name = d.name, count = #lines, links = #d.links, header = d.header, shown = shown }
@@ -2884,9 +3448,23 @@ H.panel = function(a)
 end
 
 H.status = function()
-  local steps = {}
+  sync_all()
+  for buf in pairs(S.focus) do
+    sync_focus(buf)
+  end
+  local steps, modified, seen = {}, {}, {}
   for _, s in ipairs(S.tour.steps) do
+    local changed = valid_buf(s.buf) and vim.bo[s.buf].modified or false
+    if changed and not seen[s.file] then
+      seen[s.file] = true
+      modified[#modified + 1] = s.file
+    end
     steps[#steps + 1] = {
+      orig_l1 = s.orig_l1,
+      orig_l2 = s.orig_l2,
+      lost = s.lost or nil,
+      lost_reason = s.lost and s.lost_reason or nil,
+      modified = changed,
       n = s.n,
       file = s.file,
       ref = s.ref,
@@ -2928,6 +3506,7 @@ H.status = function()
     current = S.tour.current,
     total = #S.tour.steps,
     steps = steps,
+    modified_files = #modified > 0 and modified or nil,
     focus = focus,
     diagrams = diagrams,
     diff_tabs = diffs,

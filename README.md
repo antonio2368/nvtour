@@ -37,6 +37,7 @@ Neovim in parallel. You step through the tour with `]w` / `[w`.
 | 🔀 **Read-only diffs** | Shows a file against a git ref, another file or stdin. |
 | 🗺️ **Diagrams as steps** | Renders Mermaid or Graphviz to Unicode text above the code. Steps can point to its lines, and `<CR>` on a label opens the code. |
 | ✅ **Self-checking ranges** | `--expect TEXT` stops a wrong line number before it shows the wrong code. |
+| ⚓ **Steps follow your edits** | When you edit a file during a tour, the steps move with the lines. `status` reports a step that moved or was lost. |
 
 > [!IMPORTANT]
 > **nvtour never writes to a file buffer or to a file you edit.** It writes only its own pin cache
@@ -134,6 +135,25 @@ How the steps behave:
   `**bold**` (the markers are hidden).
 - **A jump scrolls** so that the note and the range are in view: centred when they fit, else the note at the
   top, and never past the end of the file. The range flashes briefly after a jump.
+
+### Steps follow your edits
+
+You can edit a file while the tour is open. Each step on a file has an anchor (an extmark) over its lines,
+so the step moves with the code. The range, the quickfix list, the panel and `]w` use the new lines.
+
+- A line inserted above the range moves the step down. A line inserted inside it makes the range longer.
+  A line added after its last line does not.
+- If you delete all the lines of a step, the step is **lost**: it has no marks, the panel shows `✗ lost`,
+  `goto N` fails with exit 6, and `]w` / `[w` skip it. Undo brings it back. To give it new lines:
+  `nvtour edit N FILE:L1-L2`.
+- `nvtour status` shows the current lines. A step that moved shows `(was 88-90)`, a lost step shows
+  `(lost: reason)`, and a line `modified: a.cpp, b.cpp` names the files whose buffer differs from the disk.
+  Line numbers from `rg` on disk can differ from the buffer in these files.
+- After `:e!` (or a reload after a change on disk), the file on disk is the source. Each step is anchored
+  again at its last lines. It is lost when those lines are beyond the end of the file or an `--expect` text
+  is gone. Run `nvtour status` after files changed.
+- A diagram step whose `--expect` text is gone after `diagram NAME` is lost too.
+- Only anchors (extmarks) are used. The files and buffers are never changed.
 
 ### Links between steps
 
@@ -314,8 +334,8 @@ nvtour step src/cache.cpp:31-38 --label "load from the store" --via 'a miss call
 
 | command | what it does |
 |---|---|
-| `goto N`, `next`, `prev`, `first`, `last` | navigate |
-| `status` | the tour, focus, panel, diff tabs and installed keys |
+| `goto N`, `next`, `prev`, `first`, `last` | navigate (a lost step: `goto` is exit 6, the others skip it) |
+| `status` | the tour, focus, panel, diff tabs and installed keys; steps that moved `(was L1-L2)` or are lost `(lost)`; `modified:` files |
 | `where` | cursor, live or previous selection (exact text), visible range of the user's file window |
 
 **View**
@@ -406,6 +426,7 @@ In the names below, `{...}` is one of `Fault`, `Flow`, `Fix`, `Context`, `Info`.
 | `NvtourNoteBg` | the band behind all nvtour lines (`nvtour_note_style = "band"`) |
 | `NvtourDim`, `NvtourFlash` | `focus --dim`, the flash after a jump |
 | `NvtourPanelCurrent`, `NvtourPanelFile`, `NvtourPanelProgress` | panel |
+| `NvtourLost` | `✗ lost` of a step whose lines were deleted (links to `DiagnosticError`) |
 
 The groups are defined with `default = true`, so a plain `vim.api.nvim_set_hl(0, "NvtourSignFault", {...})`
 in `init.lua` wins on first load. To survive colorscheme changes and runtime upgrades, set overrides in an
@@ -532,9 +553,15 @@ The full design is in [`DESIGN.md`](DESIGN.md).
 - `clear` unlists the buffers nvtour added to the buffer list (not shown and not modified); `--keep-buffers`
   keeps them listed. Buffers are never unloaded or wiped.
 
+**Edits by the user**
+
+- Each step on a file has an anchor extmark (namespace `nvtour_anchor`). `nvim_buf_attach` watches the buffer;
+  150 ms after the last edit only that buffer is drawn again. Deleting all lines of a range makes the step
+  lost (undo restores it). A reload (`:e!`) anchors again from the last lines and checks `--expect`.
+
 **Quickfix**
 
-- Quickfix item text is `[role] label`. `clear` empties the nvtour quickfix list (retitled `nvtour (cleared)`)
+- Quickfix item text is `[role] label`; a lost step ends with `(lost)`. `clear` empties the nvtour quickfix list (retitled `nvtour (cleared)`)
   because a single list cannot be deleted without dropping the user's others; if it is the current list, the
   previous list becomes current again. The next tour reuses the list while it is still the current one.
 
