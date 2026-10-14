@@ -902,7 +902,11 @@ ref: `git ref <ref> · <sha12>`, or `commit <sha12>` when the ref is a prefix of
 diagram: none. The window has `statuscolumn = "  "` (`side.MARGIN`): a left margin, also on wrapped lines;
 the rules end the same 2 cells before the right edge.
 `fillchars = "eob: "`, `breakindentopt = "list:-1"` with a `formatlistpat` for `•`, `-`, `*`, `+` and `1.`
-(a wrapped item goes on under its text). Card keys: `<CR>` on a line of the Next or Previous block (`card.line_map`) goes to that step, `q` runs `view inline`.
+(a wrapped item goes on under its text). Card keys: `<CR>` on a line of the Next or Previous block (`card.line_map`) goes to that step, `q` runs `card`.
+
+`card` hides the card when the side view shows it (`card.user_closed = true`: `side.render` keeps it closed,
+also on jumps), else shows it and sets the side view. `view side` resets `user_closed`, so the side view comes
+back with its card; so does `clear`. `<leader>ws` and `:NvtourCard` run it.
 
 `view [inline|side|toggle]` and `range_style [STYLE]` (it also sets the side view) render all steps again
 (`rerender_all`), draw the card, scroll the current step into view (`scroll_to`) and render the panel. A bad
@@ -1151,13 +1155,13 @@ visual mode, and are free only when `maparg` is empty in both modes. Global norm
 and skip that key. `vim.g.nvtour_keys` is read (missing entries use the defaults), never written.
 
 The actions are in two sets. `KEYS.tour` is `next`, `prev`, `first`, `last`, `panel`, `clear`, `next_chapter`,
-`prev_chapter`, `peek`, `view` and `range_style`. `KEYS.always` is `mark` and `mark_note`.
+`prev_chapter`, `peek`, `view`, `card` and `range_style`. `KEYS.always` is `mark` and `mark_note`.
 
 ```lua
 DEFAULT_KEYS = {
   next = "]w", prev = "[w", first = "[W", last = "]W", panel = "<leader>wp", clear = "<leader>wc",
   next_chapter = "]c", prev_chapter = "[c", peek = "<leader>wk",
-  view = "<leader>wv", range_style = "<leader>wr",
+  view = "<leader>wv", card = "<leader>ws", range_style = "<leader>wr",
   mark = "<leader>wm", mark_note = "<leader>wM",
 }
 ```
@@ -1175,8 +1179,8 @@ User commands (defined on load, always available): `:NvtourNext`, `:NvtourPrev`,
 `:NvtourLast`, `:NvtourNextChapter`, `:NvtourPrevChapter`, `:NvtourGoto N`, `:NvtourPanel`, `:NvtourClear`,
 `:NvtourPeek [N]` (peeks step N, default the step under the cursor; see "Peek a step"), `:NvtourFollow`
 (flips `vim.g.nvtour_follow_cursor` and says the new state; see "Follow the cursor"), `:NvtourMarksClear`
-(removes all marks and says how many; see §5, "Marks"), `:NvtourView [inline|side|toggle]` and
-`:NvtourRangeStyle [STYLE]` (see §6, "Side view").
+(removes all marks and says how many; see §5, "Marks"), `:NvtourView [inline|side|toggle]`, `:NvtourCard`
+and `:NvtourRangeStyle [STYLE]` (see §6, "Side view").
 
 The quickfix list also works (`:cnext`, `:cprev`, `:copen`); it moves the cursor only, not the
 current step.

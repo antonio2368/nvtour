@@ -401,7 +401,9 @@ first step
 
 A step at a git ref shows `git ref v1 · <commit>` (or `commit <sha>` when the ref is a hash) instead of the
 working tree. `<CR>` on the Next or Previous block goes to that
-step. `q` closes the card and goes back to the inline view.
+step. `<leader>ws` (or `:NvtourCard`) hides and shows the card, as `<leader>wp` does for the panel; `q` in
+the card hides it too. A hidden card keeps the side view, so the code stays clean; `<leader>wv` goes back to
+the inline view.
 
 In the code, every step keeps its coloured line numbers. The current step also keeps its suggested code (the
 `suggested` frame and the struck-through lines) and the underlined `--expect` texts (the Watch list of the
@@ -697,6 +699,7 @@ is skipped. The tour keys are set when a tour starts and removed by `clear`. The
 | `<leader>wp` | toggle panel |
 | `<leader>wk` | peek at the step under the cursor in a float (see [Peek at a step](#follow-and-peek)) |
 | `<leader>wv` | switch between the inline view and the [side view](#side-view) |
+| `<leader>ws` | hide / show the step card of the side view (turns the side view on) |
 | `<leader>wr` | next range style of the side view (turns the side view on) |
 | `<leader>wm` / `<leader>wM` | mark the cursor line or the selection for the agent / the same, then ask for a comment (see [Marks](#marks)); normal and visual mode; always installed, also without a tour |
 | `<leader>wc` | clear everything |
@@ -704,14 +707,14 @@ is skipped. The tour keys are set when a tour starts and removed by `clear`. The
 **In the panel:** `<CR>` jumps to the step under the cursor (on a chapter line, a file name or a link line: the
 step after it), `K` peeks at that step, `q` closes the panel.
 
-**In the step card:** `<CR>` on the Next or Previous block goes to that step, `q` goes back to the inline view.
+**In the step card:** `<CR>` on the Next or Previous block goes to that step, `q` hides the card.
 
 **In a diagram:** `<CR>` on an underlined link text opens its code; elsewhere it moves down as usual.
 
 **Commands:** `:NvtourNext`, `:NvtourPrev`, `:NvtourFirst`, `:NvtourLast`, `:NvtourNextChapter`,
 `:NvtourPrevChapter`, `:NvtourGoto N`, `:NvtourPanel`, `:NvtourClear`, `:NvtourPeek [N]` (see
 [Peek at a step](#follow-and-peek)), `:NvtourFollow` (turn [follow mode](#follow-and-peek) on or off),
-`:NvtourView [inline|side|toggle]`, `:NvtourRangeStyle [STYLE]` (see [Side view](#side-view)),
+`:NvtourView [inline|side|toggle]`, `:NvtourCard`, `:NvtourRangeStyle [STYLE]` (see [Side view](#side-view)),
 `:NvtourMarksClear` (remove all [marks](#marks)).
 
 **Quickfix:** the list `nvtour: <title>` works too (`:cnext`, `:cprev`), but it only moves the cursor. It does
@@ -726,7 +729,7 @@ Set these in `init.lua` before the first step:
 ```lua
 vim.g.nvtour_keys = { next = "]w", prev = "[w", first = "[W", last = "]W", panel = "<leader>wp", clear = "<leader>wc",
                       next_chapter = "]c", prev_chapter = "[c", peek = "<leader>wk",
-                      view = "<leader>wv", range_style = "<leader>wr",
+                      view = "<leader>wv", card = "<leader>ws", range_style = "<leader>wr",
                       mark = "<leader>wm", mark_note = "<leader>wM" }
 vim.g.nvtour_auto_panel = false               -- do not open the panel on the first step
 vim.g.nvtour_steal_focus = "unless_terminal"  -- "always" | "never"; default keeps the focus in a terminal window

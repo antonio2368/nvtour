@@ -53,7 +53,7 @@ local function new_state()
     mark_keys = {}, -- [name] = lhs: the KEYS.always that we installed
     mark_keymaps_installed = false,
     ns_card = api.nvim_create_namespace("nvtour_card"),
-    card = { buf = nil, win = nil, line_map = {} }, -- the step card of the side view (see "Side view")
+    card = { buf = nil, win = nil, line_map = {}, user_closed = false }, -- the step card of the side view (see "Side view")
     view = nil, -- "inline" or "side"; nil: vim.g.nvtour_view
     range_style = nil, -- the range style of the side view from the cycle key; nil: vim.g.nvtour_range_style
     git = {}, -- [dir] = { at, top, sha, ref, linked }: the git state of a directory, for the card
@@ -79,6 +79,7 @@ local DEFAULT_KEYS = {
   prev_chapter = "[c",
   peek = "<leader>wk",
   view = "<leader>wv",
+  card = "<leader>ws",
   range_style = "<leader>wr",
   mark = "<leader>wm",
   mark_note = "<leader>wM",
@@ -1201,7 +1202,7 @@ local side = {}
 -- (KEYS.tour) are installed when a tour starts and removed by clear. The keys of the marks
 -- (KEYS.always) stay while the runtime is loaded (see "Marks").
 local KEYS = {
-  tour = { "next", "prev", "first", "last", "panel", "clear", "next_chapter", "prev_chapter", "peek", "view", "range_style" },
+  tour = { "next", "prev", "first", "last", "panel", "clear", "next_chapter", "prev_chapter", "peek", "view", "card", "range_style" },
   always = { "mark", "mark_note" },
 }
 
@@ -2430,7 +2431,7 @@ function side.map_keys(buf)
     end
   end)
   map("q", function()
-    _G.nvtour.dispatch("view", { mode = "inline" }) -- the card is the side view: closing it ends it
+    _G.nvtour.dispatch("card", {}) -- hides the card; the view stays the side view
   end)
 end
 
@@ -2520,7 +2521,7 @@ end
 ---   Previous  [w                      the same for the step before ("first step" at the ends)
 function side.render()
   local step = S.tour.steps[S.tour.current]
-  if not side.on() or not step then
+  if not side.on() or not step or S.card.user_closed then
     side.close()
     return
   end
@@ -3263,6 +3264,9 @@ local function key_actions()
     view = function()
       run("view")
     end,
+    card = function()
+      run("card")
+    end,
     range_style = function()
       run("range_style")
     end,
@@ -3548,6 +3552,7 @@ local function reset(keep_panel)
     S.panel.buf = nil
     S.panel.user_closed = false
     S.panel.line_map = {}
+    S.card.user_closed = false
   end
   for _, b in ipairs(api.nvim_list_bufs()) do
     local keep = keep_panel and b == S.panel.buf
@@ -4048,8 +4053,24 @@ H.view = function(a)
     fail(("unknown view '%s' (inline, side or toggle)"):format(tostring(mode)), 2)
   end
   S.view = mode
+  if mode == "side" then
+    S.card.user_closed = false -- the side view comes back with its card
+  end
   side.refresh()
   return { ok = true, view = mode, message = "nvtour: " .. mode .. " view" }
+end
+
+--- Hide or show the step card (like the panel). Hiding keeps the side view, so the code stays clean;
+--- showing it also turns the side view on.
+H.card = function()
+  local hide = side.on() and side.shown()
+  S.card.user_closed = hide
+  if not hide then
+    S.view = "side"
+  end
+  side.refresh()
+  local state = hide and "hidden" or "shown"
+  return { ok = true, card = state, view = side.view(), message = "nvtour: step card " .. state }
 end
 
 --- Set the range style of the side view (`a.style`), or take the next one of side.STYLES. The view
@@ -5550,6 +5571,9 @@ ucmd("NvtourView", function(o)
 end, { nargs = "?", complete = function()
   return { "inline", "side", "toggle" }
 end })
+ucmd("NvtourCard", function()
+  return dispatch("card", {})
+end)
 ucmd("NvtourRangeStyle", function(o)
   return dispatch("range_style", { style = o.args })
 end, { nargs = "?", complete = function()

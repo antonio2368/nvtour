@@ -184,7 +184,26 @@ def test_card_keys(cli, nv, side):
     nv.current.window = win
     nv.input("q")
     time.sleep(WAIT)
-    assert card(nv)[0] is None and nv.exec_lua("return _G.nvtour.state.view") == "inline"
+    assert card(nv)[0] is None and nv.exec_lua("return _G.nvtour.state.view") == "side"  # like the panel
+
+
+def test_card_toggle(cli, nv, side):
+    tour(cli)
+    nv.input("\\ws")  # in the inline view: shows the card and turns the side view on
+    time.sleep(WAIT)
+    assert card(nv)[0] is not None and "nvtour: step card shown" in side()
+    nv.input("\\ws")
+    time.sleep(WAIT)
+    assert card(nv)[0] is None and "nvtour: step card hidden" in side()
+    assert any(d.get("virt_lines_above") for d in details(nv, "a.txt"))  # still the side view: the rules
+    ok(cli("next"))
+    assert card(nv)[0] is None  # a hidden card stays hidden on a jump
+    assert "<leader>ws card" in ok(cli("status"))
+    nv.input("\\wv")  # side -> inline
+    time.sleep(WAIT)
+    nv.input("\\wv")  # inline -> side: with its card
+    time.sleep(WAIT)
+    assert card(nv)[0] is not None
 
 
 def test_clear_closes_the_card(cli, nv, side):
