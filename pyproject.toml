@@ -11,7 +11,7 @@ requires-python = ">=3.11"
 dependencies = []
 
 [project.optional-dependencies]
-test = ["pytest", "pynvim>=0.5"]
+test = ["pytest", "pytest-xdist", "pynvim>=0.5"]
 
 [project.scripts]
 nvtour = "nvtour.cli:main"

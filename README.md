@@ -935,7 +935,7 @@ The full design is in [`DESIGN.md`](DESIGN.md).
 
 ```sh
 pip install --user --break-system-packages -e '.[test]'
-pytest
+pytest -n auto
 ```
 
 Regenerate the images in `docs/`:
