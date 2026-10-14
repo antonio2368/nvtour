@@ -846,6 +846,69 @@ the file do not change.
 - **Other steps.** One line `suggested: N lines` in `NvtourNoteCollapsed`, with the grey `╶─ ` lead.
 - `scroll_to` counts the suggestion with the other lines below `l2`.
 
+### Side view
+
+`side.view()` is `S.view` (set by `view`), else `vim.g.nvtour_view == "side"`, else `"inline"`. All of the
+above is the inline view. In the side view (`render_step` → `side.draw`):
+
+- **Every step:** the line numbers (`number_hl_group`) only. No note, link line, chapter line, eol marker
+  or collapsed suggestion.
+- **Current step:** the range style, then below `l2` the suggested code (the frame of "Suggested code",
+  without the gutter bar), `NvtourStrike` on the replaced lines and the `--expect` marks (as inline). `step.below` counts the lines below `l2`
+  for `scroll_to`.
+
+The **range style** is `S.range_style` (from the cycle key or `range_style STYLE`), else
+`vim.g.nvtour_range_style`, else `rules`; an invalid name falls through. It is parts joined by `+`:
+
+- `rules`: a virtual line above `l1`, `── N <mark> <title> ───`, and one below `l2`, `─────`, in
+  `NvtourFrame<Role>`, from the code column to the right edge (or `nvtour_note_width` + 4).
+- `bracket`: `sign_text` ` ┌`, ` │`, ` └` (one line: ` ▸`) in `NvtourSign<Role>`.
+- `spotlight`: `NvtourDim` (`hl_eol`, priority 200) from line 1 to `l1 − 1` and from `l2 + 1` to the end.
+
+`side.STYLES` is the cycle: `rules`, `bracket`, `spotlight`, `rules+spotlight`.
+
+The **step card** is a scratch buffer `nvtour://step` (`nofile`, `hide`, markdown, treesitter started)
+in a `split = "left", win = -1` window of the tab of the tour window, width `clamp(columns * 0.28, 36, 64)`,
+`winfixwidth`, `wrap`, `linebreak`, `conceallevel = 2`, `statuscolumn = "  "`. `side.render()` (called by `make_current` before
+`render_step`, so the rules get the final width, and by `render_panel`) opens it in the side view when there is
+a current step and closes it otherwise. Lines, highlighted with extmarks in `nvtour_card`:
+
+```
+1/3 ✗ fault · <chapter>                 NvtourSign<Role>, NvtourPanelChapter
+<label>                                 NvtourCardTitle
+<path>:<range>                          NvtourPanelFile
+working tree · <branch> @ <sha12>       the version, see below
+repo <name> | worktree <name>           the repository
+↔ SHEET#STEP                            NvtourVia
+↑ from N: <via>                         --via or --from of this step
+────                                    overlay virt_text, the window width (drawn again on WinResized)
+<note lines, raw markdown>
+Watch                                   NvtourCardTitle
+• <expect>                              one line each: NvtourSign<Role>, NvtourNoteCode
+────
+Next  <next key>                        NvtourCardTitle, the key in NvtourPanelProgress
+N <mark> <title>                        NvtourSign<Role>, NvtourLabel<Role> ("last step" at the end)
+<link_loc>                              NvtourViaLoc
+↓ <via of the next step>
+
+Previous  <prev key>                    the same block without the via ("first step")
+```
+
+The version lines come from one `git -C DIR rev-parse --show-toplevel --absolute-git-dir
+--git-common-dir HEAD --symbolic-full-name HEAD` (cached per directory for 2 s, 1 s timeout). A step on a
+file: `working tree · <branch> @ <sha12>` (the branch from `refs/heads/...`, else `detached`). A step at a git
+ref: `git ref <ref> · <sha12>`, or `commit <sha12>` when the ref is a prefix of the commit. Then `repo <name>`
+(the toplevel's name), or `worktree <name>` when the common dir is not the git dir (a linked worktree). A
+diagram: none. The window has `statuscolumn = "  "` (`side.MARGIN`): a left margin, also on wrapped lines;
+the rules end the same 2 cells before the right edge.
+`fillchars = "eob: "`, `breakindentopt = "list:-1"` with a `formatlistpat` for `•`, `-`, `*`, `+` and `1.`
+(a wrapped item goes on under its text). Card keys: `<CR>` on a line of the Next or Previous block (`card.line_map`) goes to that step, `q` runs `view inline`.
+
+`view [inline|side|toggle]` and `range_style [STYLE]` (it also sets the side view) render all steps again
+(`rerender_all`), draw the card, scroll the current step into view (`scroll_to`) and render the panel. A bad
+name is exit 2. Both return a `message` that the keys show. `status` returns `view`, `range_style` and
+`card` (open). `clear` closes the card; the view stays for the next tour.
+
 ## 7. Panel
 
 A scratch buffer `nvtour://panel` (`buftype = nofile`, `bufhidden = hide`, `swapfile = false`,
@@ -1088,12 +1151,13 @@ visual mode, and are free only when `maparg` is empty in both modes. Global norm
 and skip that key. `vim.g.nvtour_keys` is read (missing entries use the defaults), never written.
 
 The actions are in two sets. `KEYS.tour` is `next`, `prev`, `first`, `last`, `panel`, `clear`, `next_chapter`,
-`prev_chapter` and `peek`. `KEYS.always` is `mark` and `mark_note`.
+`prev_chapter`, `peek`, `view` and `range_style`. `KEYS.always` is `mark` and `mark_note`.
 
 ```lua
 DEFAULT_KEYS = {
   next = "]w", prev = "[w", first = "[W", last = "]W", panel = "<leader>wp", clear = "<leader>wc",
   next_chapter = "]c", prev_chapter = "[c", peek = "<leader>wk",
+  view = "<leader>wv", range_style = "<leader>wr",
   mark = "<leader>wm", mark_note = "<leader>wM",
 }
 ```
@@ -1111,7 +1175,8 @@ User commands (defined on load, always available): `:NvtourNext`, `:NvtourPrev`,
 `:NvtourLast`, `:NvtourNextChapter`, `:NvtourPrevChapter`, `:NvtourGoto N`, `:NvtourPanel`, `:NvtourClear`,
 `:NvtourPeek [N]` (peeks step N, default the step under the cursor; see "Peek a step"), `:NvtourFollow`
 (flips `vim.g.nvtour_follow_cursor` and says the new state; see "Follow the cursor"), `:NvtourMarksClear`
-(removes all marks and says how many; see §5, "Marks").
+(removes all marks and says how many; see §5, "Marks"), `:NvtourView [inline|side|toggle]` and
+`:NvtourRangeStyle [STYLE]` (see §6, "Side view").
 
 The quickfix list also works (`:cnext`, `:cprev`, `:copen`); it moves the cursor only, not the
 current step.

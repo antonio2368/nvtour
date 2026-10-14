@@ -369,6 +369,57 @@ frame, and the `→ next` line. The border has the colour of the role, and the t
   most half as high as the window. In the panel it uses the width of the editor.
 - The float shows a scratch buffer `nvtour://peek`. No file buffer is written.
 
+### Side view
+
+The notes, links and markers between the lines of code can feel cluttered. The side view moves all of it into
+a step card on the left. Press `<leader>wv` (or `:NvtourView`) to switch between the two views, or start in
+the side view with `vim.g.nvtour_view = "side"`.
+
+The card shows the current step:
+
+```
+1/3 ✗ fault · Why does it fail?            position, role, chapter
+dangling iterator                          label
+docs/demo/cache.cpp:20                     file and lines
+working tree · master @ 0c1af94a27e3       the version: the working tree on a branch and its commit
+repo nvtour                                the repository ("worktree NAME" in a linked worktree)
+↔ arch#3                                   sheet link
+↑ from 2: get() calls refresh() …          how the tour came here (--via, --from)
+────────────────────────────
+<the note, as markdown>
+Watch                                      the --expect texts, one per line
+• it->second
+────────────────────────────
+Next  ]w                                   where ]w goes:
+2 → extract + insert                       the number, role mark and label of the next step
+line 52                                    where it is
+↓ get() calls refresh() while it holds it  why the tour goes there (its --via)
+
+Previous  [w
+first step
+```
+
+A step at a git ref shows `git ref v1 · <commit>` (or `commit <sha>` when the ref is a hash) instead of the
+working tree. `<CR>` on the Next or Previous block goes to that
+step. `q` closes the card and goes back to the inline view.
+
+In the code, every step keeps its coloured line numbers. The current step also keeps its suggested code (the
+`suggested` frame and the struck-through lines) and the underlined `--expect` texts (the Watch list of the
+card), and gets a **range style**:
+
+| style | what it draws |
+|---|---|
+| `rules` (default) | a line above the range with the step number, role mark and label, and a line below it |
+| `bracket` | `┌ │ └` beside the line numbers. Takes no extra lines |
+| `spotlight` | dims every line outside the range |
+
+Join styles with `+`, for example `rules+spotlight`. `<leader>wr` goes to the next style and turns the side
+view on. It goes through `rules`, `bracket`, `spotlight` and `rules+spotlight`, so you can compare them on
+a live tour. `:NvtourRangeStyle bracket` picks one, and `vim.g.nvtour_range_style` sets
+the default. `nvtour status` shows `view: side (STYLE)`.
+
+The winbar, the panel, the quickfix list and peek work as in the inline view.
+
 ### Marks
 
 You can point at code for the agent. Put the cursor on a line (or select lines or text) and press `<leader>wm`.
@@ -645,17 +696,22 @@ is skipped. The tour keys are set when a tour starts and removed by `clear`. The
 | `]c` / `[c` | first step of the next chapter / of this chapter (or the one before) |
 | `<leader>wp` | toggle panel |
 | `<leader>wk` | peek at the step under the cursor in a float (see [Peek at a step](#follow-and-peek)) |
+| `<leader>wv` | switch between the inline view and the [side view](#side-view) |
+| `<leader>wr` | next range style of the side view (turns the side view on) |
 | `<leader>wm` / `<leader>wM` | mark the cursor line or the selection for the agent / the same, then ask for a comment (see [Marks](#marks)); normal and visual mode; always installed, also without a tour |
 | `<leader>wc` | clear everything |
 
 **In the panel:** `<CR>` jumps to the step under the cursor (on a chapter line, a file name or a link line: the
 step after it), `K` peeks at that step, `q` closes the panel.
 
+**In the step card:** `<CR>` on the Next or Previous block goes to that step, `q` goes back to the inline view.
+
 **In a diagram:** `<CR>` on an underlined link text opens its code; elsewhere it moves down as usual.
 
 **Commands:** `:NvtourNext`, `:NvtourPrev`, `:NvtourFirst`, `:NvtourLast`, `:NvtourNextChapter`,
 `:NvtourPrevChapter`, `:NvtourGoto N`, `:NvtourPanel`, `:NvtourClear`, `:NvtourPeek [N]` (see
 [Peek at a step](#follow-and-peek)), `:NvtourFollow` (turn [follow mode](#follow-and-peek) on or off),
+`:NvtourView [inline|side|toggle]`, `:NvtourRangeStyle [STYLE]` (see [Side view](#side-view)),
 `:NvtourMarksClear` (remove all [marks](#marks)).
 
 **Quickfix:** the list `nvtour: <title>` works too (`:cnext`, `:cprev`), but it only moves the cursor. It does
@@ -670,6 +726,7 @@ Set these in `init.lua` before the first step:
 ```lua
 vim.g.nvtour_keys = { next = "]w", prev = "[w", first = "[W", last = "]W", panel = "<leader>wp", clear = "<leader>wc",
                       next_chapter = "]c", prev_chapter = "[c", peek = "<leader>wk",
+                      view = "<leader>wv", range_style = "<leader>wr",
                       mark = "<leader>wm", mark_note = "<leader>wM" }
 vim.g.nvtour_auto_panel = false               -- do not open the panel on the first step
 vim.g.nvtour_steal_focus = "unless_terminal"  -- "always" | "never"; default keeps the focus in a terminal window
@@ -678,6 +735,8 @@ vim.g.nvtour_flash = 0                        -- ms the range flashes after a ju
 vim.g.nvtour_follow_cursor = true             -- the step under the cursor becomes the current step (default false)
 vim.g.nvtour_note_style = "band"              -- a background band instead of the frame (default "frame")
 vim.g.nvtour_note_width = 160                 -- wrap notes at most this many cells wide (default: the window width)
+vim.g.nvtour_view = "side"                    -- the step card on the left instead of notes in the code (default "inline")
+vim.g.nvtour_range_style = "rules+spotlight"  -- how the side view marks the range (default "rules")
 vim.g.nvtour_sheet_cmd = "sheet"              -- the command for steps with --sheet (default "sheet")
 ```
 
@@ -708,11 +767,12 @@ In the names below, `{...}` is one of `Fault`, `Flow`, `Fix`, `Context`, `Info`.
 | `NvtourNoteCollapsed` | one-line note of the other steps |
 | `NvtourNoteBorder` | note border |
 | `NvtourVia`, `NvtourViaLoc`, `NvtourVersion` | link text, link location, version (`@ref`, `working tree`) |
-| `NvtourFrame{...}` | the frame around the note, the `╶─` lead of the "next" line |
+| `NvtourFrame{...}` | the frame around the note, the `╶─` lead of the "next" line, the rules of the side view |
 | `NvtourNoteBg` | the band behind all nvtour lines (`nvtour_note_style = "band"`) |
-| `NvtourDim`, `NvtourFlash` | `focus --dim`, the flash after a jump |
+| `NvtourDim`, `NvtourFlash` | `focus --dim` and the `spotlight` range style, the flash after a jump |
 | `NvtourDiagramLine`, `NvtourDiagramLink` | the box and arrow characters of a diagram, the underlined link texts |
 | `NvtourPanelCurrent`, `NvtourPanelFile`, `NvtourPanelProgress` | panel |
+| `NvtourCardTitle` | the label in the step card of the side view |
 | `NvtourPanelChapter` | the `## Name` line of a chapter in the panel, and the name in the winbar (links to `Title`) |
 | `NvtourLost` | `✗ lost` of a step whose lines were deleted (links to `DiagnosticError`) |
 | `NvtourUserMark` | the `◆` sign of a mark of the user (links to `DiagnosticHint`) |

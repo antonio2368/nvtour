@@ -52,6 +52,11 @@ local function new_state()
     mark_seq = 0, -- the id of the next mark
     mark_keys = {}, -- [name] = lhs: the KEYS.always that we installed
     mark_keymaps_installed = false,
+    ns_card = api.nvim_create_namespace("nvtour_card"),
+    card = { buf = nil, win = nil, line_map = {} }, -- the step card of the side view (see "Side view")
+    view = nil, -- "inline" or "side"; nil: vim.g.nvtour_view
+    range_style = nil, -- the range style of the side view from the cycle key; nil: vim.g.nvtour_range_style
+    git = {}, -- [dir] = { at, top, sha, ref, linked }: the git state of a directory, for the card
   }
 end
 
@@ -73,6 +78,8 @@ local DEFAULT_KEYS = {
   next_chapter = "]c",
   prev_chapter = "[c",
   peek = "<leader>wk",
+  view = "<leader>wv",
+  range_style = "<leader>wr",
   mark = "<leader>wm",
   mark_note = "<leader>wM",
 }
@@ -151,6 +158,7 @@ local function define_highlights(force)
   set("NvtourPanelCurrent", { bg = blend(fg, bg, 0.12), bold = true })
   set("NvtourDiagramLine", { fg = blend(fg, bg, 0.55) }) -- the box and arrow characters of a diagram
   set("NvtourDiagramLink", { fg = hl_attr("Directory", "fg") or fg, underline = true })
+  set("NvtourCardTitle", { fg = fg, bold = true }) -- the label of the step in the card of the side view
   set("NvtourPanelFile", { link = "Directory" })
   set("NvtourPanelChapter", { link = "Title" }) -- the "## Name" line of a chapter (also in the winbar)
   set("NvtourPanelProgress", { link = "Comment" })
@@ -290,7 +298,7 @@ local function tour_win(buf, create)
   end
   local anchor = -1
   for _, w in ipairs(api.nvim_tabpage_list_wins(tab)) do
-    if is_normal_win(w) and w ~= S.panel.win then
+    if is_normal_win(w) and w ~= S.panel.win and w ~= S.card.win then
       anchor = w
       break
     end
@@ -377,7 +385,7 @@ diagram_win = function(buf, create, split)
   end
   if not anchor then
     for _, w in ipairs(api.nvim_tabpage_list_wins(tab)) do
-      if is_normal_win(w) and w ~= S.panel.win then
+      if is_normal_win(w) and w ~= S.panel.win and w ~= S.card.win then
         anchor = w
         break
       end
@@ -1185,11 +1193,15 @@ end
 
 local step_goto -- forward declaration
 
+-- The side view (see "Side view") keeps its functions in one table: a Lua chunk has at most 200
+-- local variables.
+local side = {}
+
 -- The two sets of keys (one table: a Lua chunk has at most 200 local variables). The keys of a tour
 -- (KEYS.tour) are installed when a tour starts and removed by clear. The keys of the marks
 -- (KEYS.always) stay while the runtime is loaded (see "Marks").
 local KEYS = {
-  tour = { "next", "prev", "first", "last", "panel", "clear", "next_chapter", "prev_chapter", "peek" },
+  tour = { "next", "prev", "first", "last", "panel", "clear", "next_chapter", "prev_chapter", "peek", "view", "range_style" },
   always = { "mark", "mark_note" },
 }
 
@@ -1332,6 +1344,7 @@ local function chapter_starts()
 end
 
 local function render_panel()
+  side.render()
   if not valid_buf(S.panel.buf) then
     return
   end
@@ -2016,13 +2029,13 @@ function peek.box(lines, B, role, kind, inner)
   return out
 end
 
-local function frame(lines, win, role, current, kind)
+local function frame(lines, win, role, current, kind, nobar)
   if not valid_win(win) then
     return { virt_lines = lines } -- drawn again in the window when the buffer is shown (BufWinEnter)
   end
   local info = vim.fn.getwininfo(win)[1]
   local off, full = info.textoff, info.width
-  local col = current and bar_col(win, off) or nil
+  local col = (current and not nobar) and bar_col(win, off) or nil
   local B = current and ("NvtourFrame" .. cap(role)) or "NvtourNoteBorder"
   local inner = math.max(10, full - off) -- cells from the code column to the right edge
   local limit = note_width_limit()
@@ -2085,7 +2098,9 @@ local function band(lines, win, role, current)
 end
 
 --- Draw step marks. Only the current step gets the bar, the full note and the --expect marks; the
---- other steps keep the line numbers, the "← N label" marker and a one-line note.
+--- other steps keep the line numbers, the "← N label" marker and a one-line note. In the side view
+--- (see "Side view") the steps keep the line numbers only; the current step gets its range style,
+--- the suggested code and the --expect marks.
 render_step = function(step, win)
   local buf = step.buf
   local ns = S.ns_steps
@@ -2103,16 +2118,57 @@ render_step = function(step, win)
   local function add(row, opts, col)
     ids[#ids + 1] = api.nvim_buf_set_extmark(buf, ns, row, col or 0, opts)
   end
+  local sided = side.on()
   for l = step.l1, step.l2 do
+    local sign = (current and not sided) and BAR_SIGN or nil
+    if current and sided then
+      sign = side.sign(step, l)
+    end
     add(l - 1, {
       number_hl_group = "NvtourNumber" .. R,
-      sign_text = current and BAR_SIGN or nil,
+      sign_text = sign,
       sign_hl_group = "NvtourSign" .. R,
       priority = 100,
     })
   end
-  local width = 80
   step.drawn_win = valid_win(win) and win or nil
+  -- The lines that the suggestion replaces are struck through (from the first non-blank character).
+  local function strike()
+    for i, line in ipairs(api.nvim_buf_get_lines(buf, step.l1 - 1, step.l2, false)) do
+      local first = line:find("%S")
+      if first then
+        add(step.l1 + i - 2, { end_col = #line, hl_group = "NvtourStrike", priority = 140 }, first - 1)
+      end
+    end
+  end
+  -- Every text of --expect in the range is underlined in the role colour (the current step only).
+  local function marks()
+    local lines = api.nvim_buf_get_lines(buf, step.l1 - 1, step.l2, false)
+    for _, text in ipairs(expect_list(step.expect) or {}) do
+      for i, line in ipairs(lines) do
+        local from = 1
+        while true do
+          local s, e = line:find(text, from, true)
+          if not s then
+            break
+          end
+          add(step.l1 + i - 2, { end_col = e, hl_group = "NvtourMark" .. R, priority = 150 }, s - 1)
+          from = e + 1
+        end
+      end
+    end
+  end
+  if sided then
+    side.draw(step, win, add, current)
+    if current then
+      if step.suggest then
+        strike()
+      end
+      marks()
+    end
+    return
+  end
+  local width = 80
   if valid_win(win) then
     local info = vim.fn.getwininfo(win)[1]
     width = info.width - info.textoff
@@ -2159,36 +2215,416 @@ render_step = function(step, win)
     add(step.l2 - 1, below)
   end
   if step.suggest and current then
-    -- The lines that the suggestion replaces are struck through (from the first non-blank character).
-    for i, line in ipairs(api.nvim_buf_get_lines(buf, step.l1 - 1, step.l2, false)) do
-      local first = line:find("%S")
-      if first then
-        add(step.l1 + i - 2, { end_col = #line, hl_group = "NvtourStrike", priority = 140 }, first - 1)
-      end
-    end
+    strike()
   end
-  local expects = current and expect_list(step.expect) or {}
-  if #expects > 0 then
-    local lines = api.nvim_buf_get_lines(buf, step.l1 - 1, step.l2, false)
-    for _, text in ipairs(expects) do
-      for i, line in ipairs(lines) do
-        local from = 1
-        while true do
-          local s, e = line:find(text, from, true)
-          if not s then
-            break
-          end
-          add(step.l1 + i - 2, { end_col = e, hl_group = "NvtourMark" .. R, priority = 150 }, s - 1)
-          from = e + 1
-        end
-      end
-    end
+  if current then
+    marks()
   end
   local label = (step.label and step.label ~= "") and (" " .. step.label) or ""
   add(step.l1 - 1, {
     virt_text = { { "  ← ", "NvtourLabel" .. R }, { tostring(step.n), "NvtourSign" .. R }, { label, "NvtourLabel" .. R } },
     virt_text_pos = "eol",
   })
+end
+
+---------------------------------------------------------------------------
+-- Side view
+---------------------------------------------------------------------------
+
+-- In the side view the code keeps only the coloured line numbers of the steps. The current step
+-- gets a range style and its suggested code; everything else about it (the note, the links, the
+-- file and version, the next and the previous step) is in the step card, a window on the left.
+
+-- The parts of a range style, and the order of the cycle key.
+side.PARTS = { rules = true, bracket = true, spotlight = true }
+side.STYLES = { "rules", "bracket", "spotlight", "rules+spotlight" }
+side.MARGIN = 2 -- blank cells on the left of the card (and at the right end of its rules)
+
+--- "inline" or "side": the view from the view key, else vim.g.nvtour_view.
+function side.view()
+  return S.view or (vim.g.nvtour_view == "side" and "side" or "inline")
+end
+
+function side.on()
+  return side.view() == "side"
+end
+
+--- Nil when `name` is a valid range style ("rules", "rules+spotlight", ...), else the reason.
+function side.bad_style(name)
+  if type(name) ~= "string" or name == "" then
+    return "empty range style"
+  end
+  for part in name:gmatch("[^+]+") do
+    if not side.PARTS[part] then
+      return ("unknown range style '%s' (rules, bracket, spotlight, joined with +)"):format(part)
+    end
+  end
+end
+
+--- The name of the range style: from the cycle key, else vim.g.nvtour_range_style, else "rules".
+function side.style_name()
+  for _, name in ipairs({ S.range_style, vim.g.nvtour_range_style }) do
+    if not side.bad_style(name) then
+      return name
+    end
+  end
+  return "rules"
+end
+
+--- The range style as a set of its parts: { rules = true, spotlight = true }.
+function side.style()
+  local set = {}
+  for part in side.style_name():gmatch("[^+]+") do
+    set[part] = true
+  end
+  return set
+end
+
+--- The sign of line `l` of the current step: a bracket ┌ │ └ beside the line numbers (style "bracket").
+function side.sign(step, l)
+  if not side.style().bracket then
+    return nil
+  end
+  if step.l1 == step.l2 then
+    return " ▸"
+  end
+  return l == step.l1 and " ┌" or (l == step.l2 and " └" or " │")
+end
+
+--- "1 ✗ label" of a step, as chunks.
+function side.title_chunks(step)
+  local R = cap(step.role)
+  local out = { { step.n .. " " .. (ROLE_MARK[step.role] or "•"), "NvtourSign" .. R } }
+  local title = step_title(step)
+  if title ~= "" then
+    out[2] = { " " .. title, "NvtourLabel" .. R }
+  end
+  return out
+end
+
+--- Draw the current step of the side view with `add(row, opts, col)` (see render_step): the range
+--- style, then below it the suggested code. Other steps get nothing more than their line numbers.
+function side.draw(step, win, add, current)
+  step.below = 0
+  if not current then
+    return
+  end
+  local buf, R = step.buf, cap(step.role)
+  local B = "NvtourFrame" .. R
+  local style = side.style()
+  local info = valid_win(win) and vim.fn.getwininfo(win)[1] or nil
+  local off = info and info.textoff or 0
+  local room = info and (info.width - info.textoff) or 80
+  local limit = note_width_limit()
+  local inner = math.max(10, limit and math.min(room, limit + 4) or room)
+  -- A virtual line that starts in the gutter (as the frame does), so the text is in the code column.
+  local function row(chunks)
+    return vim.list_extend(info and gutter_chunks(off, nil, step.role, plain_hl) or {}, chunks)
+  end
+  local above, below = {}, {}
+  local title = side.title_chunks(step)
+  if style.rules then
+    local head, w = clip_chunks(title, inner - 8)
+    local top = { { "── ", B } }
+    vim.list_extend(top, head)
+    top[#top + 1] = { " " .. ("─"):rep(math.max(1, inner - 4 - w)), B }
+    above[1] = row(top)
+    below[1] = row({ { ("─"):rep(inner), B } })
+  end
+  if style.spotlight then
+    local count = api.nvim_buf_line_count(buf)
+    local dim = { hl_group = "NvtourDim", hl_eol = true, priority = 200 }
+    if step.l1 > 1 then
+      add(0, vim.tbl_extend("force", dim, { end_row = step.l1 - 1, end_col = 0 }))
+    end
+    if step.l2 < count then
+      local last = api.nvim_buf_get_lines(buf, count - 1, count, false)[1] or ""
+      add(step.l2, vim.tbl_extend("force", dim, { end_row = count - 1, end_col = #last }))
+    end
+  end
+  if step.suggest then
+    vim.list_extend(below, frame(suggest_lines(step, 4), win, step.role, true, "suggest", true).virt_lines)
+  end
+  if #above > 0 then
+    add(step.l1 - 1, { virt_lines = above, virt_lines_above = true, virt_lines_leftcol = info ~= nil })
+  end
+  if #below > 0 then
+    add(step.l2 - 1, { virt_lines = below, virt_lines_leftcol = info ~= nil })
+  end
+  step.below = #below -- scroll_to counts the lines below l2
+end
+
+--- The version of the code of `step` and its repository, as lines of chunks:
+---   working tree · master @ 0c1af94a27e3     (a detached HEAD: "detached @ ...")
+---   repo nvtour                              (a linked worktree: "worktree nvtour-fix")
+--- A step at a git ref: "git ref v1 · 1a2b3c4d5e6f", or "commit 1a2b3c4d5e6f" when the ref is the
+--- commit. {} for a diagram; no repository line outside git. The state of a directory is read at most
+--- every 2 s.
+function side.git(step)
+  if step.diagram then
+    return {}
+  end
+  local dir = vim.fn.fnamemodify(step.file, ":h")
+  local c, now = S.git[dir], uv.now()
+  if not c or now - c.at > 2000 then
+    c = { at = now }
+    S.git[dir] = c
+    local ok, res = pcall(function()
+      return vim
+        .system({ "git", "-C", dir, "rev-parse", "--show-toplevel", "--absolute-git-dir", "--git-common-dir", "HEAD", "--symbolic-full-name", "HEAD" }, { text = true })
+        :wait(1000)
+    end)
+    local out = (ok and res.code == 0) and vim.split(vim.trim(res.stdout or ""), "\n") or {}
+    if #out >= 4 then
+      local common = out[3]
+      if common:sub(1, 1) ~= "/" then
+        common = dir .. "/" .. common
+      end
+      local function norm(path)
+        return (vim.fn.resolve(vim.fn.simplify(path)):gsub("/$", ""))
+      end
+      c.top, c.sha, c.ref = out[1], out[4], out[5]
+      c.linked = norm(common) ~= norm(out[2])
+    end
+  end
+  local lines = {}
+  if step.ref then
+    local sha = step.sha:sub(1, 12)
+    if step.sha:sub(1, #step.ref) == step.ref then
+      lines[1] = { { "commit ", "NvtourVia" }, { sha, "NvtourVersion" } }
+    else
+      lines[1] = { { "git ref ", "NvtourVia" }, { step.ref, "NvtourVersion" }, { " · " .. sha, "NvtourVia" } }
+    end
+  elseif c.sha then
+    local branch = c.ref and c.ref:match("^refs/heads/(.+)$")
+    lines[1] = {
+      { "working tree", "NvtourVersion" },
+      { " · ", "NvtourNoteBorder" },
+      { branch or "detached", "NvtourVia" },
+      { " @ " .. c.sha:sub(1, 12), "NvtourVia" },
+    }
+  end
+  if c.top then
+    lines[#lines + 1] = { { c.linked and "worktree " or "repo ", "NvtourVia" }, { vim.fn.fnamemodify(c.top, ":t"), "NvtourViaLoc" } }
+  end
+  return lines
+end
+
+function side.shown()
+  local w = S.card.win
+  return valid_win(w) and valid_buf(S.card.buf) and api.nvim_win_get_buf(w) == S.card.buf
+end
+
+--- Buffer-local keys of the card; they call through _G so they survive a runtime upgrade.
+function side.map_keys(buf)
+  local function map(lhs, fn)
+    vim.keymap.set("n", lhs, fn, { buffer = buf, nowait = true, silent = true })
+  end
+  map("<CR>", function()
+    local n = S.card.line_map[api.nvim_win_get_cursor(0)[1]]
+    if n then
+      local res = _G.nvtour.dispatch("goto", { n = n })
+      if not res.ok then
+        notify(res.error, vim.log.levels.WARN)
+      end
+    end
+  end)
+  map("q", function()
+    _G.nvtour.dispatch("view", { mode = "inline" }) -- the card is the side view: closing it ends it
+  end)
+end
+
+function side.buf()
+  if valid_buf(S.card.buf) then
+    return S.card.buf
+  end
+  local buf = api.nvim_create_buf(false, true)
+  api.nvim_buf_set_name(buf, "nvtour://step")
+  vim.bo[buf].buftype = "nofile"
+  vim.bo[buf].bufhidden = "hide"
+  vim.bo[buf].swapfile = false
+  vim.bo[buf].filetype = "markdown"
+  vim.bo[buf].modifiable = false
+  if not vim.treesitter.highlighter.active[buf] then
+    pcall(vim.treesitter.start, buf, "markdown") -- `code` in the note, conceal of the markers
+  end
+  side.map_keys(buf)
+  S.card.buf = buf
+  return buf
+end
+
+function side.close()
+  if side.shown() then
+    local w = S.card.win
+    if #api.nvim_tabpage_list_wins(api.nvim_win_get_tabpage(w)) > 1 or #api.nvim_list_tabpages() > 1 then
+      pcall(api.nvim_win_close, w, true)
+      balance_side_diagram()
+    end
+  end
+  S.card.win = nil
+end
+
+--- Open the card on the left of the tab of the tour window (a card in another tab is closed first).
+function side.open()
+  local target = tour_win() or api.nvim_get_current_win()
+  local tab = api.nvim_win_get_tabpage(target)
+  if side.shown() then
+    if api.nvim_win_get_tabpage(S.card.win) == tab then
+      return
+    end
+    side.close()
+  end
+  local buf = side.buf()
+  vim.bo[buf].formatlistpat = [[^\s*\([-*+•]\|\d\+[.)]\)\s\+]] -- the bullets of the card and of markdown lists
+  local width = math.max(36, math.min(64, math.floor(vim.o.columns * 0.28)))
+  local win
+  api.nvim_win_call(target, function()
+    win = api.nvim_open_win(buf, false, { split = "left", win = -1, width = width })
+  end)
+  S.card.win = win
+  local wo = vim.wo[win]
+  wo.winfixwidth = true
+  wo.wrap = true
+  wo.linebreak = true
+  wo.breakindent = true
+  wo.conceallevel = 2
+  wo.concealcursor = "nc"
+  wo.number = false
+  wo.relativenumber = false
+  wo.signcolumn = "no"
+  wo.foldcolumn = "0"
+  wo.cursorline = false
+  wo.foldenable = false
+  wo.list = false
+  wo.spell = false
+  wo.statuscolumn = (" "):rep(side.MARGIN) -- a left margin, also on wrapped lines
+  wo.fillchars = "eob: " -- no "~" below the last line
+  wo.breakindentopt = "list:-1" -- a wrapped item of a list goes on under its text, not under the bullet
+  balance_side_diagram()
+end
+
+--- Draw the card of the current step; opens it in the side view and closes it otherwise (or when
+--- there is no current step). Lines:
+---   1/3 ✗ fault · Why it fails          position, role, chapter
+---   dangling iterator                   label
+---   src/a.cpp:412-415                   file and range
+---   working tree · master @ 0c1af94a27e3   version (a ref step: "git ref v1 · <sha>")
+---   repo nvtour                         repository (a linked worktree: "worktree NAME")
+---   ↔ arch#3                            sheet link
+---   ↑ from 2: <via>                     how the tour came here
+---   ────────
+---   <note>
+---   Watch                               --expect, one "• text" line each
+---   ────────
+---   Next  ]w                          then the next step: number and title, place, --via
+---   Previous  [w                      the same for the step before ("first step" at the ends)
+function side.render()
+  local step = S.tour.steps[S.tour.current]
+  if not side.on() or not step then
+    side.close()
+    return
+  end
+  sync_step(step)
+  side.open()
+  local buf, R = S.card.buf, cap(step.role)
+  local lines, hls, map, rules = {}, {}, {}, {}
+  -- One line of { text, group } segments (group nil: no highlight of ours, markdown shows it).
+  local function put(segs, n)
+    local text = ""
+    for _, sg in ipairs(segs) do
+      if sg[2] then
+        hls[#hls + 1] = { #lines + 1, #text, #text + #sg[1], sg[2] }
+      end
+      text = text .. sg[1]
+    end
+    lines[#lines + 1] = text
+    map[#lines] = n
+  end
+  local function oneline(text)
+    return (text or ""):gsub("%s+", " ")
+  end
+  local chapter = chapter_of(step)
+  local head = { { ("%d/%d %s %s"):format(step.n, #S.tour.steps, ROLE_MARK[step.role] or "•", step.role), "NvtourSign" .. R } }
+  if chapter then
+    head[2] = { " · ", "NvtourNoteBorder" }
+    head[3] = { chapter.name, "NvtourPanelChapter" }
+  end
+  put(head)
+  if step.label and step.label ~= "" then
+    put({ { step.label, "NvtourCardTitle" } })
+  end
+  put({})
+  put({ { doc_path(step) .. ":" .. fmt_range(step), "NvtourPanelFile" } })
+  for _, line in ipairs(side.git(step)) do
+    put(line)
+  end
+  if step.sheet then
+    put({ { "↔ ", "NvtourNoteBorder" }, { sheet_label(step.sheet), "NvtourVia" } })
+  end
+  if step.lost then
+    put({ { "✗ lost", "NvtourLost" }, { " · its lines were deleted", "NvtourVia" } })
+  end
+  local via = step.via and step.via ~= "" and oneline(step.via) or nil
+  if step.n > 1 and (via or explicit_from(step)) then
+    local src = source_of(step)
+    put({ { "↑ from " .. src.n, "NvtourSign" .. cap(src.role) }, { via and ": " or "", "NvtourVia" }, { via or "" } })
+  end
+  put({})
+  rules[#rules + 1] = #lines
+  if step.note and step.note ~= "" then
+    put({})
+    for _, l in ipairs(split_lines(step.note)) do
+      put({ { l } })
+    end
+  end
+  local expects = expect_list(step.expect) or {}
+  if #expects > 0 then
+    -- One item per line: a long text wraps under its own item (breakindentopt "list").
+    put({})
+    put({ { "Watch", "NvtourCardTitle" } })
+    for _, e in ipairs(expects) do
+      put({ { "• ", "NvtourSign" .. R }, { e, "NvtourNoteCode" } })
+    end
+  end
+  put({})
+  put({})
+  rules[#rules + 1] = #lines
+  put({})
+  -- The next and the previous step, each a block:
+  --   Next  ]w
+  --   2 → extract + insert          number, role mark, title
+  --   line 52                       where it is
+  --   ↓ get() calls refresh() …     the --via of the next step (why the tour goes there)
+  local function link(key, name, s, none, via)
+    put({ { name, "NvtourCardTitle" }, { key and ("  " .. key) or "", "NvtourPanelProgress" } }, s and s.n)
+    if not s then
+      put({ { none, "NvtourVia" } })
+      return
+    end
+    local title = step_title(s)
+    put({ { s.n .. " " .. (ROLE_MARK[s.role] or "•"), "NvtourSign" .. cap(s.role) }, { title ~= "" and (" " .. title) or "", "NvtourLabel" .. cap(s.role) } }, s.n)
+    put({ { link_loc(s, step), "NvtourViaLoc" } }, s.n)
+    if via then
+      put({ { "↓ ", "NvtourNoteBorder" }, { via } }, s.n)
+    end
+  end
+  local nxt, prv = S.tour.steps[step.n + 1], S.tour.steps[step.n - 1]
+  link(S.keys.next, "Next", nxt, "last step", nxt and nxt.via and nxt.via ~= "" and oneline(nxt.via) or nil)
+  put({})
+  link(S.keys.prev, "Previous", prv, "first step")
+  S.card.line_map = map
+  vim.bo[buf].modifiable = true
+  api.nvim_buf_set_lines(buf, 0, -1, false, lines)
+  vim.bo[buf].modifiable = false
+  api.nvim_buf_clear_namespace(buf, S.ns_card, 0, -1)
+  for _, h in ipairs(hls) do
+    api.nvim_buf_set_extmark(buf, S.ns_card, h[1] - 1, h[2], { end_col = h[3], hl_group = h[4], priority = 150 })
+  end
+  local width = math.max(1, api.nvim_win_get_width(S.card.win) - 2 * side.MARGIN)
+  for _, r in ipairs(rules) do
+    api.nvim_buf_set_extmark(buf, S.ns_card, r - 1, 0, { virt_text = { { ("─"):rep(width), "NvtourNoteBorder" } }, virt_text_pos = "overlay" })
+  end
+  pcall(api.nvim_win_set_cursor, S.card.win, { 1, 0 })
 end
 
 ---------------------------------------------------------------------------
@@ -2824,6 +3260,12 @@ local function key_actions()
     peek = function()
       run("peek")
     end,
+    view = function()
+      run("view")
+    end,
+    range_style = function()
+      run("range_style")
+    end,
     clear = function()
       run("clear")
     end,
@@ -3079,6 +3521,7 @@ local function reset(keep_panel)
   clear_winbars()
   diff_close()
   remove_keymaps(KEYS.tour) -- the keys of the marks stay: the marks belong to the user
+  side.close()
   local qf_id = S.tour.qf_id
   if qf_valid() then
     vim.fn.setqflist({}, "r", { id = qf_id, title = "nvtour (cleared)", items = {} })
@@ -3181,6 +3624,7 @@ local function make_current(step, win, opts)
     render_step(old, tour_win(old.buf))
   end
   set_winbar(win) -- before the note is wrapped and the view is computed: it takes a row
+  side.render() -- the card opens before the step is drawn, so the rules have the final width
   render_step(step, win)
   if opts.scroll then
     scroll_to(step, win)
@@ -3577,6 +4021,58 @@ local function rerender_all()
     end
   end
   refocus_all_steps() -- the steps of a file changed: so do the folds of a focus from the steps
+end
+
+--- Draw the code and the card again after the view or the range style changed, and scroll the
+--- current step back into view (its block above and below the range is not the same).
+function side.refresh()
+  side.render()
+  rerender_all()
+  local step = S.tour.steps[S.tour.current]
+  if step and not step.lost and valid_buf(step.buf) then
+    local win = tour_win(step.buf)
+    if win and api.nvim_win_get_buf(win) == step.buf then
+      scroll_to(step, win)
+    end
+  end
+  render_panel()
+end
+
+--- Set the view: `a.mode` is "inline", "side" or "toggle" (the default).
+H.view = function(a)
+  local mode = a.mode
+  if mode == nil or mode == "" or mode == "toggle" then
+    mode = side.on() and "inline" or "side"
+  end
+  if mode ~= "inline" and mode ~= "side" then
+    fail(("unknown view '%s' (inline, side or toggle)"):format(tostring(mode)), 2)
+  end
+  S.view = mode
+  side.refresh()
+  return { ok = true, view = mode, message = "nvtour: " .. mode .. " view" }
+end
+
+--- Set the range style of the side view (`a.style`), or take the next one of side.STYLES. The view
+--- becomes the side view: the style is only shown there.
+H.range_style = function(a)
+  local style = a.style
+  if style == nil or style == "" then
+    local cur, i = side.style_name(), 0
+    for k, name in ipairs(side.STYLES) do
+      if name == cur then
+        i = k
+      end
+    end
+    style = side.STYLES[i % #side.STYLES + 1]
+  end
+  local bad = side.bad_style(style)
+  if bad then
+    fail(bad, 2)
+  end
+  S.range_style = style
+  S.view = "side"
+  side.refresh()
+  return { ok = true, range_style = style, view = "side", message = "nvtour: range style " .. style }
 end
 
 --- Lines (l1, l2) that the text range `q` selects in the list `lines`; `name` is for the messages.
@@ -4662,6 +5158,9 @@ H.status = function()
     diagrams = diagrams,
     diff_tabs = diffs,
     panel = { open = panel_shown(), user_closed = S.panel.user_closed },
+    view = side.view(),
+    range_style = side.style_name(),
+    card = side.shown(),
     follow = follow.on(),
     keys = installed_keys(),
     mark_keys = next(S.mark_keys) and S.mark_keys or vim.empty_dict(),
@@ -4990,6 +5489,9 @@ api.nvim_create_autocmd("WinResized", {
         pcall(render_step, s, w)
       end
     end
+    if side.shown() and shown[S.card.buf] then
+      pcall(side.render) -- the rules of the card are as wide as its window
+    end
   end,
 })
 
@@ -5043,6 +5545,16 @@ ucmd("NvtourMarksClear", function()
   res.message = ("nvtour: %d mark(s) cleared"):format(res.count or 0)
   return res
 end)
+ucmd("NvtourView", function(o)
+  return dispatch("view", { mode = o.args })
+end, { nargs = "?", complete = function()
+  return { "inline", "side", "toggle" }
+end })
+ucmd("NvtourRangeStyle", function(o)
+  return dispatch("range_style", { style = o.args })
+end, { nargs = "?", complete = function()
+  return side.STYLES
+end })
 ucmd("NvtourFollow", function()
   local on = not follow.on()
   vim.g.nvtour_follow_cursor = on
@@ -5062,6 +5574,9 @@ if PREV_VERSION ~= nil and PREV_VERSION ~= M.VERSION then
   end
   if valid_buf(S.panel.buf) then
     map_panel_keys(S.panel.buf)
+  end
+  if valid_buf(S.card.buf) then
+    side.map_keys(S.card.buf)
   end
   for _, d in pairs(S.diagrams) do
     if valid_buf(d.buf) then

@@ -852,7 +852,7 @@ def format_chapter(args: argparse.Namespace, res: Mapping[str, Any]) -> str:
 
 
 def format_keys(keys: Mapping[str, str] | None) -> str:
-    order = ["next", "prev", "first", "last", "panel", "clear", "next_chapter", "prev_chapter", "peek"]
+    order = ["next", "prev", "first", "last", "panel", "clear", "next_chapter", "prev_chapter", "peek", "view", "range_style"]
     return ", ".join(f"{keys[k]} {k}" for k in order if keys and keys.get(k)) or "(none installed)"
 
 
@@ -891,6 +891,8 @@ def format_status(res: dict[str, Any], workspace: str) -> str:
         out.append(f"marks: {res['marks']}")
     panel = res.get("panel") or {}
     out.append(f"panel: {'open' if panel.get('open') else 'closed'}   diff tabs: {res.get('diff_tabs', 0)}")
+    if res.get("view") == "side":
+        out.append(f"view: side ({res.get('range_style') or 'rules'}), card {'open' if res.get('card') else 'closed'}")
     out.append(f"keys: {format_keys(res.get('keys'))}")
     return "\n".join(out)
 
