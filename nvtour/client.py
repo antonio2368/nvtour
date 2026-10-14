@@ -1,41 +1,17 @@
-"""pynvim connection with hard timeouts and Lua runtime loading."""
+"""Connection to nvim with hard timeouts, and Lua runtime loading."""
 
 from __future__ import annotations
 
 import hashlib
-import threading
 import time
 from functools import cache
 from importlib import resources
 from typing import Any, Callable
 
 from .errors import EXIT_RPC, NvtourError
+from .rpc import Connection, RpcTimeout
 
 HINT = "nvim may be waiting at a prompt; press <Enter> in nvim"
-
-
-class RpcTimeout(Exception):
-    """An RPC call did not finish in time."""
-
-
-def run_with_timeout(fn: Callable[[], Any], timeout: float) -> Any:
-    """Run ``fn`` in a daemon thread; raise RpcTimeout if it takes longer than ``timeout``."""
-    box: dict[str, Any] = {}
-
-    def target() -> None:
-        try:
-            box["value"] = fn()
-        except BaseException as exc:  # noqa: BLE001 - forwarded to the caller
-            box["error"] = exc
-
-    thread = threading.Thread(target=target, daemon=True)
-    thread.start()
-    thread.join(timeout)
-    if thread.is_alive():
-        raise RpcTimeout()
-    if "error" in box:
-        raise box["error"]
-    return box.get("value")
 
 
 @cache
@@ -56,14 +32,15 @@ class Client:
         self.socket = socket
         self.timeout = timeout
         self.deadline: float | None = None  # one budget for the whole command, set by connect()
-        self.nvim: Any = None
+        self.conn: Connection | None = None
 
-    def _guard(self, fn: Callable[[], Any], phase: str) -> Any:
-        remaining = self.timeout if self.deadline is None else self.deadline - time.monotonic()
+    def _guard(self, fn: Callable[[float], Any], phase: str) -> Any:
+        """Run ``fn(deadline)``; a timeout or a failure becomes an NvtourError that names ``phase``."""
+        deadline = time.monotonic() + self.timeout if self.deadline is None else self.deadline
         try:
-            if remaining <= 0:
+            if deadline <= time.monotonic():
                 raise RpcTimeout()
-            return run_with_timeout(fn, remaining)
+            return fn(deadline)
         except RpcTimeout:
             later = "; the command may still run when nvim is free" if phase == "dispatch" else ""
             raise NvtourError(EXIT_RPC, f"timeout after {self.timeout:g}s during {phase} on {self.socket}; {HINT}{later}")
@@ -73,22 +50,21 @@ class Client:
             raise NvtourError(EXIT_RPC, f"RPC failure during {phase} on {self.socket}: {exc}") from exc
 
     def connect(self) -> "Client":
-        try:
-            import pynvim
-        except ImportError:
-            raise NvtourError(EXIT_RPC, "pynvim is not installed; install with: pip install pynvim") from None
-
         self.deadline = time.monotonic() + self.timeout
-        self.nvim = self._guard(lambda: pynvim.attach("socket", path=self.socket), "connect")
+        self.conn = self._guard(lambda deadline: Connection(self.socket, deadline), "connect")
         return self
+
+    def request(self, method: str, args: list[Any], phase: str) -> Any:
+        """Call the nvim API function ``method`` with a timeout."""
+        return self._guard(lambda deadline: self.conn.request(method, args, deadline), phase)
 
     def exec_lua(self, code: str, *args: Any, phase: str = "request") -> Any:
         """Run Lua code in nvim with a timeout."""
-        return self._guard(lambda: self.nvim.exec_lua(code, *args), phase)
+        return self.request("nvim_exec_lua", [code, list(args)], phase)
 
     def mode(self) -> dict[str, Any]:
         """``nvim_get_mode()``: answered at once even when nvim waits for input."""
-        res = self._guard(lambda: self.nvim.api.get_mode(), "mode check")
+        res = self.request("nvim_get_mode", [], "mode check")
         return res if isinstance(res, dict) else {}
 
     def check_not_blocked(self) -> None:
@@ -123,8 +99,6 @@ class Client:
         return res
 
     def close(self) -> None:
-        if self.nvim is not None:
-            try:
-                run_with_timeout(self.nvim.close, 1.0)
-            except Exception:  # noqa: BLE001 - best effort
-                pass
+        if self.conn is not None:
+            self.conn.close()
+            self.conn = None

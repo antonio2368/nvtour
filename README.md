@@ -65,7 +65,7 @@ ln -s ~/projects/nvtour/skill ~/.codex/skills/nvtour
 nvtour doctor
 ```
 
-**Requirements:** Python ≥ 3.11, [`pynvim`](https://github.com/neovim/pynvim), Neovim ≥ 0.10.
+**Requirements:** Python ≥ 3.11 and Neovim ≥ 0.10. There are no Python dependencies.
 Optional, for `nvtour diagram`: [`mermaid-ascii`](https://github.com/AlexanderGrooff/mermaid-ascii/releases)
 (Mermaid) and `graph-easy` (`sudo apt install libgraph-easy-perl`, for Graphviz DOT).
 

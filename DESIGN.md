@@ -20,7 +20,7 @@ It is **not** a code editing or review tool. It never writes to a file buffer or
 ## 2. Architecture
 
 ```
-agent (Bash) ──► nvtour CLI (Python, pynvim) ──msgpack-RPC over unix socket──► running nvim
+agent (Bash) ──► nvtour CLI (Python, stdlib) ──msgpack-RPC over unix socket──► running nvim
                      │                                                          │
                      │ loads once per nvim process                              ▼
                      └──────────────────────────────────────────────► nvtour.lua runtime (_G.nvtour)
@@ -43,11 +43,19 @@ agent (Bash) ──► nvtour CLI (Python, pynvim) ──msgpack-RPC over unix s
   command was not run"; otherwise nvim would queue the request and run it after the user answers.
 - **Timeouts**: one budget (`--timeout`) for the whole command: connect, mode check, version check,
   runtime load and dispatch share it. A timeout error names the phase.
+- **RPC client** (`nvtour/rpc.py`): a small msgpack-RPC client on the standard library (socket and
+  struct), not pynvim. A command is a new process that sends 3 requests, so the start of the
+  process is most of its time; the import of pynvim (asyncio, greenlet) took about 30 ms of the
+  75 ms of a command. The deadline of the budget is the timeout of the socket, so no thread is
+  needed. Strings are UTF-8 with `surrogateescape` both ways (as in pynvim); an ext value (Buffer,
+  Window, Tabpage) is read as its handle. A request from nvim to the client (`rpcrequest`) gets an
+  error response, and a notification is skipped, so nvim never waits for the client.
 - **Return protocol**: `dispatch` always returns a table `{ ok = true, ... }` or
   `{ ok = false, error = "message" }`. Lua errors are caught with `pcall` and converted to the
   error form. Python maps `ok = false` to exit code 5 and prints the message to stderr.
 
-Dependencies: Python ≥ 3.11, `pynvim` (already installed, 0.6.0), Neovim ≥ 0.10 (user has 0.12.4).
+Dependencies: Python ≥ 3.11, Neovim ≥ 0.10 (user has 0.12.4). The tests also need `pytest` and `pynvim`
+(the test extra), to look at the state of the test nvim.
 
 ## 3. Instance discovery and selection
 
@@ -299,9 +307,9 @@ msgpack) and `resolved_from` instead of `l1` and `l2`.
   dim, diff tabs, panel window and buffer, keymaps, the nvtour quickfix items. Buffers that were
   loaded stay loaded; the ones nvtour added to the buffer list are unlisted again unless shown,
   modified, or `--keep-buffers`. Prints `cleared`.
-- **doctor** — checks: nvim on PATH (optional), pynvim importable, runtime dirs scanned,
+- **doctor** — checks: nvim on PATH (optional), runtime dirs scanned,
   live/stale sockets, selected instance, version of that nvim ≥ 0.10, Lua runtime version loaded in
-  it. The exit code is the code of the first failed required check (pynvim, selected instance,
+  it. The exit code is the code of the first failed required check (selected instance,
   nvim version, connection). The check `sheet command` is informational (never fails the command):
   it says whether `vim.g.nvtour_sheet_cmd` (default `sheet`) is executable in the selected nvim.
 
@@ -1133,13 +1141,14 @@ current step.
 
 ```
 ~/projects/nvtour/
-  pyproject.toml          # name nvtour, console_scripts nvtour = nvtour.cli:main, dependency pynvim
+  pyproject.toml          # name nvtour, console_scripts nvtour = nvtour.cli:main, no dependencies
   README.md               # usage, keys, example session, init.lua options
   DESIGN.md
   nvtour/__init__.py      # __version__
   nvtour/cli.py           # argparse, subcommands, output
   nvtour/discover.py      # socket scan, probe, score, pin cache
-  nvtour/client.py        # pynvim attach with timeout, ensure_lua_loaded, call(cmd, args)
+  nvtour/client.py        # connect with timeout, ensure_lua_loaded, call(cmd, args)
+  nvtour/rpc.py           # msgpack codec and msgpack-RPC connection (stdlib)
   nvtour/ranges.py        # FILE:L1-L2 and FILE:/TEXT/ parsing, resolve_query, path resolution
   nvtour/gitutil.py       # toplevel, git show
   nvtour/diagram.py       # diagram renderers, output cleaning, --link targets

@@ -1135,13 +1135,6 @@ def run_doctor(args: argparse.Namespace, workspace: str, env: Mapping[str, str])
         add(version_tuple(ver) >= (0, 10), "nvim on PATH", f"{path} {ver} (optional; the running nvim is checked below)")
     else:
         add(None, "nvim on PATH", "not found (optional; nvtour only talks to a running nvim)")
-    try:
-        import pynvim
-
-        add(True, "pynvim importable", f"pynvim {getattr(pynvim, '__version__', '?')}")
-    except ImportError as exc:
-        add(False, "pynvim importable", f"{exc}; install with: pip install pynvim", EXIT_RPC)
-        return report()
     for program, command in diagram.tool_status():
         add(True if command else None, f"{program} (diagrams)", command or "not found (optional; needed for 'nvtour diagram')")
     add(True, "workspace", workspace)
@@ -1201,10 +1194,6 @@ def run(args: argparse.Namespace, env: Mapping[str, str]) -> int:
     workspace = resolve_workspace(args.workspace)
     if args.command == "doctor":
         return run_doctor(args, workspace, env)
-    try:
-        import pynvim  # noqa: F401
-    except ImportError:
-        raise NvtourError(EXIT_RPC, "pynvim is not installed; install with: pip install pynvim") from None
     if args.command == "instances":
         return run_instances(args, workspace, env)
     if args.command == "attach":
