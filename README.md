@@ -208,9 +208,12 @@ EOF
   step (`chapter = "Name"`): there is no `[[chapter]]` table. The steps are added in the order of the file, so `at` is a location, not a number.
 - **Unknown keys** and wrong types are exit 2, and the message names the entry. The entries are numbered
   from 1 in the order of the file: `step[3]: unknown key "lable" (did you mean "label"?)`.
+- **All errors at once:** every entry is checked, also after an error, and one failure lists them all in
+  file order (`3 errors, nothing was changed:` and one line per entry), so a tour file needs one fix, not
+  one call per error. A step on a diagram that failed is not checked again.
 - **Everything is checked first,** in nvim: files, ranges, text ranges, `expect`, `from`, sheet links,
   chapter names and the lines of diagram steps. A failure is exit 6 (or 2) with the entry in front, for
-  example `step[4]: --expect "it->second" not found in src/a.cpp:402; line 402 is "..."`. Nothing is
+  example `step[4]: --expect "it->second" not found in src/a.cpp:402; line 402 is "..."; it is on line 405`. Nothing is
   changed: the old tour, its diagrams and its focus stay. (Buffers that were loaded stay loaded, as after a
   failed `step`.)
 - **A new tour is the default.** `apply` does what `start` does, adds the diagrams, the focus, the steps and
@@ -232,6 +235,7 @@ contains `TEXT` (plain text, not a regex).
 ```bash
 nvtour step src/a.cpp:/Cache::get/ --label "the lookup"
 nvtour step src/a.cpp:'/it->second = value/+2'     # that line and 2 lines after it
+nvtour step src/a.cpp:'/void Cache::get/-3+8'      # 3 lines before it (a comment) to 8 lines after it
 nvtour step src/a.cpp:/try/../catch/               # from the try line to the first catch line after it
 nvtour step src/a.cpp:/erase/@2                    # the 2nd line that has "erase"
 nvtour step src/a.cpp:/erase/~120                  # the line with "erase" that is nearest to line 120
@@ -241,10 +245,12 @@ nvtour step src/a.cpp:/erase/~120                  # the line with "erase" that 
 |---|---|
 | `FILE:/TEXT/` | the line with `TEXT` |
 | `FILE:/TEXT/+N` | that line and `N` lines after it |
+| `FILE:/TEXT/-N` | `N` lines before that line, and the line (it stops at line 1) |
+| `FILE:/TEXT/-N+M` | from `N` lines before it to `M` lines after it (`-N..+M` is the same) |
 | `FILE:/START/../END/` | from the `START` line to the first `END` line at or after it |
 | `FILE:/TEXT/@N` | the `N`-th line with `TEXT` (from 1) |
 | `FILE:/TEXT/~L` | the line with `TEXT` that is nearest to line `L` (a tie: the earlier line) |
-| `FILE:/TEXT/@N+2`, `FILE:/A/@2../B/+1` | the parts can be combined: `@N` or `~L` after `START`, `+N` at the end |
+| `FILE:/TEXT/@N+2`, `FILE:/A/@2-1../B/+1` | the parts can be combined: `@N` or `~L` after `START`, then `-N`, `+N` at the end |
 
 - **A slash in `TEXT`:** write `\/`. Other backslashes stay as they are.
 - **A colon in `TEXT`** is fine (`a.cpp:/Cache::get/`). The text range starts at the first `:/` that is
@@ -375,13 +381,19 @@ A jump to a step (`]w`, `goto`, the panel) is animated, so you see where the tou
 
 - **In the same file**, the view scrolls to the step (500 ms). A long way starts one window height before
   the step, so the scroll is never slow.
-- **To another file**, the old text fades to the background, then the new text fades in (300 ms). The
+- **To another file**, the old text fades to the background, then the new text fades in (500 ms). The
   text of the two never mixes.
 - **To the same file at another commit** (a step with `--ref`), the old version is lined up with the new
   one. The lines that are the same in both versions stay, and only the code that changed fades.
-- **A title card** in the middle of the fade tells what changed: `## Chapter` when the chapter changes,
-  `◇ file @ref (sha)` when the file or the commit changes. The fade stays dark for 800 ms so you can read it.
-  A new chapter in the same file fades too (with only its name), instead of the scroll.
+- **What changed** (a new chapter, a new file or commit) is shown where you read it, not over the code:
+  - In the **inline view** the step shows it already (the chapter heading above the note, the change of
+    file or version), so nothing more is drawn.
+  - In the **side view** the lines of the card that changed light up: the chapter name, and the lines of
+    the file and its version. A new chapter also lights up in the winbar. The light blinks (200 ms on,
+    200 ms off) for 1500 ms each, and the code is there at once.
+  - Only with the **card hidden** (`<leader>ws`) does the fade show a title card in the middle: the chapter
+    name and `◇ file @ref (sha)`. The fade stays dark while it shows (1500 ms for each line), and a new
+    chapter in the same file fades too (with only its name), instead of the scroll.
 - The flash of the range comes after the animation.
 
 `<leader>wa` or `:NvtourAnimate [on|off|toggle]` turns it on and off. `vim.g.nvtour_animate = false` turns it
@@ -392,8 +404,9 @@ off in `init.lua`. When it is not set, it is on when Neovim has a UI, and off in
 - The fade needs `termguicolors`. Without it, a jump to another file is not animated.
 - During the first half of a fade the old buffer is shown again, read-only, under a blank float
   (`nvtour://fade`). A key that you type then cannot change it.
-- Set `vim.g.nvtour_scroll_ms`, `vim.g.nvtour_fade_ms` and `vim.g.nvtour_title_ms` to change the durations
-  (`0` turns that one off; without the title card, a new chapter in the same file scrolls).
+- Set `vim.g.nvtour_scroll_ms`, `vim.g.nvtour_fade_ms`, `vim.g.nvtour_title_ms` (the chapter: its light in
+  the card, or its line on the title card) and `vim.g.nvtour_file_ms` (the file and version) to change the
+  durations. `0` turns that one off; without the chapter line, a new chapter in the same file scrolls.
 
 ### Side view
 
@@ -764,8 +777,9 @@ vim.g.nvtour_winbar = false                   -- do not show the tour position i
 vim.g.nvtour_flash = 0                        -- ms the range flashes after a jump (default 300; 0 = off)
 vim.g.nvtour_animate = false                  -- no animation of jumps (default: on when nvim has a UI)
 vim.g.nvtour_scroll_ms = 500                  -- ms of the scroll in the same file (default 500; 0 = off)
-vim.g.nvtour_fade_ms = 300                    -- ms of the fade to another file (default 300; 0 = off)
-vim.g.nvtour_title_ms = 800                   -- ms the title card of a fade stays (default 800; 0 = no card)
+vim.g.nvtour_fade_ms = 500                    -- ms of the fade to another file (default 500; 0 = off)
+vim.g.nvtour_title_ms = 1500                  -- ms a new chapter is lit in the card / on the title card (default 1500; 0 = off)
+vim.g.nvtour_file_ms = 1500                   -- ms a new file or version is lit / on the title card (default 1500; 0 = off)
 vim.g.nvtour_follow_cursor = true             -- the step under the cursor becomes the current step (default false)
 vim.g.nvtour_note_style = "band"              -- a background band instead of the frame (default "frame")
 vim.g.nvtour_note_width = 160                 -- wrap notes at most this many cells wide (default: the window width)

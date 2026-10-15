@@ -20,8 +20,25 @@ def animate(nv):
     yield
     nv.exec_lua(
         "vim.g.nvtour_animate = nil; vim.g.nvtour_scroll_ms = nil; vim.g.nvtour_fade_ms = nil; "
-        "vim.g.nvtour_title_ms = nil; vim.g.nvtour_follow_cursor = nil; _G.nvtour.state.animate = nil"
+        "vim.g.nvtour_title_ms = nil; vim.g.nvtour_file_ms = nil; vim.g.nvtour_follow_cursor = nil; "
+        "_G.nvtour.state.animate = nil"
     )
+
+
+@pytest.fixture()
+def side_view(nv):
+    """Room for the step card of the side view; the inline view again at the end."""
+    nv.command("set columns=200")
+    yield
+    nv.exec_lua("_G.nvtour.state.view = nil; _G.nvtour.state.card.user_closed = false; _G.nvtour.dispatch('clear', {})")
+    nv.command("set columns=80")
+
+
+def hide_card(nv):
+    """The side view with its card hidden: the only view where the curtain shows the title card (the
+    inline view shows the change in the step, the side view lights it up in the card). After `start`,
+    which shows the card again."""
+    nv.exec_lua("_G.nvtour.state.view = 'side'; _G.nvtour.state.card.user_closed = true")
 
 
 def running(nv):
@@ -264,10 +281,11 @@ def jump_card(nv, n, shows=True):
     return wins, lines
 
 
-def test_title_card_names_the_new_file(cli, nv, animate):
+def test_title_card_names_the_new_file(cli, nv, animate, side_view):
     ok(cli("start", "Anim"))
     ok(cli("step", "a.txt:5"))
     ok(cli("step", "b.txt:20"))
+    hide_card(nv)
     ok(cli("goto", "1"))
     wait_done(nv)
     _, lines = jump_card(nv, 2)
@@ -276,10 +294,11 @@ def test_title_card_names_the_new_file(cli, nv, animate):
     wait_done(nv)
 
 
-def test_title_card_names_the_commit(cli, nv, animate):
+def test_title_card_names_the_commit(cli, nv, animate, side_view):
     ok(cli("start", "Anim"))
     ok(cli("step", "a.txt:30"))
     ok(cli("step", "a.txt:30", "--ref", "v1"))
+    hide_card(nv)
     ok(cli("goto", "1"))
     wait_done(nv)
     _, lines = jump_card(nv, 2)
@@ -287,13 +306,14 @@ def test_title_card_names_the_commit(cli, nv, animate):
     wait_done(nv)
 
 
-def test_a_new_chapter_fades_with_its_name(cli, nv, animate):
+def test_a_new_chapter_fades_with_its_name(cli, nv, animate, side_view):
     ok(cli("start", "Anim"))
     ok(cli("chapter", "One"))
     ok(cli("step", "a.txt:2"))
     ok(cli("step", "a.txt:30"))
     ok(cli("chapter", "Two"))
     ok(cli("step", "a.txt:55"))
+    hide_card(nv)
     final = end_view(cli, nv, 3)
     ok(cli("goto", "1"))
     wait_done(nv)
@@ -306,14 +326,57 @@ def test_a_new_chapter_fades_with_its_name(cli, nv, animate):
     nv.exec_lua("_G.nvtour.dispatch('goto', { n = 2 })")
     wait_done(nv)
     wins, lines = jump_card(nv, 3)
-    assert wins == ["nvtour://fade"] and lines[1:-1] == ["│ ## Two │"]  # with its name only
+    assert wins == ["nvtour://fade"] and lines[1:-1] == ["│ Two │"]  # with its name only
     wait_done(nv)
     assert topline(nv) == final and nv.exec_lua("return vim.bo.modifiable") is True
     assert nv.exec_lua("return _G.nvtour.state.tour.current") == 3
 
 
-def test_no_title_card_with_title_ms_0(cli, nv, animate):
+def hold(nv, n):
+    """The time the title card of the jump from step n - 1 to step n stays."""
+    return nv.exec_lua(f"local s = _G.nvtour.state.tour.steps return _G.nvtour._anim.card(s[{n}], s[{n} - 1]).hold")
+
+
+def test_the_card_stays_for_each_line_that_it_shows(cli, nv, animate):
+    nv.exec_lua("vim.g.nvtour_title_ms = 700; vim.g.nvtour_file_ms = 300")
+    ok(cli("start", "Anim"))
+    ok(cli("chapter", "One"))
+    ok(cli("step", "a.txt:2"))
+    ok(cli("step", "b.txt:20"))  # the file
+    ok(cli("chapter", "Two"))
+    ok(cli("step", "b.txt:25"))  # the chapter
+    ok(cli("chapter", "Three"))
+    ok(cli("step", "a.txt:5"))  # both
+    ok(cli("step", "a.txt:9"))  # nothing
+    assert [hold(nv, n) for n in (2, 3, 4, 5)] == [300, 700, 1000, 0]
+    nv.exec_lua("vim.g.nvtour_title_ms = nil; vim.g.nvtour_file_ms = nil")
+    assert hold(nv, 4) == 3000  # 1500 each by default
+
+
+def test_a_card_line_with_0_ms_is_left_out(cli, nv, animate, side_view):
     nv.exec_lua("vim.g.nvtour_title_ms = 0")
+    ok(cli("start", "Anim"))
+    ok(cli("chapter", "One"))
+    ok(cli("step", "a.txt:2"))
+    ok(cli("chapter", "Two"))
+    ok(cli("step", "a.txt:50"))
+    ok(cli("step", "b.txt:20"))
+    hide_card(nv)
+    ok(cli("goto", "1"))
+    wait_done(nv)
+    assert jump_card(nv, 2, shows=False) == ([], [])  # a new chapter only scrolls
+    wait_done(nv)
+    wins, lines = jump_card(nv, 3)
+    assert wins == ["nvtour://fade"] and lines[1:-1] == ["│ ◇ b.txt │"]  # the file line stays
+    wait_done(nv)
+    nv.exec_lua("vim.g.nvtour_file_ms = 0")
+    ok(cli("goto", "2"))
+    wait_done(nv)
+    assert jump_card(nv, 3, shows=False) == (["nvtour://fade"], [])  # a fade without a card
+    wait_done(nv)
+
+
+def test_the_inline_view_has_no_title_card(cli, nv, animate):
     ok(cli("start", "Anim"))
     ok(cli("chapter", "One"))
     ok(cli("step", "a.txt:2"))
@@ -322,8 +385,77 @@ def test_no_title_card_with_title_ms_0(cli, nv, animate):
     ok(cli("step", "b.txt:20"))
     ok(cli("goto", "1"))
     wait_done(nv)
-    assert jump_card(nv, 2, shows=False) == ([], [])  # a new chapter only scrolls
+    assert jump_card(nv, 2, shows=False) == ([], [])  # a new chapter in the same file: a scroll
     wait_done(nv)
-    assert jump_card(nv, 3, shows=False) == (["nvtour://fade"], [])  # another file fades, without a card
+    assert jump_card(nv, 3, shows=False) == (["nvtour://fade"], [])  # a new file: a fade, no card
     wait_done(nv)
+
+
+def card_lights(nv):
+    """The lit parts of the side card: (group, the lit text) per mark of side.flash."""
+    return nv.exec_lua(
+        "local c = _G.nvtour.state.card local ns = vim.api.nvim_create_namespace('nvtour_card_flash') "
+        "local out = {} for _, m in ipairs(vim.api.nvim_buf_get_extmarks(c.buf, ns, 0, -1, { details = true })) do "
+        "local t = vim.api.nvim_buf_get_text(c.buf, m[2], m[3], m[4].end_row, m[4].end_col, {}) "
+        "out[#out + 1] = { m[4].hl_group, table.concat(t, '|') } end return out"
+    )
+
+
+def test_the_side_card_lights_up_what_changed(cli, nv, animate, side_view):
+    nv.exec_lua("vim.g.nvtour_title_ms = 300; vim.g.nvtour_file_ms = 300")
+    ok(cli("start", "Anim"))
+    ok(cli("chapter", "One"))
+    ok(cli("step", "a.txt:2"))
+    ok(cli("chapter", "Two"))
+    ok(cli("step", "b.txt:20"))  # the chapter and the file
+    ok(cli("step", "b.txt:30"))  # nothing
+    ok(cli("step", "a.txt:30", "--ref", "v1"))  # the file and the version
+    nv.exec_lua("_G.nvtour.state.view = 'side'")
+    ok(cli("goto", "1"))
+    wait_done(nv)
+    nv.exec_lua("_G.nvtour.dispatch('goto', { n = 2 })")
+    lit = card_lights(nv)  # at once: the code is shown, the card says what changed
+    assert ["NvtourCardFlashChapter", "Two"] in lit
+    files = [t for g, t in lit if g == "NvtourCardFlashFile"]
+    assert len(files) == 1 and files[0].startswith("b.txt:20|"), lit
+    assert card(nv) == []  # no title card on the curtain
+    assert "%#NvtourWinbarFlash#Two · %*" in nv.exec_lua("return _G.nvtour.winbar()")  # and in the winbar
+    wait_done(nv)
+    assert card_lights(nv) == []  # the light is gone at the end
+    assert "%#NvtourPanelChapter#Two · %*" in nv.exec_lua("return _G.nvtour.winbar()")
+    nv.exec_lua("_G.nvtour.dispatch('goto', { n = 3 })")
+    assert card_lights(nv) == []  # nothing changed: nothing lights up
+    assert "NvtourWinbarFlash" not in nv.exec_lua("return _G.nvtour.winbar()")
+    wait_done(nv)
+    nv.exec_lua("_G.nvtour.dispatch('goto', { n = 4 })")
+    assert "NvtourWinbarFlash" not in nv.exec_lua("return _G.nvtour.winbar()")  # only a new file: not the chapter
+    wait_done(nv)
+    ok(cli("goto", "3"))
+    wait_done(nv)
+    nv.exec_lua("_G.nvtour.dispatch('goto', { n = 4 })")
+    lit = card_lights(nv)
+    assert [g for g, _ in lit] == ["NvtourCardFlashFile"] and "git ref v1" in lit[0][1], lit
+    wait_done(nv)
+
+
+def test_the_card_light_blinks(cli, nv, animate, side_view):
+    nv.exec_lua("vim.g.nvtour_title_ms = 1000; vim.g.nvtour_file_ms = 1000")
+    ok(cli("start", "Anim"))
+    ok(cli("chapter", "One"))
+    ok(cli("step", "a.txt:2"))
+    ok(cli("chapter", "Two"))
+    ok(cli("step", "b.txt:20"))
+    nv.exec_lua("_G.nvtour.state.view = 'side'")
+    ok(cli("goto", "1"))
+    wait_done(nv)
+    light = nv.exec_lua("return vim.api.nvim_get_hl(0, { name = 'NvtourFlash' }).bg")
+    nv.exec_lua("_G.nvtour.dispatch('goto', { n = 2 })")
+    seen, bars = set(), set()
+    deadline = time.time() + 2
+    while running(nv) and time.time() < deadline:
+        seen.add(nv.exec_lua("return vim.api.nvim_get_hl(0, { name = 'NvtourCardFlashChapter' }).bg") == light)
+        bars.add(nv.exec_lua("return vim.api.nvim_get_hl(0, { name = 'NvtourWinbarFlash' }).bg") == light)
+        time.sleep(0.03)
+    assert seen == {True, False} and bars == {True, False}  # on and off, in the card and in the winbar
+    assert card_lights(nv) == []
 

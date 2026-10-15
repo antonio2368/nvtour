@@ -522,17 +522,22 @@ def parse_tour(text: str) -> dict[str, Any]:
     for key in data:
         if key not in TOUR_KEYS and key not in TOUR_TABLES:
             raise unknown_key(key, [*TOUR_KEYS, *TOUR_TABLES], "tour")
-    tour = check_entry({k: v for k, v in data.items() if k in TOUR_KEYS}, TOUR_KEYS, [], "tour")
+    errors: list[dict[str, Any]] = []
+    tour = collect(errors, "tour", 0, lambda: check_entry({k: v for k, v in data.items() if k in TOUR_KEYS},
+                                                          TOUR_KEYS, [], "tour"), {})
     for name, (keys, required) in TOUR_TABLES.items():
         entries = data.get(name)
         if entries is None:
             entries = []
         if not isinstance(entries, list):
             raise tour_error("tour", f'"{name}" must be an array of tables ([[{name}]])')
-        tour[name] = [check_entry(e, keys, required, f"{name}[{i}]") for i, e in enumerate(entries, 1)]
+        tour[name] = [collect(errors, name, i, lambda e=e, w=f"{name}[{i}]", k=keys, r=required: check_entry(e, k, r, w), {})
+                      for i, e in enumerate(entries, 1)]
     for i, d in enumerate(tour["diagram"], 1):
-        if ("source" in d) == ("file" in d):
-            raise tour_error(f"diagram[{i}]", 'give one of "source" and "file"')
+        if d and ("source" in d) == ("file" in d):
+            errors.append(entry_error("diagram", i, tour_error(f"diagram[{i}]", 'give one of "source" and "file"')))
+    if errors:
+        raise combined_error(errors)
     return tour
 
 
@@ -542,6 +547,35 @@ def scoped(where: str, fn: Any) -> Any:
         return fn()
     except NvtourError as exc:
         raise NvtourError(exc.code, f"{where}: {exc.message}") from None
+
+
+# The order of the entries of a tour file in an error report (apply_tour in nvtour.lua has the same).
+ENTRY_RANK = {"tour": 0, "sheet": 0, "diagram": 1, "focus": 2, "step": 3}
+
+
+def entry_error(kind: str, i: int, exc: NvtourError) -> dict[str, Any]:
+    """One error of a tour file for the report: ``msg`` names the entry already (``step[3]: ...``)."""
+    return {"kind": kind, "i": i, "msg": exc.message, "code": exc.code}
+
+
+def collect(errors: list[dict[str, Any]], kind: str, i: int, fn: Any, failed: Any) -> Any:
+    """Run ``fn`` for entry ``kind[i]``; on an error of nvtour add it to ``errors`` and return ``failed``,
+    so the other entries are checked too (``apply`` reports all errors at once)."""
+    try:
+        return fn()
+    except NvtourError as exc:
+        errors.append(entry_error(kind, i, exc))
+        return failed
+
+
+def combined_error(errors: list[dict[str, Any]]) -> NvtourError:
+    """One error for all ``errors`` in the order of the file: the message alone when there is one, else
+    a count and one message per entry. The exit code is the one of the first."""
+    errors = sorted(errors, key=lambda e: (ENTRY_RANK[e["kind"]], e["i"]))
+    if len(errors) == 1:
+        return NvtourError(errors[0]["code"], errors[0]["msg"])
+    return NvtourError(errors[0]["code"], f"{len(errors)} errors, nothing was changed:\n"
+                       + "\n".join(e["msg"] for e in errors))
 
 
 def read_tour(path: str) -> str:
@@ -584,11 +618,6 @@ def tour_step(st: dict[str, Any], blobs: dict[tuple[str, str], tuple[gitutil.Blo
               sent: set[tuple[str, str]]) -> dict[str, Any]:
     """Lua args of one ``[[step]]``. The lines of a git blob go with the first step on it only."""
     req = location(st["at"], st.get("ref"), st.get("diagram"), blobs)
-    if "sha" in req:
-        key = (req["sha"], req["file"])
-        if key in sent:
-            del req["lines"]
-        sent.add(key)
     for key in ("role", "label", "note", "via", "suggest", "from"):
         if key in st:
             req[key] = st[key]
@@ -599,6 +628,11 @@ def tour_step(st: dict[str, Any], blobs: dict[tuple[str, str], tuple[gitutil.Blo
         req["sheet"] = link
     if "chapter" in st:
         req["chapter"] = st["chapter"]
+    if "sha" in req:  # last: a step that failed above is skipped, so the next step on the blob takes the lines
+        key = (req["sha"], req["file"])
+        if key in sent:
+            del req["lines"]
+        sent.add(key)
     return req
 
 
@@ -614,18 +648,30 @@ def apply_request(args: argparse.Namespace, base: dict[str, Any]) -> dict[str, A
     sheet = None
     if "sheet" in tour:
         sheet = scoped("sheet", lambda: check_sheet_id(tour["sheet"]))
+    # The errors of all entries are collected: an entry that fails here goes to Lua as {skip = true}, Lua
+    # checks the others and reports these errors with its own (DESIGN.md section 15, "All errors at once").
+    errors: list[dict[str, Any]] = []
     names: dict[str, int] = {}
+    diagrams: list[dict[str, Any]] = []
     for i, d in enumerate(tour["diagram"], 1):
         if d["name"] in names:
-            raise tour_error(f"diagram[{i}]", f'the name "{d["name"]}" is used by diagram[{names[d["name"]]}] already')
+            errors.append(entry_error("diagram", i, tour_error(
+                f"diagram[{i}]", f'the name "{d["name"]}" is used by diagram[{names[d["name"]]}] already')))
+            diagrams.append({"skip": True})
+            continue
         names[d["name"]] = i
+        # a diagram that fails keeps its name: Lua then skips the steps on it, the error is enough
+        diagrams.append(collect(errors, "diagram", i, lambda d=d, i=i: scoped(f"diagram[{i}]", lambda: tour_diagram(d)),
+                                {"skip": True, "name": d["name"]}))
     blobs: dict[tuple[str, str], tuple[gitutil.Blob, list[str]]] = {}
     sent: set[tuple[str, str]] = set()
-    diagrams = [scoped(f"diagram[{i}]", lambda d=d: tour_diagram(d)) for i, d in enumerate(tour["diagram"], 1)]
-    focus = [scoped(f"focus[{i}]", lambda f=f: tour_focus(f)) for i, f in enumerate(tour["focus"], 1)]
-    steps = [scoped(f"step[{i}]", lambda st=st: tour_step(st, blobs, sent)) for i, st in enumerate(tour["step"], 1)]
+    focus = [collect(errors, "focus", i, lambda f=f, i=i: scoped(f"focus[{i}]", lambda: tour_focus(f)), {"skip": True})
+             for i, f in enumerate(tour["focus"], 1)]
+    steps = [collect(errors, "step", i, lambda st=st, i=i: scoped(f"step[{i}]", lambda: tour_step(st, blobs, sent)),
+                     {"skip": True}) for i, st in enumerate(tour["step"], 1)]
     return {**base, "title": tour.get("title"), "sheet": sheet, "sheet_env": sheet_env() or None,
             "panel": tour.get("panel"), "focus": focus, "diagrams": diagrams, "steps": steps,
+            "errors": errors or None,
             "append": args.append or None, "check": args.check or None, "no_jump": args.no_jump or None}
 
 

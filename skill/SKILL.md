@@ -27,7 +27,7 @@ Use this when the user asks about code ("this", "here", "this chunk") but gives 
 
 1. Run `nvtour attach` first.
    - Exit 3 or 4: relay the stderr message to the user verbatim and stop. Do not start nvim yourself.
-2. A tour of 3 or more steps: write the whole tour as TOML and run `nvtour apply - <<'EOF' ... EOF` once. It starts the tour, adds the steps, sets the panel and jumps to step 1: do not run `start`, `step` or `panel` as well. A shorter tour: `nvtour start "<title>"`, then one `nvtour step FILE:L1[-L2] ...` per point.
+2. Write the whole tour as TOML and run `nvtour apply - <<'EOF' ... EOF` once, also for a tour of 1 or 2 steps. It starts the tour, adds the steps, sets the panel and jumps to step 1: do not run `start`, `step` or `panel` as well. The quoted heredoc needs no shell quoting, so notes can contain `(`, `'`, `$` and backticks. Do not chain `nvtour start ... && nvtour step ... && ...` in one command.
 
    ```
    nvtour apply - <<'EOF'
@@ -43,7 +43,7 @@ Use this when the user asks about code ("this", "here", "this chunk") but gives 
    note = "The iterator is used after `erase()` invalidated it."
 
    [[step]]
-   at = "src/b.cpp:88"
+   at = "src/b.cpp:/void evict(/-2+6"         # 2 lines before the text (a comment) to 6 after it
    role = "flow"
    via = "the cleanup thread runs `evict()`"
    note = "The cleanup thread erases the entry while the reader holds `it`."
@@ -51,7 +51,7 @@ Use this when the user asks about code ("this", "here", "this chunk") but gives 
    ```
 
    - Keys: top level `title`, `sheet`, `panel`, `[[focus]]`, `[[diagram]]`; `[[step]]` `at` (required), `role`, `label`, `note`, `expect`, `via`, `from`, `suggest`, `sheet`, `ref`, `chapter`, `diagram`.
-   - Check the echoed `step N/T` lines of every step. Run `apply --check` first when the tour is long or uses `ref`: it changes nothing, and the error names the entry (`step[4]: ...`). Use `step`, `edit` and `remove` only for fixes.
+   - Check the echoed `step N/T` lines of every step. Run `apply --check` first when the tour is long or uses `ref`: it changes nothing. A failure lists every bad entry at once (`step[4]: ...`, one per line): fix them all in one edit of the tour file, then run it again. Use `step`, `edit` and `remove` only for fixes and for one more step in a tour that is open.
 3. Interleave with your chat explanation: one step per point.
    - Use 3 to 8 steps. One idea per step.
    - Follow reading order: cause, propagation, effect (or entry, core, exit).
@@ -62,15 +62,18 @@ Use this when the user asks about code ("this", "here", "this chunk") but gives 
 
 ## Line numbers
 
-- Prefer `FILE:/text/` over numbers from `rg -n` (no `rg | cut` pipelines): `nvtour step a.cpp:/Cache::get/` is the line that has the text, `/text/+N` adds N lines, `/start/../end/` is a block, and `\/` is a slash in the text. The text is plain, not a regex. Quote it when it has spaces. On several matches nvtour fails with exit 6 and lists the lines: pick one with `@N` (the N-th) or `~L` (nearest to line L). `focus`, `edit`, `step --diagram NAME /label/` and `diagram --link 'TEXT=FILE:/text/'` take it too. In a tour file it is the same text in `at`.
-- When you use numbers, take them from `rg -n` or `sed -n 'A,Bp'` output, not from memory. `FILE:L:COL` (compiler and `rg --column` output) is accepted; the column is ignored.
+- Give every range by its text: `FILE:/text/`. Use text that you already read while you studied the code. Do not run `sed -n`, `rg -n`, `nl` or `cat -n` only to get line numbers for a step: nvtour finds the lines.
+- The forms: `/text/` is the line that has the text. `/text/+N` adds N lines after it, `/text/-N` adds N lines before it (for example the comment above a function), and `/text/-N+M` does both. `/start/../end/` is a block from the `start` line to the first `end` line after it (`/start/-N../end/+M` with context). `\/` is a slash in the text. The text is plain, not a regex. Quote it when it has spaces.
+- On several matches nvtour fails with exit 6 and lists the lines with their numbers. Pick, in this order: longer text that occurs once; `~L` (the match nearest to line L: an approximate L is enough); `@N` (the N-th match: it changes when the file changes).
+- `focus`, `edit`, `step --diagram NAME /label/` and `diagram --link 'TEXT=FILE:/text/'` take it too. In a tour file it is the same text in `at`.
+- Use numbers only when no text can name the lines, and then take them from tool output that you have already, not from memory. `FILE:L:COL` (compiler and `rg --column` output) is accepted; the column is ignored.
 - Each `step` prints the first highlighted line (`  412| ...`). Check it.
-- Add `--expect TEXT` (a substring of the range) to make a wrong range fail with exit 6 instead of highlighting the wrong code. A query and an expect together are fine. The user sees `TEXT` underlined, so pick the exact expression the note is about (for example `it->second`).
+- Add `--expect TEXT` (a substring of the range) to make a wrong range fail with exit 6 instead of highlighting the wrong code. A query and an expect together are fine. The error tells where the text is (`; it is on line 231`, or `; it is not in the file`): fix the range from that, without a new lookup. The user sees `TEXT` underlined, so pick the exact expression the note is about (for example `it->second`).
 - When the note names more than one part of the range, give `--expect` for each one (at most 3): `--expect 'refresh(key)' --expect 'it->second'`. Each text must be in the range.
 
 ## Fixing a tour
 
-- `nvtour edit N [FILE:L1-L2] [--note ...] [--label ...] [--role ...]` changes step N. `--label ''` removes the label.
+- `nvtour edit N [FILE:/text/] [--note ...] [--label ...] [--role ...]` changes step N. `--label ''` removes the label.
 - `nvtour remove N` removes step N. `nvtour step ... --at N` inserts at position N.
 - `nvtour status` shows the tour, focus, panel and keys. Use it after an error or when you lost track. Do not `clear` and start again.
 - **Questions during a tour:** before you answer a question that the user asks while a tour is open, run `nvtour status` and answer relative to the current step. The user may have moved with `]w`, `<CR>` in the panel, by cursor (`follow: on`), or read another step in a peek float (`<leader>wk`, `K` in the panel) that does not change the current step. If `status` shows `marks: N`, or the user mentions "the places I marked", run `nvtour marks` and use them.
@@ -94,10 +97,10 @@ Use this when the user asks about code ("this", "here", "this chunk") but gives 
 - Put identifiers in backticks (`` `erase()` ``); `**bold**` also works. Other markdown is shown as typed.
 - Only the current step shows its full note; the others show the first line. Make the first sentence of a note stand alone.
 - Text that starts with `-`: write `--note=TEXT`, `--label=TEXT` or `--via=TEXT`.
-- Multi-line notes:
+- Multi-line notes: in a tour file, `note = """...` with the lines, and `"""` at the end. On a single `step` (a fix), `--note -` with a heredoc:
 
   ```
-  nvtour step f.cpp:10-12 --role fault --note - <<'EOF'
+  nvtour step f.cpp:/erase(it)/-1+1 --role fault --note - <<'EOF'
   First sentence.
   Second sentence.
   EOF
@@ -115,7 +118,7 @@ Use this when the user asks about code ("this", "here", "this chunk") but gives 
 ## Sheets
 
 - Use this only when you also draw a `sheet` canvas for the same topic. nvtour never starts or changes a sheet by itself.
-- `--sheet SHEET#STEP` on `nvtour step` (or `edit`) links a tour step to a step of a sheet. When the user moves to that tour step, the viewer shows the sheet step. Example: ``nvtour step f.cpp:10-12 --sheet arch#evict``.
+- `--sheet SHEET#STEP` on `nvtour step` (or `edit`) links a tour step to a step of a sheet. When the user moves to that tour step, the viewer shows the sheet step. Example: ``nvtour step f.cpp:/void evict(/ --sheet arch#evict`` (`sheet = "arch#evict"` in a tour file).
 - Prefer a step id for STEP (`arch#evict`): numbers change when the sheet changes. 0 is the overview.
 - `nvtour start TITLE --sheet SHEET` sets the sheet of the tour; then `--sheet '#evict'` is enough. `nvtour edit N --sheet ''` removes a link.
 - One tour can use several sheets: a full `SHEET#STEP` links a step to another sheet (`#STEP` keeps the tour's sheet), so the tour can go from `arch#overview` to `raft#append` and back. The note of the first linked step and of each step where the sheet changes starts with `↔ sheet raft`, so you do not need to write that the sheet changed.
@@ -131,23 +134,28 @@ Use this when the user asks about code ("this", "here", "this chunk") but gives 
 
 ## Old code
 
-- `nvtour step FILE:L1-L2 --ref GITREF` shows the range as it is at a git ref, in a read-only buffer. Everything else works as on a normal step.
+- `nvtour step FILE:/text/ --ref GITREF` (or `ref = "GITREF"` in a tour file) shows the range as it is at a git ref, in a read-only buffer. Everything else works as on a normal step.
 - Use it for code that a change removed or moved, and for before/after: a step on the old range (`--ref origin/master`), then a step on the new range (no `--ref`).
-- Get line numbers of the old version from `git show GITREF:PATH | sed -n 'A,Bp'` (or `| rg -n`), not from the working tree.
+- With `--ref`, the text is searched in the file at that ref. Use text from the old version (`git show GITREF:PATH`, or the diff you read), not from the working tree.
 - The file does not have to exist in the working tree.
-- `nvtour edit N FILE:L1-L2` without `--ref` moves the step to the working tree. Add `--ref` to keep it on the old version.
+- `nvtour edit N FILE:/text/` without `--ref` moves the step to the working tree. Add `--ref` to keep it on the old version.
 
 ## Suggested fix
 
 - A `fix` step with a concrete change gives `--suggest`: the code that would replace the range. nvim shows it below the range, with syntax colours, and strikes through the old lines.
 - `--suggest` replaces the whole range: give all the new lines for it, not only the changed line. To delete a line, leave it out. Use the indentation of the file.
-- Multi-line code: `--suggest -` with a heredoc. Only one of `--note -` and `--suggest -` can read stdin; give the note inline then.
+- In a tour file, write the code in a literal string (`'''`): it keeps backslashes and quotes as they are. On a single `step`, `--suggest -` reads a heredoc; only one of `--note -` and `--suggest -` can read stdin, so give the note inline then.
 
   ```
-  nvtour step f.cpp:19-20 --role fix --label "update in place" --note 'Change the expiry through `it`.' --suggest - <<'EOF'
+  [[step]]
+  at = "f.cpp:/expires_at = now/+1"
+  role = "fix"
+  label = "update in place"
+  note = "Change the expiry through `it`."
+  suggest = '''
           it->second.expires_at += ttl;
           return it->second.value;
-  EOF
+  '''
   ```
 
 - `nvtour edit N --suggest ''` removes it.
@@ -155,13 +163,13 @@ Use this when the user asks about code ("this", "here", "this chunk") but gives 
 ## Diagrams
 
 - Use a diagram when the point is a protocol, a sequence of messages, or how components connect, and code alone does not show it. Do not draw a diagram for one function.
-- Make it after `nvtour start` (`start` and `clear` delete diagrams): `nvtour diagram NAME --link 'TEXT=FILE:L1-L2' <<'EOF'` with Mermaid source on stdin. The terminal shows no images: it is text in a split next to the code.
+- Make it after `nvtour start` (`start` and `clear` delete diagrams): `nvtour diagram NAME --link 'TEXT=FILE:/text/' <<'EOF'` with Mermaid source on stdin, or a `[[diagram]]` entry in the tour file. The terminal shows no images: it is text in a split next to the code.
 - Before the first `nvtour diagram` in a conversation, ask the user where to put the diagram: above the code (horizontal split, good for wide diagrams), or beside it (vertical split, good for tall diagrams such as a long `sequenceDiagram`), and on which side, or full screen (a tab page of its own, good when there is no code to look at). Do not ask again in the same conversation unless the user wants to change it. Give the answer as `--split above|below|left|right|full` on every `nvtour diagram`.
 - Formats: Mermaid `sequenceDiagram` for messages over time, `graph LR` / `graph TD` for components (default; needs `mermaid-ascii`). `--format dot` for Graphviz DOT (needs `graph-easy`). `--format text` for a small diagram you draw yourself. Keep it to about 6 participants or 20 nodes: wide diagrams do not fit.
 - The participant names of a `sequenceDiagram` stay in the winbar when the user scrolls; nothing to do. For a long `--format text` diagram with a row of names or columns at the top, give `--header N` (the line of the names).
-- The output prints every rendered line with its number. Take step ranges from it, not from the source.
-- `nvtour step --diagram NAME L1[-L2] --note ...` puts a step on diagram lines (for example one message). Give `--expect` with the label text. Then step into the code with `--via`, and back to the diagram for the next message.
-- `--link TEXT=FILE:L1-L2` lets the user press `<CR>` on TEXT to open that code. Link each label that has one clear code location. TEXT must be in the rendered diagram (exit 6 otherwise).
+- The output prints every rendered line with its number. A step on a diagram is best given by its label: `/label/` is searched in the rendered lines, not in the source.
+- `nvtour step --diagram NAME /label/ --note ...` (`diagram = "NAME"` and `at = "/label/"` in a tour file) puts a step on diagram lines (for example one message). Give `--expect` with the label text. Then step into the code with `--via`, and back to the diagram for the next message.
+- `--link 'TEXT=FILE:/text/'` lets the user press `<CR>` on TEXT to open that code. Link each label that has one clear code location. TEXT must be in the rendered diagram (exit 6 otherwise).
 - Exit 2 with `not found`: the renderer is missing. Tell the user, or draw the diagram by hand with `--format text`.
 - Never state a message or an edge that you did not verify in the code or the docs.
 

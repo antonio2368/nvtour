@@ -60,12 +60,15 @@ def _scan_text(s: str, i: int) -> tuple[str, int]:
 
 
 _MOD_RE = re.compile(r"(?:@(\d+)|~(\d+))?")
+_MINUS_RE = re.compile(r"(?:-(\d+))?")
 _PLUS_RE = re.compile(r"(?:\+(\d+))?")
 
 
 def parse_query(text: str) -> dict[str, Any]:
-    """Parse ``/TEXT/[@N|~L][+N]`` or ``/START/[@N|~L]../END/[+N]`` into
-    ``{start, end, plus, nth, near}`` (``end``, ``nth`` and ``near`` are None when absent).
+    """Parse ``/TEXT/[@N|~L][-N][+N]`` or ``/START/[@N|~L][-N]../END/[+N]`` into
+    ``{start, end, minus, plus, nth, near}`` (``end``, ``nth`` and ``near`` are None when absent).
+    ``-N`` adds N lines before START, ``+N`` N lines after the last line; ``/TEXT/-N..+M`` is the same
+    as ``/TEXT/-N+M``.
 
     ``\\/`` is a slash inside TEXT. Raises ValueError with the reason when ``text`` is not a query."""
     if not text.startswith("/"):
@@ -76,8 +79,13 @@ def parse_query(text: str) -> dict[str, Any]:
     i = m.end()
     nth = int(m.group(1)) if m.group(1) else None
     near = int(m.group(2)) if m.group(2) else None
+    minus_m = _MINUS_RE.match(text, i)
+    assert minus_m is not None
+    i = minus_m.end()
     end = None
-    if text.startswith("../", i):
+    if minus_m.group(1) and text.startswith("..+", i):
+        i += 2  # /TEXT/-N..+M: the lines around TEXT
+    elif text.startswith("../", i):
         end, i = _scan_text(text, i + 3)
         if not end:
             raise ValueError("the END text is empty")
@@ -89,7 +97,8 @@ def parse_query(text: str) -> dict[str, Any]:
         raise ValueError("the text is empty")
     if nth == 0 or near == 0:
         raise ValueError("@N and ~L count from 1")
-    return {"start": start, "end": end, "plus": int(plus_m.group(1) or 0), "nth": nth, "near": near}
+    return {"start": start, "end": end, "minus": int(minus_m.group(1) or 0), "plus": int(plus_m.group(1) or 0),
+            "nth": nth, "near": near}
 
 
 def format_query(q: dict[str, Any]) -> str:
@@ -100,6 +109,8 @@ def format_query(q: dict[str, Any]) -> str:
         out += f"@{q['nth']}"
     elif q.get("near"):
         out += f"~{q['near']}"
+    if q.get("minus"):
+        out += f"-{q['minus']}"
     if q.get("end"):
         out += "../" + esc(q["end"]) + "/"
     if q.get("plus"):
@@ -109,7 +120,8 @@ def format_query(q: dict[str, Any]) -> str:
 
 def resolve_query(lines: list[str], q: dict[str, Any], name: str = "file") -> tuple[int, int]:
     """Lines (1-based, inclusive) that query ``q`` selects in ``lines``. The Lua runtime has the
-    same function (``resolve_query`` in nvtour.lua); tests/test_query.py runs both on one table."""
+    same function (``resolve_query`` in nvtour.lua); tests/test_query.py runs both on one table.
+    ``-N`` stops at line 1."""
     start = q["start"]
     hits = [n for n, line in enumerate(lines, 1) if start in line]
     if not hits:
@@ -135,7 +147,7 @@ def resolve_query(lines: list[str], q: dict[str, Any], name: str = "file") -> tu
         if found is None:
             raise NvtourError(EXIT_BAD_FILE, f"end text '{q['end']}' not found in {name} after line {l1} ({len(lines)} lines)")
         l2 = found
-    return l1, l2 + (q.get("plus") or 0)
+    return max(1, l1 - (q.get("minus") or 0)), l2 + (q.get("plus") or 0)
 
 
 def read_lines(path: str) -> list[str]:

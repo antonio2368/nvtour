@@ -181,14 +181,17 @@ FILE (or none) and a range is exit 2 (§8, "Focus from the steps").
 ```
 FILE:/TEXT/                 the line that contains TEXT
 FILE:/TEXT/+N               that line and N lines after it
+FILE:/TEXT/-N               N lines before that line, and the line (stops at line 1)
+FILE:/TEXT/-N+M             N lines before it to M lines after it; `-N..+M` is the same
 FILE:/START/../END/         from the START line to the first END line at or after it, inclusive
 FILE:/TEXT/@N               the N-th line with TEXT (from 1)
 FILE:/TEXT/~L               the line with TEXT nearest to line L (a tie: the earlier line)
-FILE:/TEXT/@N+2, FILE:/A/@2../B/+1    combined: @N or ~L after START (not both), +N last
+FILE:/TEXT/@N+2, FILE:/A/@2-1../B/+1  combined: @N or ~L after START (not both), -N next, +N last
 ```
 
-Grammar after the file: `/START/ [@N | ~L] [../END/] [+N]`; `+N` goes on the last line, so it is the
-end of `END` too. `\/` is a slash in `TEXT`; other backslashes are literal. `TEXT` and `END` are not
+Grammar after the file: `/START/ [@N | ~L] [-N] [../END/] [+N]`; `-N` goes on the `START` line and
+`+N` on the last line, so it is the end of `END` too. `END` is searched from the `START` match, not
+from the `-N` line. `/TEXT/-N..+M` (no `END`) is read as `/TEXT/-N+M`: agents write that form. `\/` is a slash in `TEXT`; other backslashes are literal. `TEXT` and `END` are not
 empty. The parse rule (`ranges.parse_spec`): a spec is a text range when it has a `:/` and the rest
 after it reads as a well formed query. The first such `:/` splits, so `TEXT` can contain `:`
 (`a.cpp:/Cache::get/`) and a path can contain `:/` (the candidates are tried from the left). With no
@@ -202,7 +205,7 @@ number of matches; `END` not found at or after the `START` line. The resolved li
 normal range checks (`+N` beyond the end of the file is exit 6).
 
 Python (`ranges.py`): `parse_spec(spec) -> Spec(path, l1, l2, query)` (numbers or `query`, never both),
-`query = { start, end, plus, nth, near }` (`end`, `nth` and `near` are None when absent);
+`query = { start, end, minus, plus, nth, near }` (`end`, `nth` and `near` are None when absent);
 `parse_file_range` is built on it and refuses a query; `parse_range_or_query(text)` is for the extra
 `focus` arguments and for `--diagram` steps; `format_query` gives the canonical text (the field
 `resolved_from`); `resolve_query(lines, query, name)` is the Python twin of the Lua function. The two
@@ -245,8 +248,9 @@ msgpack) and `resolved_from` instead of `l1` and `l2`.
   jumps (so a finished tour is at step 1); `--jump` forces a jump, `--no-jump` suppresses it for the
   first step. Prints `step N/N: file:L1-L2 [role] label` and the first highlighted line
   (`  L1| text`). `--expect TEXT` fails with exit 6 unless `TEXT` occurs in the range; it can be
-  given more than one time, then each text must occur (the error names the first one that does not;
-  in `edit` the new list replaces the old one, `''` removes it). `--note -`
+  given more than one time, then each text must occur (the error names the first one that does not,
+  and tells where it is in the file: `; it is on lines 231, 400` (at most 3, the nearest first) or
+  `; it is not in the file`; in `edit` the new list replaces the old one, `''` removes it). `--note -`
   reads the note from stdin (lets agents pass multi-line text with a heredoc). A step is added only
   after it rendered (and jumped); on an error nothing of it remains. `--ref GITREF` puts the step on
   the file as it is at that git ref, not on the working tree (§6, "Steps at a git ref"); the output
@@ -794,7 +798,7 @@ animates the view from `from` to that state, and `done` flashes the range. Nothi
   the final view, `n` times `<C-y>` (or `<C-e>`, upwards) goes back towards the old view; each frame
   then scrolls `round(n * (1 - (1 - t)^3)) - moved` lines forward (eased out). The last frame is
   `winrestview` of the final view.
-- **Fade** (another buffer; `vim.g.nvtour_fade_ms`, default 300; needs `termguicolors`; not when either
+- **Fade** (another buffer; `vim.g.nvtour_fade_ms`, default 500; needs `termguicolors`; not when either
   buffer has a `'bufhidden'` other than `""` or `hide`). A float that blends (`winblend`) shows the
   windows under it, never another float, and its blank cells show the text under them. So the old text
   cannot be a float: for the first half the window shows the old buffer again (`noautocmd keepalt
@@ -816,12 +820,28 @@ animates the view from `from` to that state, and `done` flashes the range. Nothi
   change), when that is less than a window height from the old view. Then the old text is shifted by
   the rows (at most half the window) that give the most equal keys: the notes of the two steps differ
   in height.
-- **Title card.** `anim.card(step, from.step)` gives the lines: `## Name` when `chapter_of` differs
+- **Title card.** `anim.card(step, from.step)` gives the lines: the chapter name (no `## `, in `NvtourPanelChapter`) when `chapter_of` differs
   (`card.chapter`), and `◇ ` + `version_segs` when the step before is not `same_doc` (or there is none).
-  `anim.start` fades instead of scrolls when the chapter changes in the same buffer; the old view then
+  `card.hold` adds `vim.g.nvtour_title_ms` for the chapter line and `vim.g.nvtour_file_ms` for the file
+  line (each default 1500; 0 leaves that line out).
+  **Where the change shows.** The card only shows what is not on the screen yet. `anim.start` drops it
+  in the inline view (the step has the chapter heading and the change of file or version), and in the
+  side view with the card shown, where `side.flash(card)` lights up the changed parts of the card
+  instead: `side.render` keeps `S.card.spots` (the chapter name on the first line; the file line and
+  the version lines), `S.card.lit` is the lit parts, and `side.light` puts them in `side.FLASH_NS`
+  after each redraw of the card (the panel redraws it after a jump). Each part has its own group
+  (`NvtourCardFlashChapter`, `NvtourCardFlashFile`) with the `bg` of `NvtourFlash`: it blinks, on and
+  off every `side.BLINK_MS` (200), for its time (`title_ms`, `file_ms`), in an `anim.run` on the card
+  window. A highlight is set only when it changes, as each `nvim_set_hl` redraws the screen.
+  A new chapter also lights up in the winbar: while `S.winbar_lit` is set, `M.winbar` draws the
+  chapter with `NvtourWinbarFlash` (the colours of `NvtourPanelChapter`, on the light when it is on,
+  else on the `WinBar` background) instead of `NvtourPanelChapter`.
+  There is no curtain hold then, so the jump does not wait. Only the side view with a hidden card
+  keeps the title card on the curtain, as below.
+  `anim.start` fades instead of scrolls when the chapter changes in the same buffer (with a card); the old view then
   draws the old step as current and the new one as not current, as before the jump. The fade runs
-  `fade + hold` ms (`hold` = `vim.g.nvtour_title_ms`, default 800; 0: no card, and a new chapter in the
-  same buffer scrolls): in for `fade / 2`, opaque for `hold`, out for `fade / 2`. `anim.card_layout`
+  `fade + card.hold` ms (no chapter line: a new chapter in the same buffer scrolls): in for `fade / 2`,
+  opaque for `hold`, out for `fade / 2`. `anim.card_layout`
   places a box (`╭─╮ │ │ ╰─╯`) with the lines in the middle rows; `anim.card_put` writes it into the
   blank rows of the curtain (`nvim_buf_set_text`) only while the curtain is opaque, and blanks them
   again before it clears: a blended float fades its characters only half way, and its blank cells show
@@ -1406,14 +1426,19 @@ An empty file is a tour with no step.
   The message names the entry with a number from 1 in file order: `step[3]: unknown key "lable" (did you
   mean "label"?)` (`difflib.get_close_matches`), `step[1]: "from" must be 1 or more`, `focus[1]: missing
   the key "ranges"`; the top level is `tour:`. A bad TOML or JSON text is `tour file: bad TOML: ...`.
+  All entries are checked, and the errors are reported together (one per entry, see "All errors at
+  once" below); the phases after it do not run then.
 - `apply_request(args, base)` then builds the Lua args with the helpers of the commands. Each entry runs
   in `scoped("step[3]", ...)`, so any error of the helpers (a bad range, an unknown git ref, a
-  renderer that fails, a bad sheet link) carries the prefix and keeps its exit code. `location(spec,
+  renderer that fails, a bad sheet link) carries the prefix and keeps its exit code. `collect` keeps
+  the error in `errors` (`{ kind, i, msg, code }`) and sends the entry as `{ skip = true }`; a diagram
+  that fails keeps its `name`. A bad top-level `sheet` still fails at once: every `#STEP` link depends
+  on it. `location(spec,
   ref, diagram, blobs)` is used per step; with `ref`, git is read once per `(file, ref)` (the `blobs`
   cache), and the lines of a blob go with the first step on a given `(commit, file)` only (the Lua side
   keeps them for the other steps). `diagram_args` is the code of the `diagram` command. `--append` with
   `title` or `sheet` in the file is exit 2. The args are `{ title, sheet, sheet_env, panel, focus,
-  diagrams, steps, append, check, no_jump }`; a nested table never has an absent key (nested nils do not
+  diagrams, steps, errors, append, check, no_jump }`; a nested table never has an absent key (nested nils do not
   survive msgpack), so the entries only have the keys that the file had.
 
 ### Lua phase (`H.apply`)
@@ -1430,6 +1455,16 @@ An empty file is a tour with no step.
    of the old tour; with `append`, the tour that is there). A chapter name is cut to one line like
    `chapter NAME`, and an empty one is exit 2. A failure is `scoped("step[i]: ", ...)`: the exit code of
    the failure with the entry in front. Buffers that were loaded stay loaded, as after a failed `step`.
+
+   **All errors at once.** The check goes on after an error: each entry is checked, and the errors of
+   Python (`errors`) and of Lua are reported in one failure, in the order of the file (top level,
+   diagrams, focus, steps; ENTRY_RANK in `cli.py` and RANK in `apply_tour` are the same). One error is
+   its message alone, as before; more are `N errors, nothing was changed:` and one message per entry. The
+   exit code is the one of the first. So an agent fixes the whole tour file in one edit, not one error
+   per call. An entry with `skip` is not checked, and also not a step on a diagram that failed: its error
+   is enough. The lines of a git blob are taken from each step before its check, so a failed first step
+   on a blob does not leave the next steps without lines. One entry gives at most one error (its checks
+   depend on each other).
 2. **Check mode.** With `check` the call ends here and returns the resolved steps (`n`, `total`, `file`,
    `l1`, `l2`, `role`, `label`, `via`, `from`, `ref`, `sha`, `diagram`, `sheet`, `chapter`, `resolved_from`
    and the first line `text`). With `append`, `n` and `total` count the steps that are there.

@@ -275,6 +275,43 @@ def test_errors_name_the_entry_and_change_nothing(cli, entry, message):
     assert stable(status(cli)) == before
 
 
+def test_all_errors_are_reported_at_once(cli):
+    ok(apply(cli, SMALL))
+    before = stable(status(cli))
+    text = (
+        '[[diagram]]\nname = "d"\nformat = "text"\nsource = "one"\nlinks = ["zzz=a.txt:3"]\n'  # diagram[1]: Lua
+        '[[step]]\nat = "a.txt:3"\n'                                       # step[1]: fine
+        '[[step]]\nat = "nofile.txt:3"\n'                                  # step[2]: Python
+        '[[step]]\nat = "a.txt:/line 1/"\n'                                # step[3]: Lua, several matches
+        '[[step]]\nat = "a.txt:/x/-1..+"\n'                                # step[4]: Python, bad text range
+        '[[step]]\nat = "1"\ndiagram = "d"\n'                             # step[5]: on the failed diagram, not checked
+        '[[step]]\nat = "a.txt:/old line 3 /"\nref = "v1"\nfrom = 99\n'  # step[6]: carries the blob, fails
+        '[[step]]\nat = "a.txt:/old line 4 /"\nref = "v1"\n'              # step[7]: same blob, fine
+        '[[step]]\nat = "a.txt:5"\nexpect = ["line 7 of a"]\n'            # step[8]: Lua, --expect
+    )
+    r = apply(cli, text)
+    lines = r.stderr.splitlines()
+    assert r.returncode == 6 and lines[0] == "6 errors, nothing was changed:", r.stderr
+    # in the order of the file; step[5] is on the failed diagram, step[7] has the blob of the failed step[6]
+    starts = [line.split(":")[0] for line in lines[1:] if not line.startswith(" ")]
+    assert starts == ["diagram[1]", "step[2]", "step[3]", "step[4]", "step[6]", "step[8]"], r.stderr
+    assert lines[-1].endswith('; it is on line 7')
+    assert stable(status(cli)) == before
+    r = apply(cli, text, "--check")  # the same report, and still nothing changes
+    assert r.returncode == 6 and r.stderr.startswith("6 errors, nothing was changed:\ndiagram[1]: ")
+    assert stable(status(cli)) == before
+
+
+def test_all_schema_errors_are_reported_at_once(cli):
+    r = apply(cli, '[[step]]\nat = "a.txt:3"\nlable = "x"\n[[step]]\nat = "a.txt:4"\n[[step]]\nrole = 3\n')
+    assert r.returncode == 2
+    assert r.stderr.splitlines() == [
+        "2 errors, nothing was changed:",
+        'step[1]: unknown key "lable" (did you mean "label"?)',
+        'step[3]: "role" must be one of: fault, flow, fix, context, info',  # one error per entry
+    ], r.stderr
+
+
 def test_unknown_keys_and_types_are_exit_2(cli):
     ok(apply(cli, SMALL))
     before = stable(status(cli))
@@ -296,7 +333,8 @@ def test_unknown_keys_and_types_are_exit_2(cli):
         ('[[focus]]\nfile = "a.txt"\n', 'focus[1]: missing the key "ranges"'),
         ('[[diagram]]\nname = "d"\n', 'diagram[1]: give one of "source" and "file"'),
         ('[[diagram]]\nname = "d"\nsource = "x"\nfile = "y"\n', 'diagram[1]: give one of "source" and "file"'),
-        ('[[diagram]]\nname = "d"\nsource = "x"\n[[diagram]]\nname = "d"\nsource = "y"\n', 'diagram[2]: the name "d" is used by diagram[1]'),
+        ('[[diagram]]\nname = "d"\nsource = "x"\nformat = "text"\n[[diagram]]\nname = "d"\nsource = "y"\nformat = "text"\n',
+         'diagram[2]: the name "d" is used by diagram[1]'),
         ('[step]\nat = "a.txt:3"\n', 'tour: "step" must be an array of tables ([[step]])'),
         ('title = 3\n', 'tour: "title" must be a string'),
         ('sheet = "-x"\n', "sheet: --sheet: bad sheet id '-x'"),

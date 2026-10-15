@@ -25,8 +25,8 @@ CODE = [
 ]
 
 
-def q(start, end=None, plus=0, nth=None, near=None):
-    return {"start": start, "end": end, "plus": plus, "nth": nth, "near": near}
+def q(start, end=None, plus=0, nth=None, near=None, minus=0):
+    return {"start": start, "end": end, "minus": minus, "plus": plus, "nth": nth, "near": near}
 
 
 # (lines, query, (l1, l2) or the error message): the SAME table runs on the Python and on the Lua resolver.
@@ -45,6 +45,10 @@ CASES = [
     (CODE, q("foo(", nth=1, end="}", plus=1), (2, 4)),
     (CODE, q("}", nth=2, end="tail"), (7, 8)),
     (CODE, q("tail }", end="tail"), (8, 8)),  # END may be on the START line
+    (CODE, q("foo(2)", minus=1), (5, 6)),
+    (CODE, q("foo(2)", minus=1, plus=1), (5, 7)),
+    (CODE, q("foo(2)", minus=9), (1, 6)),  # -N stops at line 1
+    (CODE, q("foo(", nth=2, minus=2, end="tail"), (4, 8)),  # END is searched from the match, not from -N
     (CODE, q("nope"), "text 'nope' not found in f.c (8 lines)"),
     (CODE, q("foo(", nth=3), "text 'foo(' has 2 match(es) in f.c, but @3 was asked"),
     (CODE, q("int f", end="zzz"), "end text 'zzz' not found in f.c after line 1 (8 lines)"),
@@ -161,6 +165,16 @@ def test_range_from_start_to_end_and_plus(cli, nv):
     assert r.returncode == 6 and "range 59-64 is beyond end of file (60 lines)" in r.stderr
 
 
+def test_lines_before_the_text(cli, nv):
+    ok(cli("start", "Q"))
+    assert ok(cli("step", "a.txt:/line 12 /-2", "--no-jump")).startswith("step 1/1: a.txt:10-12 ")
+    assert ok(cli("step", "a.txt:/line 12 /-2..+1", "--no-jump")).startswith("step 2/2: a.txt:10-13 ")
+    assert ok(cli("step", "a.txt:/line 12 /-1../line 14 /", "--no-jump")).startswith("step 3/3: a.txt:11-14 ")
+    assert ok(cli("step", "a.txt:/line 2 /-5", "--no-jump")).startswith("step 4/4: a.txt:1-2 ")  # stops at line 1
+    res = step_json(cli, "a.txt:/line 20 /-1..+1", "--no-jump")
+    assert (res["l1"], res["l2"], res["resolved_from"]) == (19, 21, "/line 20 /-1+1")
+
+
 def test_query_at_a_git_ref_reads_the_old_content(cli, nv):
     ok(cli("start", "Q"))
     out = ok(cli("step", "a.txt:/old line 33 /", "--ref", "v1", "--jump"))
@@ -176,6 +190,17 @@ def test_expect_with_a_query(cli, nv):
     assert ok(cli("step", "a.txt:/line 12 /../line 14 /", "--expect", "line 13 of a", "--no-jump")).startswith("step 1/1: a.txt:12-14")
     r = cli("step", "a.txt:/line 12 /+1", "--expect", "line 14 of a")
     assert r.returncode == 6 and "--expect 'line 14 of a' not found" in r.stderr.replace('"', "'")
+    assert "; it is on line 14" in r.stderr
+
+
+def test_expect_error_tells_where_the_text_is(cli, nv):
+    ok(cli("start", "Q"))
+    r = cli("step", "a.txt:5", "--expect", "line 3")  # lines 3, 30-39
+    assert r.returncode == 6 and r.stderr.rstrip().endswith("; it is on lines 3, 30, 31 and 8 more")
+    r = cli("step", "a.txt:36", "--expect", "line 3 ")
+    assert r.returncode == 6 and r.stderr.rstrip().endswith("; it is on line 3")
+    r = cli("step", "a.txt:5", "--expect", "no such text")
+    assert r.returncode == 6 and r.stderr.rstrip().endswith("; it is not in the file")
 
 
 def test_edit_by_text(cli, nv):

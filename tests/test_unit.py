@@ -46,8 +46,8 @@ def test_parse_file_range_needs_colon():
         parse_file_range("nocolon")
 
 
-def q(start, end=None, plus=0, nth=None, near=None):
-    return {"start": start, "end": end, "plus": plus, "nth": nth, "near": near}
+def q(start, end=None, plus=0, nth=None, near=None, minus=0):
+    return {"start": start, "end": end, "minus": minus, "plus": plus, "nth": nth, "near": near}
 
 
 QUERIES = [
@@ -66,7 +66,17 @@ QUERIES = [
     ("/Cache::get/", q("Cache::get")),
     ("/ x /", q(" x ")),
     ("/\\n/", q("\\n")),  # other backslashes stay as they are
+    ("/foo/-2", q("foo", minus=2)),
+    ("/foo/-2+3", q("foo", minus=2, plus=3)),
+    ("/foo/@2-1+1", q("foo", nth=2, minus=1, plus=1)),
+    ("/a/~9-2../b/+4", q("a", end="b", near=9, minus=2, plus=4)),
 ]
+
+
+def test_parse_query_minus_dot_dot_plus():
+    assert parse_query("/foo/-5..+6") == q("foo", minus=5, plus=6)  # the form agents guess
+    assert format_query(parse_query("/foo/-5..+6")) == "/foo/-5+6"
+
 
 
 @pytest.mark.parametrize("text,expected", QUERIES)
@@ -76,7 +86,8 @@ def test_parse_query_table(text, expected):
 
 
 @pytest.mark.parametrize("bad", ["foo", "/foo", "//", "/foo/@0", "/foo/~0", "/foo/@2~3", "/foo/+", "/a/+1../b/",
-                                 "/a/../", "/a/../b", "/foo/x", "/foo/@", "/a\\/"])
+                                 "/a/../", "/a/../b", "/foo/x", "/foo/@", "/a\\/",
+                                 "/foo/-", "/foo/+1-2", "/foo/-2@1", "/foo/..+2", "/a/../b/-1", "/foo/-1..+"])
 def test_parse_query_errors(bad):
     with pytest.raises(ValueError):
         parse_query(bad)

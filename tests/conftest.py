@@ -68,8 +68,12 @@ def sandbox(tmp_path_factory: pytest.TempPathFactory):
 def nvim_proc(sandbox):
     """Headless nvim started with cwd = workspace and its own runtime dir."""
     env = clean_env(sandbox.runtime)
+    # Swap files in the sandbox, not in the user's swap dir: a killed nvim leaves them, and a later run
+    # with the same --basetemp then stops on E325. pytest empties the basetemp at the start of a run.
+    swap = sandbox.runtime.parent / "swap"
+    swap.mkdir(exist_ok=True)
     proc = subprocess.Popen(
-        ["nvim", "--headless", "--clean"],
+        ["nvim", "--headless", "--clean", "--cmd", f"set directory={swap}//"],
         cwd=sandbox.ws,
         env=env,
         stdin=subprocess.DEVNULL,

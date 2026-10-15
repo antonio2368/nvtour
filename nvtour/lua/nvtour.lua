@@ -1199,7 +1199,10 @@ local step_goto -- forward declaration
 
 -- The side view (see "Side view") keeps its functions in one table: a Lua chunk has at most 200
 -- local variables.
-local side = {}
+local side = {
+  FLASH_NS = api.nvim_create_namespace("nvtour_card_flash"), -- side.flash: the changed lines of the card
+  BLINK_MS = 200, -- side.flash: the light is on for this long, then off for this long, and again
+}
 
 -- The two sets of keys (one table: a Lua chunk has at most 200 local variables). The keys of a tour
 -- (KEYS.tour) are installed when a tour starts and removed by clear. The keys of the marks
@@ -2549,9 +2552,13 @@ function side.render()
   end
   local chapter = chapter_of(step)
   local head = { { ("%d/%d %s %s"):format(step.n, #S.tour.steps, ROLE_MARK[step.role] or "•", step.role), "NvtourSign" .. R } }
+  -- Where side.flash lights up a change: the chapter name, and the lines of the file and its version.
+  local spots = {}
   if chapter then
     head[2] = { " · ", "NvtourNoteBorder" }
     head[3] = { chapter.name, "NvtourPanelChapter" }
+    local col = #head[1][1] + #head[2][1]
+    spots.chapter = { row = 0, col = col, end_row = 0, end_col = col + #chapter.name }
   end
   put(head)
   if step.label and step.label ~= "" then
@@ -2559,9 +2566,11 @@ function side.render()
   end
   put({})
   put({ { doc_path(step) .. ":" .. fmt_range(step), "NvtourPanelFile" } })
+  local file_row = #lines - 1
   for _, line in ipairs(side.git(step)) do
     put(line)
   end
+  spots.file = { row = file_row, col = 0, end_row = #lines - 1, end_col = #lines[#lines] }
   if step.sheet then
     put({ { "↔ ", "NvtourNoteBorder" }, { sheet_label(step.sheet), "NvtourVia" } })
   end
@@ -2616,7 +2625,7 @@ function side.render()
   link(S.keys.next, "Next", nxt, "last step", nxt and nxt.via and nxt.via ~= "" and oneline(nxt.via) or nil)
   put({})
   link(S.keys.prev, "Previous", prv, "first step")
-  S.card.line_map = map
+  S.card.line_map, S.card.spots = map, spots
   vim.bo[buf].modifiable = true
   api.nvim_buf_set_lines(buf, 0, -1, false, lines)
   vim.bo[buf].modifiable = false
@@ -2628,7 +2637,25 @@ function side.render()
   for _, r in ipairs(rules) do
     api.nvim_buf_set_extmark(buf, S.ns_card, r - 1, 0, { virt_text = { { ("─"):rep(width), "NvtourNoteBorder" } }, virt_text_pos = "overlay" })
   end
+  side.light()
   pcall(api.nvim_win_set_cursor, S.card.win, { 1, 0 })
+end
+
+--- Put the lights of side.flash (S.card.lit, a list of { spot = "chapter" | "file", group }) on the
+--- card as it is drawn now: a redraw of the card (the panel redraws it after a jump) keeps them.
+function side.light()
+  local buf = S.card.buf
+  if not valid_buf(buf) then
+    return
+  end
+  api.nvim_buf_clear_namespace(buf, side.FLASH_NS, 0, -1)
+  for _, p in ipairs(S.card.lit or {}) do
+    local sp = (S.card.spots or {})[p.spot]
+    if sp then
+      pcall(api.nvim_buf_set_extmark, buf, side.FLASH_NS, sp.row, sp.col,
+        { end_row = sp.end_row, end_col = sp.end_col, hl_group = p.group, hl_eol = sp.col == 0, priority = 140 })
+    end
+  end
 end
 
 ---------------------------------------------------------------------------
@@ -3059,7 +3086,9 @@ function M.winbar()
       break
     end
   end
-  local head = chapter ~= "" and ("%#NvtourPanelChapter#" .. sl_escape(chapter) .. "%*") or ""
+  -- While side.flash lights up a new chapter, its name lights up here too (NvtourWinbarFlash).
+  local group = S.winbar_lit and "NvtourWinbarFlash" or "NvtourPanelChapter"
+  local head = chapter ~= "" and ("%#" .. group .. "#" .. sl_escape(chapter) .. "%*") or ""
   local out = (" nvtour %s%%#NvtourSign%s#%s%%*%s%s"):format(head, cap(step.role), pos, sl_escape(at), sl_escape(label))
   return out .. "%=" .. sl_escape(right) .. (right ~= "" and " " or "")
 end
@@ -3114,7 +3143,7 @@ api.nvim_create_autocmd("BufWinEnter", {
 -- A jump to a step animates when it stays in the same window. In the same buffer the view scrolls
 -- to the step (vim.g.nvtour_scroll_ms, default 500). To another buffer (another file, or the same
 -- file at another commit) the old text fades out and the new text fades in
--- (vim.g.nvtour_fade_ms, default 300). The step, the lists and the card change at once; only the
+-- (vim.g.nvtour_fade_ms, default 500). The step, the lists and the card change at once; only the
 -- view moves over the frames, and the last frame is the view of a jump without animation. The next
 -- jump, a command (dispatch) or a key ends an animation at once, so they always see that view. The
 -- flash comes after the animation.
@@ -3233,10 +3262,22 @@ end
 --- `from` (anim.capture). `done` runs when it ends. False when there is nothing to animate. A new
 --- chapter in the same buffer fades too, so its title card has a place.
 function anim.start(step, win, from, done)
-  if not from or from.win ~= win or not valid_buf(from.buf) or not api.nvim_buf_is_loaded(from.buf) then
+  if not from then
     return false
   end
+  -- What changed (a chapter, a file or version) is shown where it is not on the screen yet. The
+  -- inline view has it in the step (the chapter heading, the change of file), so it gets no card;
+  -- the side view lights it up in the card on the left. Only a hidden card leaves it to the curtain.
   local card = anim.card(step, from.step)
+  if not side.on() then
+    card = { hold = 0 }
+  elseif side.shown() then
+    side.flash(card)
+    card = { hold = 0 }
+  end
+  if from.win ~= win or not valid_buf(from.buf) or not api.nvim_buf_is_loaded(from.buf) then
+    return false
+  end
   local ok, started
   if from.buf == step.buf and not card.chapter then
     ok, started = pcall(anim.scroll, win, from, done)
@@ -3248,21 +3289,77 @@ end
 
 --- The lines of the title card of the jump from `prev` (nil: no current step) to `step`, as chunks
 --- { text, hl }: the chapter when it changes (`card.chapter` is then true), and the file and its
---- version when they change. Empty with vim.g.nvtour_title_ms = 0.
+--- version when they change (`card.file`). `card.hold` is the time the card stays: vim.g.nvtour_title_ms
+--- for the chapter plus vim.g.nvtour_file_ms for the file (each default 1500; 0 leaves that line out);
+--- `card.title_ms` and `card.file_ms` are the two (side.flash lights each part up for its time).
 function anim.card(step, prev)
-  local card = {}
-  if anim.ms("title", 800) == 0 then
-    return card
-  end
+  local title_ms, file_ms = anim.ms("title", 1500), anim.ms("file", 1500)
+  local card = { hold = 0, title_ms = title_ms, file_ms = file_ms }
   local chapter = chapter_of(step)
-  if chapter and (not prev or chapter_of(prev) ~= chapter) then
-    card[#card + 1] = { { "## " .. chapter.name, "NvtourPanelChapter" } }
-    card.chapter = true
+  if title_ms > 0 and chapter and (not prev or chapter_of(prev) ~= chapter) then
+    card[#card + 1] = { { chapter.name, "NvtourPanelChapter" } } -- no "## ": the highlight shows the chapter
+    card.chapter, card.hold = true, card.hold + title_ms
   end
-  if not prev or not same_doc(prev, step) then
+  if file_ms > 0 and (not prev or not same_doc(prev, step)) then
     card[#card + 1] = vim.list_extend({ { "◇ ", "NvtourNoteBorder" } }, version_segs(step, prev or {}))
+    card.file, card.hold = true, card.hold + file_ms
   end
   return card
+end
+
+--- Light up the parts of the side card that the jump changed (`card` of anim.card: `chapter`, `file`):
+--- the chapter name for card.title_ms, the file and version lines for card.file_ms. The light is the
+--- colour of the range flash, and it blinks: on and off every side.BLINK_MS, until its time ends.
+--- A new chapter lights up in the winbar too (S.winbar_lit, NvtourWinbarFlash: the colour of the
+--- chapter on the light). No curtain and no wait: the code is there at once, and the card says what
+--- changed.
+function side.flash(card)
+  local parts = {}
+  if card.chapter then
+    parts[#parts + 1] = { spot = "chapter", ms = card.title_ms, group = "NvtourCardFlashChapter" }
+  end
+  if card.file then
+    parts[#parts + 1] = { spot = "file", ms = card.file_ms, group = "NvtourCardFlashFile" }
+  end
+  if #parts == 0 then
+    return
+  end
+  local bg = hl_attr("Normal", "bg") or (vim.o.background ~= "light" and 0x1d2021 or 0xfbf1c7)
+  local light = hl_attr("NvtourFlash", "bg") or bg
+  local bar_bg = hl_attr("WinBar", "bg") or bg
+  local title = api.nvim_get_hl(0, { name = "NvtourPanelChapter", link = false })
+  local function paint(p, on)
+    api.nvim_set_hl(0, p.group, { bg = on and light or bg })
+    if p.spot == "chapter" then
+      api.nvim_set_hl(0, "NvtourWinbarFlash", { fg = title.fg, bold = title.bold, italic = title.italic, bg = on and light or bar_bg })
+    end
+  end
+  local longest = 0
+  for _, p in ipairs(parts) do
+    p.on = true
+    paint(p, true)
+    longest = math.max(longest, p.ms)
+  end
+  S.card.lit = parts
+  S.winbar_lit = card.chapter or nil
+  side.light()
+  redraw_winbars()
+  anim.run(S.card.win, longest, function(t)
+    local e = t * longest
+    for _, p in ipairs(parts) do
+      local on = e < p.ms and math.floor(e / side.BLINK_MS) % 2 == 0
+      if on ~= p.on then -- a highlight is set only when it changes: each change redraws the screen
+        p.on = on
+        paint(p, on)
+      end
+    end
+  end, function()
+    if S.card.lit == parts then
+      S.card.lit, S.winbar_lit = nil, nil
+      side.light()
+      redraw_winbars()
+    end
+  end)
 end
 
 --- The layout of the title card `card` (anim.card) in a box in the middle of a curtain of `width` x
@@ -3479,10 +3576,10 @@ end
 --- cannot be a float.) The gutter always fades; a row whose text looks the same before and after
 --- stays. For the same file at another version, the old lines are put where the same lines of the
 --- new version are (when that is near the old view), so only the lines that changed fade. With a
---- title card (`card`, anim.card), the curtain stays opaque for vim.g.nvtour_title_ms (default 800)
---- and shows the card in the middle; its text fades with the curtain.
+--- title card (`card`, anim.card), the curtain stays opaque for `card.hold` and shows the card in the
+--- middle; its text fades with the curtain.
 function anim.fade(win, from, step, done, card)
-  local ms = anim.ms("fade", 300)
+  local ms = anim.ms("fade", 500)
   if ms == 0 or not vim.o.termguicolors then
     return false -- without RGB colours a float cannot blend
   end
@@ -3584,7 +3681,7 @@ function anim.fade(win, from, step, done, card)
     api.nvim_buf_set_lines(cbuf, 0, -1, false, rows)
     local gutter = math.max(info.textoff, vim.fn.getwininfo(win)[1].textoff) -- the signs of the two can differ
     local layout = card and #card > 0 and anim.card_layout(card, info.width, info.height) or nil
-    local hold = layout and anim.ms("title", 800) or 0
+    local hold = layout and card.hold or 0
     local card_top, card_rows = layout and layout.top or -1, layout and layout.count or 0
     for r = 1, info.height do
       -- The rows of the card always fade: the blank cells in the box must cover the text.
@@ -4655,7 +4752,8 @@ H.animate = function(a)
 end
 
 --- Lines (l1, l2) that the text range `q` selects in the list `lines`; `name` is for the messages.
---- q = { start, end, plus, nth, near } (see ranges.py, which has the same function in Python).
+--- q = { start, end, minus, plus, nth, near } (see ranges.py, which has the same function in Python).
+--- `minus` stops at line 1.
 local function resolve_query(lines, q, name)
   local hits = {}
   for n, line in ipairs(lines) do
@@ -4704,7 +4802,7 @@ local function resolve_query(lines, q, name)
       fail(("end text '%s' not found in %s after line %d (%d lines)"):format(q["end"], name, l1, #lines), 6)
     end
   end
-  return l1, l2 + (q.plus or 0)
+  return math.max(1, l1 - (q.minus or 0)), l2 + (q.plus or 0)
 end
 M._resolve_query = resolve_query
 
@@ -4713,6 +4811,31 @@ M._resolve_query = resolve_query
 --- With `lines` (a list), those lines are checked and no buffer is loaded (`apply` checks the lines
 --- of a git blob or of a diagram that is not in nvim yet). Returns the buffer and the checked l1 and l2.
 local function checked_range(a, l1, l2, expect, lines)
+  -- Where the --expect text `text` is in `all` (the lines of the file) when it is not in the range
+  -- that starts at `l1`: "; it is on line(s) ..." with at most 3 lines, the nearest to l1 first, or
+  -- "; it is not in the file". Lets the agent fix the range without reading the file again.
+  local function expect_hint(all, text, l1)
+    local hits = {}
+    for n, line in ipairs(all) do
+      if line:find(text, 1, true) then
+        hits[#hits + 1] = n
+      end
+    end
+    if #hits == 0 then
+      return "; it is not in the file"
+    end
+    table.sort(hits, function(x, y)
+      local dx, dy = math.abs(x - l1), math.abs(y - l1)
+      return dx < dy or (dx == dy and x < y)
+    end)
+    local shown = {}
+    for i = 1, math.min(#hits, 3) do
+      shown[i] = tostring(hits[i])
+    end
+    local more = #hits > 3 and (" and %d more"):format(#hits - 3) or ""
+    return ("; it is on line%s %s%s"):format(#hits > 1 and "s" or "", table.concat(shown, ", "), more)
+  end
+
   local buf, count, get
   if lines then
     count = #lines
@@ -4748,7 +4871,8 @@ local function checked_range(a, l1, l2, expect, lines)
       local first = checked[1] or ""
       local range = l1 == l2 and tostring(l1) or (l1 .. "-" .. l2)
       local at = a.ref and (" @" .. a.ref) or ""
-      fail(("--expect %q not found in %s:%s%s; line %d is %q"):format(expect, doc_path(a), range, at, l1, first), 6)
+      fail(("--expect %q not found in %s:%s%s; line %d is %q%s"):format(expect, doc_path(a), range, at, l1, first,
+        expect_hint(get(1, count), expect, l1)), 6)
     end
   end
   return buf, l1, l2
@@ -5480,8 +5604,9 @@ end
 --- `sheet_env`, `panel`, `focus`, `diagrams` and `steps` (entries as the commands of the same names
 --- get them, with `lines` of a git blob only in the first step that has it), and the flags `append`,
 --- `check` and `no_jump`. Phase 1 checks everything and changes nothing of the tour (files stay
---- loaded, as after a failed `step`); a failure names the entry (`step[4]: ...`). With `check` it
---- ends there. Phase 2 builds the tour; the steps are drawn, and the quickfix list and the panel are
+--- loaded, as after a failed `step`); a failure names the entry (`step[4]: ...`). It checks all
+--- entries and fails once with all errors, also those of Python (`errors`, with the entries that
+--- failed there as { skip = true }). With `check` it ends there. Phase 2 builds the tour; the steps are drawn, and the quickfix list and the panel are
 --- updated, once at the end.
 --- The steps are numbered from 1 in the file. With `append` a `from` is the number in the final tour:
 --- the existing steps come first, then the steps of the file.
@@ -5496,29 +5621,55 @@ local function apply_tour(a)
     tour = { sheet = sheet, sheet_env = sheet and sheet_env_of(a.sheet_env) or nil }
   end
 
-  -- Phase 1: check.
+  -- Phase 1: check. Each entry is checked, also after an error, so that one call reports all errors.
+  local errors = {}
+  for _, e in ipairs(a.errors or {}) do
+    errors[#errors + 1] = e
+  end
+  local RANK = { tour = 0, sheet = 0, diagram = 1, focus = 2, step = 3 } -- as ENTRY_RANK in cli.py
+  local function check(kind, i, fn)
+    local ok, err = pcall(scoped, ("%s[%d]: "):format(kind, i), fn)
+    if not ok then
+      if type(err) ~= "table" or not err.nvtour then
+        error(err, 0) -- a bug, not a problem of the tour file
+      end
+      errors[#errors + 1] = { kind = kind, i = i, msg = err.msg, code = err.code }
+    end
+  end
   local diagram_lines = {} -- [name] = the lines of a diagram of the file
+  local diagram_failed = {} -- [name] = true: its error is reported, and the steps on it are not checked
   for i, d in ipairs(a.diagrams or {}) do
-    scoped(("diagram[%d]: "):format(i), function()
-      local lines = d.lines or {}
-      if #lines == 0 then
-        fail("the diagram is empty", 6)
+    if d.skip then
+      if d.name then
+        diagram_failed[d.name] = true
       end
-      if d.split and not DIAGRAM_SPLITS[d.split] then
-        fail(("bad split %q: use above, below, left, right or full"):format(d.split), 2)
-      end
-      for _, s in ipairs(append and S.tour.steps or {}) do -- as 'diagram' does for a diagram that is replaced
-        if s.diagram == d.name and s.l2 > #lines then
-          fail(("step %d (lines %s) is beyond the new diagram (%d lines); edit or remove it first"):format(s.n, fmt_range(s), #lines), 6)
+    else
+      check("diagram", i, function()
+        local lines = d.lines or {}
+        if #lines == 0 then
+          fail("the diagram is empty", 6)
         end
+        if d.split and not DIAGRAM_SPLITS[d.split] then
+          fail(("bad split %q: use above, below, left, right or full"):format(d.split), 2)
+        end
+        for _, s in ipairs(append and S.tour.steps or {}) do -- as 'diagram' does for a diagram that is replaced
+          if s.diagram == d.name and s.l2 > #lines then
+            fail(("step %d (lines %s) is beyond the new diagram (%d lines); edit or remove it first"):format(s.n, fmt_range(s), #lines), 6)
+          end
+        end
+        diagram_lines[d.name] = lines
+      end)
+      if not diagram_lines[d.name] then
+        diagram_failed[d.name] = true
       end
-      diagram_lines[d.name] = lines
-    end)
+    end
   end
   for i, f in ipairs(a.focus or {}) do
-    scoped(("focus[%d]: "):format(i), function()
-      focus_ranges(f, load_buf(f.file))
-    end)
+    if not f.skip then
+      check("focus", i, function()
+        focus_ranges(f, load_buf(f.file))
+      end)
+    end
   end
   local plan, blobs = {}, {}
   local running, pending_name -- the chapter that the next step is in, and the pending one it starts
@@ -5528,44 +5679,65 @@ local function apply_tour(a)
     pending_name = (chapter_at(nil) or {}).name
   end
   for i, st in ipairs(a.steps or {}) do
-    scoped(("step[%d]: "):format(i), function()
-      if not ROLES[st.role or "info"] then
-        fail("unknown role: " .. tostring(st.role), 2)
+    if st.sha then -- first, so the next step on the blob has its lines when this step fails
+      local key = st.sha .. ":" .. st.file
+      if st.lines then
+        blobs[key] = st.lines
+      else
+        st.lines = blobs[key]
       end
-      local lines -- the lines to check, when they are not in a buffer yet
-      if st.sha then
-        local key = st.sha .. ":" .. st.file
-        if st.lines then
-          blobs[key] = st.lines
-        else
-          st.lines = blobs[key]
+    end
+    if not st.skip and not (st.diagram and diagram_failed[st.diagram]) then
+      check("step", i, function()
+        if not ROLES[st.role or "info"] then
+          fail("unknown role: " .. tostring(st.role), 2)
         end
-        lines = st.lines
-      elseif st.diagram then
-        local d = S.diagrams[st.diagram]
-        lines = diagram_lines[st.diagram] or (append and d and d.lines) or nil
-        if not lines then
-          fail(("no diagram %q in the file%s"):format(st.diagram, append and " or in the tour" or ""), 6)
+        local lines = st.lines -- the lines to check, when they are not in a buffer yet
+        if st.diagram then
+          local d = S.diagrams[st.diagram]
+          lines = diagram_lines[st.diagram] or (append and d and d.lines) or nil
+          if not lines then
+            fail(("no diagram %q in the file%s"):format(st.diagram, append and " or in the tour" or ""), 6)
+          end
         end
-      end
-      local buf, l1, l2 = checked_range(st, st.l1 or 0, st.l2 or st.l1 or 0, st.expect, lines)
-      if st.from and (st.from < 1 or st.from > base + i - 1) then
-        fail(("from %d: no such step before this one (%d step(s) come before it)"):format(st.from, base + i - 1), 6)
-      end
-      local link = resolve_sheet(st.sheet, a.sheet_env, tour)
-      local chapter
-      if st.chapter ~= nil then
-        chapter = vim.trim((st.chapter:gsub("%s+", " "))) -- a heading is one line
-        if chapter == "" then
-          fail("the chapter needs a name", 2)
+        local buf, l1, l2 = checked_range(st, st.l1 or 0, st.l2 or st.l1 or 0, st.expect, lines)
+        if st.from and (st.from < 1 or st.from > base + i - 1) then
+          fail(("from %d: no such step before this one (%d step(s) come before it)"):format(st.from, base + i - 1), 6)
         end
+        local link = resolve_sheet(st.sheet, a.sheet_env, tour)
+        local chapter
+        if st.chapter ~= nil then
+          chapter = vim.trim((st.chapter:gsub("%s+", " "))) -- a heading is one line
+          if chapter == "" then
+            fail("the chapter needs a name", 2)
+          end
+        end
+        if i == 1 and pending_name then
+          running = pending_name
+        end
+        running = chapter or running
+        plan[i] = { st = st, l1 = l1, l2 = l2, link = link, chapter = chapter, in_chapter = running, text = first_text(buf, lines, l1) }
+      end)
+    end
+  end
+  if #errors > 0 then
+    for n, e in ipairs(errors) do
+      e.seq = n
+    end
+    table.sort(errors, function(x, y)
+      if RANK[x.kind] ~= RANK[y.kind] then
+        return RANK[x.kind] < RANK[y.kind]
       end
-      if i == 1 and pending_name then
-        running = pending_name
-      end
-      running = chapter or running
-      plan[i] = { st = st, l1 = l1, l2 = l2, link = link, chapter = chapter, in_chapter = running, text = first_text(buf, lines, l1) }
+      return x.i < y.i or (x.i == y.i and x.seq < y.seq)
     end)
+    if #errors == 1 then
+      fail(errors[1].msg, errors[1].code)
+    end
+    local msgs = {}
+    for n, e in ipairs(errors) do
+      msgs[n] = e.msg
+    end
+    fail(("%d errors, nothing was changed:\n%s"):format(#errors, table.concat(msgs, "\n")), errors[1].code)
   end
 
   if a.check then
