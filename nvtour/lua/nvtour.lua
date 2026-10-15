@@ -57,6 +57,8 @@ local function new_state()
     view = nil, -- "inline" or "side"; nil: vim.g.nvtour_view
     range_style = nil, -- the range style of the side view from the cycle key; nil: vim.g.nvtour_range_style
     git = {}, -- [dir] = { at, top, sha, ref, linked }: the git state of a directory, for the card
+    anims = {}, -- [win] = { finish }: the animation that runs in the window (see "Animation")
+    animate = nil, -- true or false from the animate key; nil: vim.g.nvtour_animate
   }
 end
 
@@ -81,6 +83,7 @@ local DEFAULT_KEYS = {
   view = "<leader>wv",
   card = "<leader>ws",
   range_style = "<leader>wr",
+  animate = "<leader>wa",
   mark = "<leader>wm",
   mark_note = "<leader>wM",
 }
@@ -1202,7 +1205,7 @@ local side = {}
 -- (KEYS.tour) are installed when a tour starts and removed by clear. The keys of the marks
 -- (KEYS.always) stay while the runtime is loaded (see "Marks").
 local KEYS = {
-  tour = { "next", "prev", "first", "last", "panel", "clear", "next_chapter", "prev_chapter", "peek", "view", "card", "range_style" },
+  tour = { "next", "prev", "first", "last", "panel", "clear", "next_chapter", "prev_chapter", "peek", "view", "card", "range_style", "animate" },
   always = { "mark", "mark_note" },
 }
 
@@ -3104,9 +3107,29 @@ api.nvim_create_autocmd("BufWinEnter", {
   end,
 })
 
+---------------------------------------------------------------------------
+-- Animation
+---------------------------------------------------------------------------
+
+-- A jump to a step animates when it stays in the same window. In the same buffer the view scrolls
+-- to the step (vim.g.nvtour_scroll_ms, default 500). To another buffer (another file, or the same
+-- file at another commit) the old text fades out and the new text fades in
+-- (vim.g.nvtour_fade_ms, default 300). The step, the lists and the card change at once; only the
+-- view moves over the frames, and the last frame is the view of a jump without animation. The next
+-- jump, a command (dispatch) or a key ends an animation at once, so they always see that view. The
+-- flash comes after the animation.
+--
+-- vim.g.nvtour_animate turns it on (true) or off (false); not set, it is on when a UI is attached
+-- (a headless nvim, as in the tests, does not animate). The animate key or :NvtourAnimate toggles it.
+local anim = {
+  FRAME_MS = 16,
+  KEY_NS = api.nvim_create_namespace("nvtour_anim_keys"),
+  NS = api.nvim_create_namespace("nvtour_fade"), -- the rows of the curtain and its NvtourFade
+}
+
 --- Highlight the range of `step` for vim.g.nvtour_flash ms (default 300, 0 = off), so the eye
 --- finds it after a jump.
-local function flash(step)
+function anim.flash(step)
   local ms = tonumber(vim.g.nvtour_flash) or 300
   if valid_buf(S.flash.buf) then
     api.nvim_buf_clear_namespace(S.flash.buf, S.ns_flash, 0, -1)
@@ -3132,6 +3155,515 @@ local function flash(step)
     end
   end, ms)
 end
+
+function anim.on()
+  if S.animate ~= nil then
+    return S.animate
+  end
+  local v = vim.g.nvtour_animate
+  if v == nil then
+    return #api.nvim_list_uis() > 0
+  end
+  return v == true or v == 1
+end
+
+--- The duration of an animation: vim.g.nvtour_<name>_ms, else `default`; 0 turns it off.
+function anim.ms(name, default)
+  return math.max(tonumber(vim.g["nvtour_" .. name .. "_ms"]) or default, 0)
+end
+
+--- Call `frame(t)` on each frame, with t (the time) from 0 to 1, for `ms`; then `done()`. A window
+--- has at most one animation: a new one ends the old one first.
+function anim.run(win, ms, frame, done)
+  anim.finish(win)
+  local timer = uv.new_timer()
+  local start = uv.hrtime()
+  local run = {}
+  run.finish = function()
+    if S.anims[win] ~= run then
+      return
+    end
+    S.anims[win] = nil
+    pcall(function()
+      timer:stop()
+      timer:close()
+    end)
+    pcall(done)
+  end
+  S.anims[win] = run
+  timer:start(
+    anim.FRAME_MS,
+    anim.FRAME_MS,
+    vim.schedule_wrap(function()
+      if S.anims[win] ~= run then
+        return
+      end
+      local t = (uv.hrtime() - start) / 1e6 / ms
+      if t >= 1 or not valid_win(win) or not pcall(frame, t) then
+        run.finish()
+      end
+    end)
+  )
+end
+
+function anim.finish(win)
+  local run = S.anims[win]
+  if run then
+    run.finish()
+  end
+end
+
+function anim.finish_all()
+  for win in pairs(S.anims) do
+    anim.finish(win)
+  end
+end
+
+--- What a jump needs to animate from: the buffer and the view of `win` before the jump, and the
+--- current step; nil when animation is off.
+function anim.capture(win)
+  if not anim.on() or not valid_win(win) then
+    return nil
+  end
+  local view = api.nvim_win_call(win, vim.fn.winsaveview)
+  return { win = win, buf = api.nvim_win_get_buf(win), view = view, step = S.tour.steps[S.tour.current] }
+end
+
+--- Start the animation of the jump to `step` in `win` (the view is already the final one) from
+--- `from` (anim.capture). `done` runs when it ends. False when there is nothing to animate. A new
+--- chapter in the same buffer fades too, so its title card has a place.
+function anim.start(step, win, from, done)
+  if not from or from.win ~= win or not valid_buf(from.buf) or not api.nvim_buf_is_loaded(from.buf) then
+    return false
+  end
+  local card = anim.card(step, from.step)
+  local ok, started
+  if from.buf == step.buf and not card.chapter then
+    ok, started = pcall(anim.scroll, win, from, done)
+  else
+    ok, started = pcall(anim.fade, win, from, step, done, card)
+  end
+  return ok and started
+end
+
+--- The lines of the title card of the jump from `prev` (nil: no current step) to `step`, as chunks
+--- { text, hl }: the chapter when it changes (`card.chapter` is then true), and the file and its
+--- version when they change. Empty with vim.g.nvtour_title_ms = 0.
+function anim.card(step, prev)
+  local card = {}
+  if anim.ms("title", 800) == 0 then
+    return card
+  end
+  local chapter = chapter_of(step)
+  if chapter and (not prev or chapter_of(prev) ~= chapter) then
+    card[#card + 1] = { { "## " .. chapter.name, "NvtourPanelChapter" } }
+    card.chapter = true
+  end
+  if not prev or not same_doc(prev, step) then
+    card[#card + 1] = vim.list_extend({ { "◇ ", "NvtourNoteBorder" } }, version_segs(step, prev or {}))
+  end
+  return card
+end
+
+--- The layout of the title card `card` (anim.card) in a box in the middle of a curtain of `width` x
+--- `height` blank rows: { rows = { { row, col, text, marks = { { from, to, group } } } }, groups,
+--- top, count }, with `col` and the marks in bytes; nil when it does not fit.
+function anim.card_layout(card, width, height)
+  local inner, lines = 0, {}
+  for i, line in ipairs(card) do
+    lines[i] = clip_chunks(line, width - 6)
+    local w = 0
+    for _, c in ipairs(lines[i]) do
+      w = w + vim.fn.strdisplaywidth(c[1])
+    end
+    lines[i].width, inner = w, math.max(inner, w)
+  end
+  if inner == 0 or height < #lines + 2 or width < 10 then
+    return nil
+  end
+  local top, col = math.floor((height - #lines - 2) / 2), math.floor((width - inner - 4) / 2)
+  local layout = { rows = {}, groups = { NvtourNoteBorder = true }, top = top, count = #lines + 2, width = inner + 4 }
+  local function row(r, chunks)
+    local text, marks = "", {}
+    for _, c in ipairs(chunks) do
+      marks[#marks + 1] = { col + #text, col + #text + #c[1], c[2] }
+      text = text .. c[1]
+      layout.groups[c[2]] = true
+    end
+    layout.rows[#layout.rows + 1] = { row = r, col = col, text = text, marks = marks }
+  end
+  local bar = string.rep("─", inner + 2)
+  row(top, { { "╭" .. bar .. "╮", "NvtourNoteBorder" } })
+  for i, line in ipairs(lines) do
+    local chunks = { { "│ ", "NvtourNoteBorder" } }
+    vim.list_extend(chunks, line)
+    chunks[#chunks + 1] = { string.rep(" ", inner - line.width) .. " │", "NvtourNoteBorder" }
+    row(top + i, chunks)
+  end
+  row(top + #lines + 1, { { "╰" .. bar .. "╯", "NvtourNoteBorder" } })
+  return layout
+end
+
+--- Write the card of `layout` into the blank rows of the curtain buffer `cbuf` (`on`), or blank them
+--- again. Each chunk gets the group "NvtourFade" .. its group, of anim.NS. A blended float fades
+--- its characters only half way, so the card is in the curtain only while the curtain is opaque.
+function anim.card_put(cbuf, layout, on)
+  for _, r in ipairs(layout.rows) do
+    if on then
+      api.nvim_buf_set_text(cbuf, r.row, r.col, r.row, r.col + layout.width, { r.text })
+      r.ids = {}
+      for _, m in ipairs(r.marks) do
+        r.ids[#r.ids + 1] = api.nvim_buf_set_extmark(cbuf, anim.NS, r.row, m[1], { end_col = m[2], hl_group = "NvtourFade" .. m[3], priority = 5000 })
+      end
+    else
+      for _, id in ipairs(r.ids or {}) do
+        pcall(api.nvim_buf_del_extmark, cbuf, anim.NS, id)
+      end
+      api.nvim_buf_set_text(cbuf, r.row, r.col, r.row, r.col + #r.text, { string.rep(" ", layout.width) })
+    end
+  end
+end
+
+--- Run `count` times the key `key` (<C-e> or <C-y>) with :normal! in `win`. vim.on_key sees the keys
+--- of :normal! too: while `anim.busy` is set, it does not take them for keys of the user.
+function anim.keys(win, count, key)
+  anim.busy = true
+  local ok, err = pcall(api.nvim_win_call, win, function()
+    vim.cmd(("normal! %d%s"):format(count, key))
+  end)
+  anim.busy = false
+  if not ok then
+    error(err, 0)
+  end
+end
+
+--- The lines from `a` to `b` (exclusive) in `win` as <C-e> counts them (a closed fold is one), at
+--- most `cap`.
+function anim.scroll_lines(win, a, b, cap)
+  return api.nvim_win_call(win, function()
+    local n, l = 0, a
+    while l < b and n < cap do
+      local fold = vim.fn.foldclosedend(l)
+      l = (fold ~= -1 and fold or l) + 1
+      n = n + 1
+    end
+    return n
+  end)
+end
+
+--- Scroll from the old view to the final one. A long way starts one window height before the step,
+--- on the side of the old view, so the scroll is never slow.
+function anim.scroll(win, from, done)
+  local ms = anim.ms("scroll", 500)
+  local to = api.nvim_win_call(win, vim.fn.winsaveview)
+  if ms == 0 or from.view.topline == to.topline then
+    return false
+  end
+  local down = to.topline > from.view.topline
+  local a, b = math.min(from.view.topline, to.topline), math.max(from.view.topline, to.topline)
+  local n = anim.scroll_lines(win, a, b, api.nvim_win_get_height(win))
+  -- <C-e> scrolls the text up (the view moves down the file), <C-y> the other way.
+  local back, fwd = down and "\25" or "\5", down and "\5" or "\25"
+  anim.keys(win, n, back)
+  local moved = 0
+  anim.run(win, ms, function(t)
+    local k = math.floor(n * (1 - (1 - t) ^ 3) + 0.5) - moved -- eased out: fast, then slow
+    if k > 0 then
+      anim.keys(win, k, fwd)
+      moved = moved + k
+    end
+  end, function()
+    if valid_win(win) then
+      api.nvim_win_call(win, function()
+        vim.fn.winrestview(to)
+      end)
+    end
+    done()
+  end)
+  return true
+end
+
+--- The file of `buf`: the file of a step at a git ref, else the name of the buffer.
+function anim.buf_file(buf)
+  local r = vim.b[buf].nvtour_ref
+  return vim.fs.normalize(r and r.file or api.nvim_buf_get_name(buf))
+end
+
+--- Line `l` of the lines `new` mapped to the lines `old` of another version of the file: the same
+--- line when it did not change, else the first line of the change.
+function anim.map_line(old, new, l)
+  local ok, hunks = pcall(vim.diff, table.concat(old, "\n") .. "\n", table.concat(new, "\n") .. "\n", { result_type = "indices" })
+  if not ok then
+    return math.min(l, #old)
+  end
+  local offset = 0
+  for _, h in ipairs(hunks) do
+    local sa, ca, sb, cb = h[1], h[2], h[3], h[4]
+    -- A count of 0 gives the line before the change as its start.
+    local astart, bstart = ca == 0 and sa + 1 or sa, cb == 0 and sb + 1 or sb
+    if l < bstart then
+      break
+    end
+    if l < bstart + cb then
+      return math.max(1, math.min(astart, #old))
+    end
+    offset = (astart + ca) - (bstart + cb)
+  end
+  return math.max(1, math.min(l + offset, #old))
+end
+
+--- Keys of the rows of the text area of `win` (1 = the first row) that show buffer text: two rows
+--- with the same key look the same (the text of the line, the part of a wrapped line, the extmarks
+--- on it). Rows of virtual lines and closed folds have no key. The rows are counted from the view
+--- (nvim_win_text_height), not from the screen: the window was not drawn since its view changed.
+function anim.row_keys(win)
+  local buf = api.nvim_win_get_buf(win)
+  local height = vim.fn.getwininfo(win)[1].height
+  local view = api.nvim_win_call(win, vim.fn.winsaveview)
+  local count = api.nvim_buf_line_count(buf)
+  local function rows(a, b) -- the rows of lines a..b, with the virtual lines above each of them
+    local ok, h = pcall(api.nvim_win_text_height, win, { start_row = a - 1, end_row = b - 1 })
+    return ok and h.all or (b - a + 1), ok and h.fill or 0
+  end
+  local _, top_fill = rows(view.topline, view.topline)
+  local hidden = top_fill - (view.topfill or 0) -- the virtual lines above the top line that are not shown
+  local keys = {}
+  local l = view.topline
+  while l <= count do
+    local last = api.nvim_win_call(win, function()
+      return vim.fn.foldclosedend(l)
+    end)
+    local all, fill = rows(l, l)
+    local row = rows(view.topline, l) - hidden - (all - fill) + 1 -- the first row of line l
+    if row > height then
+      break
+    end
+    if last ~= -1 then
+      l = last + 1
+    else
+      local key = { api.nvim_buf_get_lines(buf, l - 1, l, false)[1] or "" }
+      for _, m in ipairs(api.nvim_buf_get_extmarks(buf, -1, { l - 1, 0 }, { l - 1, -1 }, { details = true })) do
+        local d = m[4]
+        if d.ns_id ~= S.ns_flash then -- the flash of the step before ends anyway
+          local virt = {}
+          for _, c in ipairs(d.virt_text or {}) do
+            virt[#virt + 1] = c[1]
+          end
+          key[#key + 1] = table.concat({ m[3], d.end_col or "", d.hl_group or "", d.line_hl_group or "", table.concat(virt) }, ":")
+        end
+      end
+      key = table.concat(key, "\0")
+      for i = 0, all - fill - 1 do
+        if row + i >= 1 then
+          keys[row + i] = key .. "\0" .. i
+        end
+      end
+      l = l + 1
+    end
+  end
+  return keys
+end
+
+--- Show `buf` in `win` at `view` for the fade: no autocmds, no change of the jumplist or of the
+--- alternate file.
+function anim.show(win, buf, view)
+  api.nvim_win_call(win, function()
+    vim.cmd(("noautocmd keepalt keepjumps buffer %d"):format(buf))
+    vim.fn.winrestview(view)
+  end)
+end
+
+--- Fade from the old buffer to the new one, through the background: the old buffer is shown again
+--- under a blank float, the curtain, which fades in; then the new buffer comes back and the curtain
+--- fades out. (A float that blends shows the windows under it, never another float, so the old text
+--- cannot be a float.) The gutter always fades; a row whose text looks the same before and after
+--- stays. For the same file at another version, the old lines are put where the same lines of the
+--- new version are (when that is near the old view), so only the lines that changed fade. With a
+--- title card (`card`, anim.card), the curtain stays opaque for vim.g.nvtour_title_ms (default 800)
+--- and shows the card in the middle; its text fades with the curtain.
+function anim.fade(win, from, step, done, card)
+  local ms = anim.ms("fade", 300)
+  if ms == 0 or not vim.o.termguicolors then
+    return false -- without RGB colours a float cannot blend
+  end
+  local info = vim.fn.getwininfo(win)[1]
+  if not info or info.height < 1 or info.width < 1 or api.nvim_win_get_buf(win) ~= step.buf then
+    return false
+  end
+  for _, b in ipairs({ from.buf, step.buf }) do
+    local bh = vim.bo[b].bufhidden
+    if bh ~= "" and bh ~= "hide" then
+      return false -- leaving the window would unload or delete it
+    end
+  end
+  local to = api.nvim_win_call(win, vim.fn.winsaveview)
+  local after = anim.row_keys(win)
+  local view, align = from.view, false
+  if from.buf ~= step.buf and anim.buf_file(from.buf) == anim.buf_file(step.buf) then
+    -- Not when the old text would jump far first: the step is at other code, nothing stays.
+    local a, b = api.nvim_buf_get_lines(from.buf, 0, -1, false), api.nvim_buf_get_lines(step.buf, 0, -1, false)
+    local top = anim.map_line(a, b, to.topline)
+    if math.abs(top - from.view.topline) < info.height then
+      view = { topline = top, topfill = to.topfill, lnum = anim.map_line(a, b, to.lnum), col = 0, leftcol = to.leftcol }
+      align = true
+    end
+  end
+  -- The old buffer is read-only while it is shown again: a key typed then must not change it.
+  local modifiable = vim.bo[from.buf].modifiable
+  -- The step before keeps the look of the current step while its buffer is shown again.
+  local prev = from.step
+  if not (prev and prev ~= step and prev.buf == from.buf and not prev.lost) then
+    prev = nil
+  end
+  local cbuf, back
+  local function restore()
+    if not back then
+      back = true
+      pcall(function()
+        vim.bo[from.buf].modifiable = modifiable
+      end)
+      if prev and valid_buf(prev.buf) then
+        pcall(render_step, prev, tour_win(prev.buf))
+      end
+      if from.buf == step.buf then
+        pcall(render_step, step, win) -- the current step again (the old view drew it as not current)
+      end
+      if valid_win(win) and valid_buf(step.buf) and api.nvim_win_get_buf(win) == from.buf then
+        pcall(anim.show, win, step.buf, to)
+      end
+    end
+  end
+  local function close()
+    restore()
+    if cbuf then
+      pcall(api.nvim_buf_delete, cbuf, { force = true })
+    end
+  end
+  local ok, err = pcall(function()
+    vim.bo[from.buf].modifiable = false
+    if prev then
+      local current = S.tour.current
+      S.tour.current = prev.n
+      pcall(render_step, prev, win)
+      if from.buf == step.buf then
+        pcall(render_step, step, win) -- in the same buffer (a new chapter): drawn as before the jump
+      end
+      S.tour.current = current
+    end
+    anim.show(win, from.buf, view)
+    local before = anim.row_keys(win)
+    if align then
+      -- The notes of the two steps differ in height: shift the old text by the rows that make the
+      -- most rows look the same.
+      local best, most = 0, -1
+      for d = -math.floor(info.height / 2), math.floor(info.height / 2) do
+        local n = 0
+        for r = 1, info.height do
+          if after[r] ~= nil and before[r + d] == after[r] then
+            n = n + 1
+          end
+        end
+        if n > most or (n == most and math.abs(d) < math.abs(best)) then
+          best, most = d, n
+        end
+      end
+      if best ~= 0 then
+        anim.keys(win, math.abs(best), best > 0 and "\5" or "\25")
+        before = anim.row_keys(win)
+      end
+    end
+    -- The curtain: blank rows (written: its name is nvtour://fade), transparent (winblend 100)
+    -- except where NvtourFade is, whose blend goes from 100 to 0 and back.
+    cbuf = api.nvim_create_buf(false, true)
+    vim.bo[cbuf].bufhidden = "wipe"
+    unique_name("nvtour://fade", cbuf)
+    local blank, rows = string.rep(" ", info.width), {}
+    for r = 1, info.height do
+      rows[r] = blank
+    end
+    api.nvim_buf_set_lines(cbuf, 0, -1, false, rows)
+    local gutter = math.max(info.textoff, vim.fn.getwininfo(win)[1].textoff) -- the signs of the two can differ
+    local layout = card and #card > 0 and anim.card_layout(card, info.width, info.height) or nil
+    local hold = layout and anim.ms("title", 800) or 0
+    local card_top, card_rows = layout and layout.top or -1, layout and layout.count or 0
+    for r = 1, info.height do
+      -- The rows of the card always fade: the blank cells in the box must cover the text.
+      local same = before[r] ~= nil and before[r] == after[r] and not (r > card_top and r <= card_top + card_rows)
+      local mark = same and { end_col = gutter, hl_group = "NvtourFade" } or { line_hl_group = "NvtourFade", priority = 100 }
+      api.nvim_buf_set_extmark(cbuf, anim.NS, r - 1, 0, mark)
+    end
+    local curtain = api.nvim_open_win(cbuf, false, {
+      relative = "editor",
+      row = info.winrow - 1 + (info.winbar or 0),
+      col = info.wincol - 1,
+      width = info.width,
+      height = info.height,
+      focusable = false,
+      style = "minimal",
+      zindex = 1, -- under every other float (the peek, messages)
+      noautocmd = true,
+    })
+    vim.wo[curtain].winbar = "" -- a new window takes the winbar of the current window
+    vim.wo[curtain].wrap = false
+    vim.wo[curtain].winblend = 100
+    vim.wo[curtain].winhighlight = "NormalFloat:Normal"
+    local bg = hl_attr("Normal", "bg") or (vim.o.background ~= "light" and 0x1d2021 or 0xfbf1c7)
+    local fg = hl_attr("Normal", "fg") or (vim.o.background ~= "light" and 0xebdbb2 or 0x3c3836)
+    -- `o`: the opacity of the curtain; `a`: of the card, which fades by its colours (blend 0).
+    local function opacity(o, a)
+      api.nvim_set_hl(anim.NS, "NvtourFade", { bg = bg, blend = 100 - math.floor(100 * o + 0.5) })
+      for g in pairs(a and layout.groups or {}) do
+        local h = api.nvim_get_hl(0, { name = g, link = false })
+        api.nvim_set_hl(anim.NS, "NvtourFade" .. g, { fg = blend(h.fg or fg, bg, a), bg = bg, bold = h.bold, italic = h.italic, blend = 0 })
+      end
+      api.nvim_win_set_hl_ns(curtain, anim.NS) -- again: a change of the group alone redraws nothing
+    end
+    opacity(0)
+    -- In: half the fade; opaque for `hold`, with the card; out: the other half. The card fades in and
+    -- out over `ramp` ms of the hold.
+    local ramp, shown = math.min(150, hold / 3), false
+    anim.run(win, ms + hold, function(t)
+      local e = t * (ms + hold)
+      local on = layout ~= nil and e >= ms / 2 and e < ms / 2 + hold
+      if on ~= shown then
+        anim.card_put(cbuf, layout, on)
+        shown = on
+      end
+      local o = e < ms / 2 and math.sin(math.pi * e / ms) or e < ms / 2 + hold and 1 or math.sin(math.pi * (e - hold) / ms)
+      opacity(o, on and math.max(0, math.min(1, (e - ms / 2) / ramp, (ms / 2 + hold - e) / ramp)) or nil)
+      if e >= ms / 2 then
+        restore() -- the curtain covers the old text now
+      end
+    end, function()
+      close()
+      done()
+    end)
+  end)
+  if not ok then
+    close()
+    error(err, 0)
+  end
+  return true
+end
+
+-- A key ends the animations that run when it is typed. Scheduled (no window changes in an on_key
+-- callback), so only these: an animation that the key itself starts (]w) stays.
+vim.on_key(function()
+  if next(S.anims) == nil or anim.busy then
+    return
+  end
+  local runs = vim.tbl_values(S.anims)
+  vim.schedule(function()
+    for _, run in ipairs(runs) do
+      run.finish()
+    end
+  end)
+end, anim.KEY_NS)
+M._anim = anim -- for the tests
+
+---------------------------------------------------------------------------
+-- Scroll to a step
+---------------------------------------------------------------------------
 
 --- Screen rows of buffer row `row` (0-based) with the virtual lines above it.
 local function rows_of(win, row)
@@ -3269,6 +3801,9 @@ local function key_actions()
     end,
     range_style = function()
       run("range_style")
+    end,
+    animate = function()
+      run("animate")
     end,
     clear = function()
       run("clear")
@@ -3510,6 +4045,7 @@ end
 
 --- Remove everything nvtour created. keep_panel keeps the panel window open.
 local function reset(keep_panel)
+  anim.finish_all()
   sheet_cancel()
   follow.cancel_all()
   peek.close()
@@ -3620,8 +4156,9 @@ end
 
 --- `step` becomes the current step: draw the old and the new step, show the winbar in `win`, start the
 --- sheet link. `opts.scroll` puts the cursor on the step and scrolls to it, then flashes the range
---- (a jump; follow mode moves nothing). `opts.lists` also updates the quickfix list and the panel
---- (the caller of a jump does that after it, when the step is in the tour).
+--- (a jump; follow mode moves nothing), animated from `opts.from` (anim.capture). `opts.lists` also
+--- updates the quickfix list and the panel (the caller of a jump does that after it, when the step is
+--- in the tour).
 local function make_current(step, win, opts)
   local old = S.tour.steps[S.tour.current]
   S.tour.current = step.n
@@ -3634,7 +4171,12 @@ local function make_current(step, win, opts)
   if opts.scroll then
     scroll_to(step, win)
     S.follow_jump = { win = win, buf = step.buf, line = step.l1 }
-    flash(step)
+    local function done()
+      anim.flash(step)
+    end
+    if not anim.start(step, win, opts.from, done) then
+      done()
+    end
   end
   if opts.lists then
     update_qf(step.n)
@@ -3644,9 +4186,11 @@ local function make_current(step, win, opts)
 end
 
 local function jump(step)
+  anim.finish_all() -- before the view is read: the end of an animation sets the view
   step_buf(step)
   sync_step(step)
   local win = tour_win(step.buf, true)
+  local from = anim.capture(win)
   -- The position before the jump goes into the jumplist of the window, so <C-o> goes back to it.
   pcall(api.nvim_win_call, win, function()
     vim.cmd("normal! m'")
@@ -3656,7 +4200,7 @@ local function jump(step)
     S.tour_win = win -- the diagram window is never a window for code
   end
   enter_win(win)
-  make_current(step, win, { scroll = true })
+  make_current(step, win, { scroll = true, from = from })
 end
 
 local function announce(step)
@@ -3738,8 +4282,8 @@ function follow.step_at(buf, line)
 end
 
 function follow.fire(win, buf)
-  if not follow.on() or not follow.win(win) or api.nvim_win_get_buf(win) ~= buf then
-    return
+  if not follow.on() or not follow.win(win) or api.nvim_win_get_buf(win) ~= buf or S.anims[win] then
+    return -- an animation moves the cursor of its window
   end
   local line = api.nvim_win_get_cursor(win)[1]
   local at = S.follow_jump
@@ -4094,6 +4638,20 @@ H.range_style = function(a)
   S.view = "side"
   side.refresh()
   return { ok = true, range_style = style, view = "side", message = "nvtour: range style " .. style }
+end
+
+--- Turn the animation of jumps on or off (`a.mode`: "on", "off" or "toggle", the default).
+H.animate = function(a)
+  local mode, on = a.mode, nil
+  if mode == nil or mode == "" or mode == "toggle" then
+    on = not anim.on()
+  elseif mode == "on" or mode == "off" then
+    on = mode == "on"
+  else
+    fail(("unknown mode '%s' (on, off or toggle)"):format(tostring(mode)), 2)
+  end
+  S.animate = on
+  return { ok = true, animate = on, message = "nvtour: animation " .. (on and "on" or "off") }
 end
 
 --- Lines (l1, l2) that the text range `q` selects in the list `lines`; `name` is for the messages.
@@ -4856,7 +5414,7 @@ H.diagram_link = function()
   api.nvim_set_current_win(code)
   api.nvim_win_set_cursor(code, { target.l1, 0 })
   vim.cmd("normal! zvzz")
-  flash({ buf = buf, l1 = target.l1, l2 = target.l2 })
+  anim.flash({ buf = buf, l1 = target.l1, l2 = target.l2 })
   return { ok = true, followed = true, file = target.file, l1 = target.l1, l2 = target.l2 }
 end
 
@@ -5183,6 +5741,7 @@ H.status = function()
     range_style = side.style_name(),
     card = side.shown(),
     follow = follow.on(),
+    animate = anim.on(),
     keys = installed_keys(),
     mark_keys = next(S.mark_keys) and S.mark_keys or vim.empty_dict(),
     marks = #S.marks,
@@ -5441,6 +6000,7 @@ dispatch = function(cmd, args)
   if not h then
     return { ok = false, error = "unknown command: " .. tostring(cmd), code = 2, pid = vim.fn.getpid() }
   end
+  pcall(anim.finish_all) -- a command sees, and starts from, the final view of a jump
   local outer = W
   W = {}
   local ok, res = pcall(h, args or {})
@@ -5578,6 +6138,11 @@ ucmd("NvtourRangeStyle", function(o)
   return dispatch("range_style", { style = o.args })
 end, { nargs = "?", complete = function()
   return side.STYLES
+end })
+ucmd("NvtourAnimate", function(o)
+  return dispatch("animate", { mode = o.args })
+end, { nargs = "?", complete = function()
+  return { "on", "off", "toggle" }
 end })
 ucmd("NvtourFollow", function()
   local on = not follow.on()

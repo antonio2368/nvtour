@@ -369,6 +369,32 @@ frame, and the `→ next` line. The border has the colour of the role, and the t
   most half as high as the window. In the panel it uses the width of the editor.
 - The float shows a scratch buffer `nvtour://peek`. No file buffer is written.
 
+### Animation
+
+A jump to a step (`]w`, `goto`, the panel) is animated, so you see where the tour goes:
+
+- **In the same file**, the view scrolls to the step (500 ms). A long way starts one window height before
+  the step, so the scroll is never slow.
+- **To another file**, the old text fades to the background, then the new text fades in (300 ms). The
+  text of the two never mixes.
+- **To the same file at another commit** (a step with `--ref`), the old version is lined up with the new
+  one. The lines that are the same in both versions stay, and only the code that changed fades.
+- **A title card** in the middle of the fade tells what changed: `## Chapter` when the chapter changes,
+  `◇ file @ref (sha)` when the file or the commit changes. The fade stays dark for 800 ms so you can read it.
+  A new chapter in the same file fades too (with only its name), instead of the scroll.
+- The flash of the range comes after the animation.
+
+`<leader>wa` or `:NvtourAnimate [on|off|toggle]` turns it on and off. `vim.g.nvtour_animate = false` turns it
+off in `init.lua`. When it is not set, it is on when Neovim has a UI, and off in a headless Neovim.
+
+- The step, the panel, the quickfix index and the card change at once; only the view moves. Any key, the
+  next jump, or a command from the agent ends the animation at once at the final view.
+- The fade needs `termguicolors`. Without it, a jump to another file is not animated.
+- During the first half of a fade the old buffer is shown again, read-only, under a blank float
+  (`nvtour://fade`). A key that you type then cannot change it.
+- Set `vim.g.nvtour_scroll_ms`, `vim.g.nvtour_fade_ms` and `vim.g.nvtour_title_ms` to change the durations
+  (`0` turns that one off; without the title card, a new chapter in the same file scrolls).
+
 ### Side view
 
 The notes, links and markers between the lines of code can feel cluttered. The side view moves all of it into
@@ -701,6 +727,7 @@ is skipped. The tour keys are set when a tour starts and removed by `clear`. The
 | `<leader>wv` | switch between the inline view and the [side view](#side-view) |
 | `<leader>ws` | hide / show the step card of the side view (turns the side view on) |
 | `<leader>wr` | next range style of the side view (turns the side view on) |
+| `<leader>wa` | turn the [animation](#animation) of jumps on or off |
 | `<leader>wm` / `<leader>wM` | mark the cursor line or the selection for the agent / the same, then ask for a comment (see [Marks](#marks)); normal and visual mode; always installed, also without a tour |
 | `<leader>wc` | clear everything |
 
@@ -715,7 +742,7 @@ step after it), `K` peeks at that step, `q` closes the panel.
 `:NvtourPrevChapter`, `:NvtourGoto N`, `:NvtourPanel`, `:NvtourClear`, `:NvtourPeek [N]` (see
 [Peek at a step](#follow-and-peek)), `:NvtourFollow` (turn [follow mode](#follow-and-peek) on or off),
 `:NvtourView [inline|side|toggle]`, `:NvtourCard`, `:NvtourRangeStyle [STYLE]` (see [Side view](#side-view)),
-`:NvtourMarksClear` (remove all [marks](#marks)).
+`:NvtourAnimate [on|off|toggle]` (see [Animation](#animation)), `:NvtourMarksClear` (remove all [marks](#marks)).
 
 **Quickfix:** the list `nvtour: <title>` works too (`:cnext`, `:cprev`), but it only moves the cursor. It does
 not change the current step of the tour.
@@ -730,11 +757,15 @@ Set these in `init.lua` before the first step:
 vim.g.nvtour_keys = { next = "]w", prev = "[w", first = "[W", last = "]W", panel = "<leader>wp", clear = "<leader>wc",
                       next_chapter = "]c", prev_chapter = "[c", peek = "<leader>wk",
                       view = "<leader>wv", card = "<leader>ws", range_style = "<leader>wr",
-                      mark = "<leader>wm", mark_note = "<leader>wM" }
+                      animate = "<leader>wa", mark = "<leader>wm", mark_note = "<leader>wM" }
 vim.g.nvtour_auto_panel = false               -- do not open the panel on the first step
 vim.g.nvtour_steal_focus = "unless_terminal"  -- "always" | "never"; default keeps the focus in a terminal window
 vim.g.nvtour_winbar = false                   -- do not show the tour position in the winbar of the tour window
 vim.g.nvtour_flash = 0                        -- ms the range flashes after a jump (default 300; 0 = off)
+vim.g.nvtour_animate = false                  -- no animation of jumps (default: on when nvim has a UI)
+vim.g.nvtour_scroll_ms = 500                  -- ms of the scroll in the same file (default 500; 0 = off)
+vim.g.nvtour_fade_ms = 300                    -- ms of the fade to another file (default 300; 0 = off)
+vim.g.nvtour_title_ms = 800                   -- ms the title card of a fade stays (default 800; 0 = no card)
 vim.g.nvtour_follow_cursor = true             -- the step under the cursor becomes the current step (default false)
 vim.g.nvtour_note_style = "band"              -- a background band instead of the frame (default "frame")
 vim.g.nvtour_note_width = 160                 -- wrap notes at most this many cells wide (default: the window width)

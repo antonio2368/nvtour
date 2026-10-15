@@ -145,6 +145,7 @@ class Demo:
             vim.o.showmode = false
             vim.o.shortmess = vim.o.shortmess .. "I"
             vim.g.nvtour_flash = 0
+            vim.g.nvtour_animate = false
         """)
         for d in TS_DIRS:
             if d.is_dir():

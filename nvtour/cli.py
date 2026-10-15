@@ -852,7 +852,7 @@ def format_chapter(args: argparse.Namespace, res: Mapping[str, Any]) -> str:
 
 
 def format_keys(keys: Mapping[str, str] | None) -> str:
-    order = ["next", "prev", "first", "last", "panel", "clear", "next_chapter", "prev_chapter", "peek", "view", "card", "range_style"]
+    order = ["next", "prev", "first", "last", "panel", "clear", "next_chapter", "prev_chapter", "peek", "view", "card", "range_style", "animate"]
     return ", ".join(f"{keys[k]} {k}" for k in order if keys and keys.get(k)) or "(none installed)"
 
 

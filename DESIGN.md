@@ -361,6 +361,8 @@ M.state = {
   follow_timers = { [winid] = uv timer },  -- the debounced check of the follow mode (§6, "Follow the cursor")
   follow_jump = { win, buf, line },  -- where the last jump put the cursor; the follow check ignores it
   peek = { win, buf, step, group, maps },  -- the open peek float (§6, "Peek a step"); {} when there is none
+  anims = { [winid] = { finish } },  -- the animation that runs in the window (§6, "Animation")
+  animate = nil,  -- true or false from the animate key or :NvtourAnimate; nil: vim.g.nvtour_animate
 }
 ```
 
@@ -532,8 +534,9 @@ For a step at `l1..l2` in buffer `buf` (0-based rows internally):
    line, so a note on line 1 is visible (`zz` hides it). The view never goes past the end of the
    file. Closed folds count as one row. Then the range flashes: one extmark in `nvtour_flash`
    (`hl_group = NvtourFlash`, `hl_eol`, `priority = 250`) removed after `vim.g.nvtour_flash` ms
-   (default 300; `0` = off). Before the buffer is shown, `normal! m'` in the tour window adds the
-   position before the jump to its jumplist, so `<C-o>` goes back to the previous step.
+   (default 300; `0` = off), after the animation of the jump when there is one (see "Animation").
+   Before the buffer is shown, `normal! m'` in the tour window adds the position before the jump to
+   its jumplist, so `<C-o>` goes back to the previous step.
 6. **Winbar** — the tour window gets `setlocal winbar=%{%v:lua.nvtour.winbar()%}`, unless the window
    already has a winbar (the user's or a plugin's) or `vim.g.nvtour_winbar == false`. Text:
    ` nvtour 2/5 fault · <label>` and on the right `next ]w: <file>:<line> <label>` (only the line when
@@ -767,6 +770,66 @@ innermost; the current step wins a tie); lost steps are skipped. When it is not 
 current step stays. A jump moves the cursor to `l1` of its step; the check ignores that one position
 (`state.follow_jump`), else a smaller step that starts on the same line would take the current step
 from the step of the jump. `status` has `follow`.
+
+### Animation
+
+`anim.on()` is `state.animate` (the animate key or `:NvtourAnimate [on|off|toggle]`, through the
+handler `animate`), else `vim.g.nvtour_animate` (`true`/`1` or `false`), else true when `nvim_list_uis()` is not
+empty: a headless nvim (the tests) does not animate. `status` has `animate`.
+
+`jump` first ends every animation (`anim.finish_all`: the end of one sets a view), then, before
+`show_buf`, records `from = { win, buf, view, step }` (the window, its buffer and `winsaveview()`, and
+the current step). `make_current` sets the final state as before: the current step, both steps drawn,
+the winbar, the card, the cursor and the view (`scroll_to`). Then `anim.start(step, win, from, done)`
+animates the view from `from` to that state, and `done` flashes the range. Nothing is animated when
+`show_buf` gave another window, or when the old buffer is not loaded.
+
+- `anim.run(win, ms, frame, done)`: one uv timer per window (`state.anims[win]`, every 16 ms) calls
+  `frame(t)` with `t` = the elapsed time / `ms` until it is 1, then `done()`. A new animation in the
+  window, `dispatch` (each command, before its handler), a key (`vim.on_key`, scheduled: only the
+  animations that ran when the key was typed) and `reset` end it: `finish` stops the timer and runs
+  `done` at once. The follow check skips a window with an animation (the scroll moves its cursor).
+- **Scroll** (the same buffer; `vim.g.nvtour_scroll_ms`, default 500): `n` = the lines between the old
+  and the new top line, as `<C-e>` counts them (a closed fold is one), at most the window height. From
+  the final view, `n` times `<C-y>` (or `<C-e>`, upwards) goes back towards the old view; each frame
+  then scrolls `round(n * (1 - (1 - t)^3)) - moved` lines forward (eased out). The last frame is
+  `winrestview` of the final view.
+- **Fade** (another buffer; `vim.g.nvtour_fade_ms`, default 300; needs `termguicolors`; not when either
+  buffer has a `'bufhidden'` other than `""` or `hide`). A float that blends (`winblend`) shows the
+  windows under it, never another float, and its blank cells show the text under them. So the old text
+  cannot be a float: for the first half the window shows the old buffer again (`noautocmd keepalt
+  keepjumps buffer N`, then `winrestview`), with `'modifiable'` off, and with the step before drawn as
+  the current step, as it was before the jump. Over the text area lies the curtain: a float (zindex 1,
+  `minimal`, `winblend` 100) on a scratch buffer `nvtour://fade` of blank rows. `NvtourFade` (in the
+  namespace `nvtour_fade`, `bg` = the `Normal` bg) covers the gutter of every row and the whole row
+  where the old and the new row differ; its `blend` is `100 - 100 * sin(pi * t)`, and
+  `nvim_win_set_hl_ns` is called again after each change (a change of the group alone redraws
+  nothing). At `t >= 0.5` the curtain is opaque: the new buffer comes back at the final view, the old
+  step is drawn again as a step that is not current, and `'modifiable'` is restored. `done` closes the
+  curtain.
+- **Rows that stay.** `anim.row_keys(win)` gives each text row a key: the line, the part of a wrapped
+  line, and the extmarks on it (column, hl group, line hl group, virtual text; not the flash). The rows
+  are counted from the view with `nvim_win_text_height` (the window was not drawn since its view
+  changed, so `screenpos` is out of date). Rows of virtual lines and closed folds have no key. For the
+  same file at another version (`b:nvtour_ref.file` or the buffer name), the old view starts at the
+  old line of the new top line (`vim.diff` indices: a changed line maps to the first line of its
+  change), when that is less than a window height from the old view. Then the old text is shifted by
+  the rows (at most half the window) that give the most equal keys: the notes of the two steps differ
+  in height.
+- **Title card.** `anim.card(step, from.step)` gives the lines: `## Name` when `chapter_of` differs
+  (`card.chapter`), and `◇ ` + `version_segs` when the step before is not `same_doc` (or there is none).
+  `anim.start` fades instead of scrolls when the chapter changes in the same buffer; the old view then
+  draws the old step as current and the new one as not current, as before the jump. The fade runs
+  `fade + hold` ms (`hold` = `vim.g.nvtour_title_ms`, default 800; 0: no card, and a new chapter in the
+  same buffer scrolls): in for `fade / 2`, opaque for `hold`, out for `fade / 2`. `anim.card_layout`
+  places a box (`╭─╮ │ │ ╰─╯`) with the lines in the middle rows; `anim.card_put` writes it into the
+  blank rows of the curtain (`nvim_buf_set_text`) only while the curtain is opaque, and blanks them
+  again before it clears: a blended float fades its characters only half way, and its blank cells show
+  the text under them. Each chunk gets `NvtourFade<Group>` in `nvtour_fade` with `blend = 0` and the
+  `fg` of its group mixed with the background, so the card fades in and out over `min(150, hold / 3)`
+  ms of the hold. The rows of the card are always covered (`line_hl_group`). With the animation off,
+  there is no fade and so no card. Floats of plugins on the window (treesitter-context) stay above the
+  curtain.
 
 ### Peek a step
 
@@ -1155,14 +1218,14 @@ visual mode, and are free only when `maparg` is empty in both modes. Global norm
 and skip that key. `vim.g.nvtour_keys` is read (missing entries use the defaults), never written.
 
 The actions are in two sets. `KEYS.tour` is `next`, `prev`, `first`, `last`, `panel`, `clear`, `next_chapter`,
-`prev_chapter`, `peek`, `view`, `card` and `range_style`. `KEYS.always` is `mark` and `mark_note`.
+`prev_chapter`, `peek`, `view`, `card`, `range_style` and `animate`. `KEYS.always` is `mark` and `mark_note`.
 
 ```lua
 DEFAULT_KEYS = {
   next = "]w", prev = "[w", first = "[W", last = "]W", panel = "<leader>wp", clear = "<leader>wc",
   next_chapter = "]c", prev_chapter = "[c", peek = "<leader>wk",
   view = "<leader>wv", card = "<leader>ws", range_style = "<leader>wr",
-  mark = "<leader>wm", mark_note = "<leader>wM",
+  animate = "<leader>wa", mark = "<leader>wm", mark_note = "<leader>wM",
 }
 ```
 
@@ -1179,8 +1242,8 @@ User commands (defined on load, always available): `:NvtourNext`, `:NvtourPrev`,
 `:NvtourLast`, `:NvtourNextChapter`, `:NvtourPrevChapter`, `:NvtourGoto N`, `:NvtourPanel`, `:NvtourClear`,
 `:NvtourPeek [N]` (peeks step N, default the step under the cursor; see "Peek a step"), `:NvtourFollow`
 (flips `vim.g.nvtour_follow_cursor` and says the new state; see "Follow the cursor"), `:NvtourMarksClear`
-(removes all marks and says how many; see §5, "Marks"), `:NvtourView [inline|side|toggle]`, `:NvtourCard`
-and `:NvtourRangeStyle [STYLE]` (see §6, "Side view").
+(removes all marks and says how many; see §5, "Marks"), `:NvtourView [inline|side|toggle]`, `:NvtourCard`,
+`:NvtourRangeStyle [STYLE]` (see §6, "Side view") and `:NvtourAnimate [on|off|toggle]` (see §6, "Animation").
 
 The quickfix list also works (`:cnext`, `:cprev`, `:copen`); it moves the cursor only, not the
 current step.
@@ -1193,7 +1256,9 @@ current step.
    `winbar` are set locally, saved and restored per window (the panel's own window options are not
    restored: nvtour closes that window). Highlight groups use `default = true`.
 3a. Never replace a modified buffer that cannot be hidden (that would run `'autowrite'`).
-3. Never close windows/tabs we did not create (panel window, diff tabs and the peek float only).
+3. Never close windows/tabs we did not create (panel window, diff tabs, the peek float and the fade
+   curtain only). The fade shows the old buffer again for a moment with `'modifiable'` off, and
+   always restores it.
 4. Never touch an nvim instance the user did not select (no broadcasting).
 5. Every command has one timeout budget for all its RPC calls; a hang never blocks the agent for
    more than `--timeout` seconds (plus the 2 s discovery probes, which run in parallel). A command
