@@ -91,7 +91,7 @@ Use this when the user asks about code ("this", "here", "this chunk") but gives 
 
 ## Writing notes
 
-- Note: at most 3 short sentences. Label: at most 6 words.
+- Note: readable cold. A one-line lead sentence, then short paragraphs split by blank lines; numbered lists for sequences, bullet lists for cases or outcomes. Explain what the names and values in the range mean, in several sentences when needed. Label: at most 6 words.
 - Roles: `fault` = wrong line(s); `flow` = how data or control gets there; `fix` = where or how it should change; `context` = background; `info` = neutral explanation (default).
 - Name identifiers in the note. The highlight already shows the location.
 - Put identifiers in backticks (`` `erase()` ``); `**bold**` also works. Other markdown is shown as typed.
