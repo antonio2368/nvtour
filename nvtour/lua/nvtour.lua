@@ -5927,7 +5927,10 @@ H.clear = function(a)
   local unlisted = 0
   for buf in pairs(S.added_bufs) do
     if not a.keep_buffers and valid_buf(buf) and not vim.bo[buf].modified and #vim.fn.win_findbuf(buf) == 0 then
-      vim.bo[buf].buflisted = false
+      -- Unlisting fires BufDelete; plugins such as treesitter-context then drop the still-loaded buffer.
+      api.nvim_buf_call(buf, function()
+        vim.cmd("noautocmd setlocal nobuflisted")
+      end)
       unlisted = unlisted + 1
     end
   end

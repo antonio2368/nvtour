@@ -553,8 +553,12 @@ def test_clear_unlists_buffers_nvtour_added(cli, nv):
     ok(cli("step", "b.txt:4"))
     b = find_buf(nv, "b.txt")
     assert nv.api.get_option_value("buflisted", {"buf": b.handle}) is True
+    nv.exec_lua("_G.nvt_deleted = {}; _G.nvt_au = vim.api.nvim_create_autocmd('BufDelete', "
+                "{callback = function(args) table.insert(_G.nvt_deleted, args.buf) end})")
     ok(cli("clear"))
+    deleted = nv.exec_lua("vim.api.nvim_del_autocmd(_G.nvt_au); return _G.nvt_deleted")
     assert nv.api.get_option_value("buflisted", {"buf": b.handle}) is False
+    assert deleted == []  # unlisting must not look like a deletion to other plugins
     assert nv.api.get_option_value("buflisted", {"buf": find_buf(nv, "a.txt").handle}) is True  # shown
     nv.command("silent! %bwipeout!")
     ok(cli("step", "b.txt:4", "--no-jump"))
