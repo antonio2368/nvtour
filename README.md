@@ -871,7 +871,7 @@ parallel):
 - sockets that fail a 2 s probe are `unresponsive`;
 - an nvim at a prompt is `blocked`.
 
-The workspace `W` is `--workspace`, else the git toplevel of the cwd, else the cwd. Each live instance gets a
+The workspace `W` is `--workspace`, else the git toplevel of the cwd (in a submodule: of its outermost superproject), else the cwd. Each live instance gets a
 score:
 
 | condition | score |

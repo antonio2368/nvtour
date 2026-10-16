@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import subprocess
+
 import pytest
 
 from nvtour import cli, discover
@@ -334,3 +336,23 @@ def test_sheet_env(monkeypatch):
     monkeypatch.setenv("SHEET_HOME", "")
     monkeypatch.setenv("PATH_UNRELATED", "x")
     assert cli.sheet_env() == {"SHEET_SOCKET": "tcp://127.0.0.1:1"}
+
+
+def test_workspace_of_a_submodule_is_the_superproject(tmp_path):
+    def git(directory, *args):
+        subprocess.run(["git", "-C", str(directory), "-c", "user.name=t", "-c", "user.email=t@example.com",
+                        "-c", "protocol.file.allow=always", *args], check=True, capture_output=True)
+
+    lib, top = tmp_path / "lib", tmp_path / "top"
+    for repo in (lib, top):
+        repo.mkdir()
+        git(repo, "init", "-q")
+        (repo / "f").write_text("x")
+        git(repo, "add", ".")
+        git(repo, "commit", "-qm", "init")
+    git(top, "submodule", "add", "-q", str(lib), "contrib/lib")
+    (top / "contrib" / "lib" / "src").mkdir()
+    real = str(top.resolve())
+    assert cli.resolve_workspace(None, str(top / "contrib" / "lib" / "src")) == real
+    assert cli.resolve_workspace(None, str(top)) == real
+    assert cli.resolve_workspace(None, str(lib)) == str(lib.resolve())

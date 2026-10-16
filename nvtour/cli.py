@@ -269,11 +269,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def resolve_workspace(arg: str | None, cwd: str | None = None) -> str:
-    """``--workspace`` or git toplevel of cwd or cwd, always realpath'd."""
+    """``--workspace`` or git toplevel of cwd (of its superproject in a submodule) or cwd, always realpath'd."""
     cwd = cwd or os.getcwd()
     if arg:
         return os.path.realpath(arg)
-    return gitutil.toplevel(cwd) or os.path.realpath(cwd)
+    return gitutil.workspace_root(cwd) or os.path.realpath(cwd)
 
 
 def pick_socket(args: argparse.Namespace, workspace: str, env: Mapping[str, str], use_pin: bool = True, save_pin: bool = True) -> tuple[str, str]:

@@ -112,6 +112,15 @@ def test_card_follows_the_current_step_and_git(cli, nv, side, sandbox):
     assert nv.api.win_get_position(card(nv)[0]) == [0, 0]
 
 
+
+def test_card_path_outside_the_workspace_is_from_the_nvim_cwd(cli, nv, side, sandbox):
+    nv.command("let g:nvtour_view = 'side'")
+    other = sandbox.root / "other"
+    other.mkdir(exist_ok=True)
+    ok(cli("--workspace", str(other), "start", "Outside"))
+    ok(cli("--workspace", str(other), "step", "a.txt:5-7", "--label", "one"))
+    assert "a.txt:5-7" in card(nv)[1]  # nvim runs in the sandbox workspace
+
 def test_card_names_the_version(cli, nv, side, sandbox):
     nv.command("let g:nvtour_view = 'side'")
     ok(cli("start", "Versions"))

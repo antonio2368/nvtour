@@ -477,12 +477,13 @@ local function strip_inline(s)
   return table.concat(out)
 end
 
+--- `path` from the workspace, else from the current directory of nvim, else as it is.
 local function relpath(path)
   local w = S.workspace
   if w and path:sub(1, #w + 1) == w .. "/" then
     return path:sub(#w + 2)
   end
-  return path
+  return vim.fn.fnamemodify(path, ":.")
 end
 
 --- Load a file into a (listed) buffer without displaying it.
@@ -6065,12 +6066,6 @@ function marks.del(m)
   end
 end
 
---- A path for the notification: from the workspace, else from the current directory.
-function marks.short_path(path)
-  local rel = relpath(path)
-  return rel ~= path and rel or vim.fn.fnamemodify(path, ":.")
-end
-
 --- Add a mark on the cursor line, or on the selection in visual mode, of the current window.
 H.mark = function()
   local win = api.nvim_get_current_win()
@@ -6109,7 +6104,7 @@ H.mark = function()
   S.mark_seq = S.mark_seq + 1
   m.id = S.mark_seq
   S.marks[#S.marks + 1] = m
-  local where = diagram and ("diagram " .. diagram) or marks.short_path(file)
+  local where = diagram and ("diagram " .. diagram) or relpath(file)
   return {
     ok = true,
     id = m.id,

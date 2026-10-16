@@ -25,6 +25,26 @@ def toplevel(directory: str) -> str | None:
     return os.path.realpath(out.stdout.strip())
 
 
+def workspace_root(directory: str) -> str | None:
+    """Like ``toplevel``, but a submodule resolves to the toplevel of its outermost superproject."""
+    top = toplevel(directory)
+    while top is not None:
+        try:
+            out = subprocess.run(
+                ["git", "-C", top, "rev-parse", "--show-superproject-working-tree"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return top
+        parent = out.stdout.strip() if out.returncode == 0 else ""
+        if not parent:
+            return top
+        top = os.path.realpath(parent)
+    return None
+
+
 def _git(top: str, *args: str, timeout: float = 30) -> subprocess.CompletedProcess:
     try:
         return subprocess.run(["git", "-C", top, *args], capture_output=True, timeout=timeout)

@@ -84,7 +84,9 @@ A socket that fails the probe (connection refused or timeout) is reported as `un
 ### Workspace
 
 `W` = `--workspace DIR` if given, else `git rev-parse --show-toplevel` of the CLI's cwd, else the
-cwd. Always `os.path.realpath`. Git worktrees resolve naturally to their own toplevel.
+cwd. Always `os.path.realpath`. Git worktrees resolve naturally to their own toplevel. In a submodule,
+`W` is the toplevel of the outermost superproject (`git rev-parse --show-superproject-working-tree`), so a
+command run from inside a submodule keeps the workspace of the repository that holds it.
 
 ### Score (per live instance)
 
