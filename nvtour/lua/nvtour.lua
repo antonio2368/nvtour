@@ -447,6 +447,37 @@ local function split_lines(text)
   return out
 end
 
+-- The parts of a step (see "Parts"): the places in its range that its note links to. Part i has the
+-- letter "a", "b", ... and is { o1, o2, text, spec }: its lines as offsets from l1 (so they follow
+-- the step when it moves), an optional expression in those lines, and the range as the agent gave it.
+-- The note links words, a sentence or a paragraph to a part with [words](a), or to several with
+-- [words](a,c). The table also has the --expect texts: a Lua chunk has at most 200 local variables.
+local part = {
+  NS = api.nvim_create_namespace("nvtour_parts"), -- the links in the card
+}
+
+--- The link to parts at or after `init` of `s` (at `init` only, with `anchored`): its start, end,
+--- words and target. The target is single letters joined with commas ("(a)", "(a, c)"). The words
+--- may go over a line break of the note, but not over a blank line. nil when there is none.
+function part.find_link(s, init, anchored)
+  local from = init
+  while true do
+    local ls, le, words, dest = s:find((anchored and "^" or "") .. "%[([^%]]+)%]%(([%l, ]+)%)", from)
+    if not ls then
+      return nil
+    end
+    local bad = dest:find("%l%s*%l") or not dest:find("^%s*%l[%l, ]*$") or dest:find(",%s*$")
+      or words:find("\n%s*\n")
+    if not bad then
+      return ls, le, words, dest
+    end
+    if anchored then
+      return nil
+    end
+    from = ls + 1
+  end
+end
+
 --- Split `s` into { text, kind } segments (kind nil, "code" or "bold"), without the markers.
 --- A marker without a closing partner is plain text. A link to parts, [words](a,c), is its words;
 --- with `links`, their kind is { base = kind, refs = { "a", "c" } } and a segment { " (a, c)",
@@ -461,11 +492,7 @@ local function parse_inline(s, links)
   end
   while i <= #s do
     local close, kind, len
-    -- A link to parts: the target is single letters, joined with commas ("(a)", "(a, c)").
-    local ls, le, words, dest = s:find("^%[([^%]]+)%]%(([%l, ]+)%)", i)
-    if ls and (dest:find("%l%s*%l") or not dest:find("^%s*%l[%l, ]*$") or dest:find(",%s*$")) then
-      ls = nil
-    end
+    local ls, le, words, dest = part.find_link(s, i, true)
     if ls then
       flush()
       local refs = {}
@@ -485,6 +512,9 @@ local function parse_inline(s, links)
         close, kind, len = s:find("`", i + 1, true), "code", 1
       elseif s:sub(i, i + 1) == "**" then
         close, kind, len = s:find("**", i + 2, true), "bold", 2
+      end
+      if close and s:sub(i, close):find("\n", 1, true) then
+        close = nil -- `code` and **bold** end on their line
       end
       if close and close > i + len then
         flush()
@@ -585,14 +615,6 @@ local function explicit_from(step)
   return f ~= nil and f ~= step and S.tour.steps[f.n] == f
 end
 
--- The parts of a step (see "Parts"): the places in its range that its note links to. Part i has the
--- letter "a", "b", ... and is { o1, o2, text, spec }: its lines as offsets from l1 (so they follow
--- the step when it moves), an optional expression in those lines, and the range as the agent gave it.
--- The note links words, a sentence or a paragraph to a part with [words](a), or to several with
--- [words](a,c). The table also has the --expect texts: a Lua chunk has at most 200 local variables.
-local part = {
-  NS = api.nvim_create_namespace("nvtour_parts"), -- the links in the card
-}
 
 --- The --expect texts as a list without empty texts, or nil when there are none. Takes a list (from
 --- the CLI) or one string (a step made by an older runtime).
@@ -1340,7 +1362,7 @@ local function step_title(s)
   if s.label and s.label ~= "" then
     return s.label
   end
-  local first = strip_inline((s.note or ""):match("[^\n]*%S[^\n]*") or "")
+  local first = strip_inline(s.note or ""):match("[^\n]*%S[^\n]*") or ""
   first = vim.trim(first)
   if vim.fn.strdisplaywidth(first) > 60 then
     first = vim.fn.strcharpart(first, 0, 59) .. "…"
@@ -1753,9 +1775,25 @@ end
 --- Lines of `note` wrapped to `width`, without leading and trailing blank lines (`links`: see
 --- parse_inline).
 local function note_lines(note, width, links)
+  -- The whole note is parsed at once, so a link can go over a line break; then each line of the
+  -- note is wrapped by itself.
+  local text = table.concat(split_lines((note or ""):gsub("\t", "  ")), "\n")
+  local paras = { {} }
+  for _, seg in ipairs(parse_inline(text, links)) do
+    local first = true
+    for piece in (seg[1] .. "\n"):gmatch("(.-)\n") do
+      if not first then
+        paras[#paras + 1] = {}
+      end
+      first = false
+      if piece ~= "" then
+        table.insert(paras[#paras], { piece, seg[2] })
+      end
+    end
+  end
   local lines = {}
-  for _, para in ipairs(split_lines((note or ""):gsub("\t", "  "))) do
-    for _, l in ipairs(wrap_text(para, width, links)) do
+  for _, segs in ipairs(paras) do
+    for _, l in ipairs(wrap_segs(segs, width)) do
       lines[#lines + 1] = l
     end
   end
@@ -2646,6 +2684,12 @@ function side.map_keys(buf)
   map("q", function()
     _G.nvtour.dispatch("card", {}) -- hides the card; the view stays the side view
   end)
+  -- The cursor on a link focuses its parts. Through _G as the keys, and made again on a runtime
+  -- upgrade (the card buffer is only nvtour's: its CursorMoved autocmds are all ours).
+  api.nvim_clear_autocmds({ event = "CursorMoved", buffer = buf })
+  api.nvim_create_autocmd("CursorMoved", { buffer = buf, callback = function()
+    pcall(_G.nvtour.card_cursor)
+  end })
 end
 
 function side.buf()
@@ -2663,9 +2707,6 @@ function side.buf()
     pcall(vim.treesitter.start, buf, "markdown") -- `code` in the note, conceal of the markers
   end
   side.map_keys(buf)
-  api.nvim_create_autocmd("CursorMoved", { buffer = buf, callback = function()
-    pcall(part.card_cursor)
-  end })
   S.card.buf = buf
   return buf
 end
@@ -2854,30 +2895,48 @@ function side.render()
   part.card_marks()
 end
 
---- The links to parts in the note rows of the card: { row (0-based), s, e (byte columns, e after the
---- link), refs } for each [words](a,c).
+--- The links to parts in the note rows of the card: { row, s, end_row, e, refs } for each
+--- [words](a,c), with 0-based rows and byte columns (e after the link). A link can go over rows.
 function part.card_links()
   local buf, rows, out = S.card.buf, S.card.note_rows, {}
-  if not valid_buf(buf) or not rows then
+  if not valid_buf(buf) or not rows or rows[2] < rows[1] then
     return out
   end
-  for r = rows[1], rows[2] do
-    local line = api.nvim_buf_get_lines(buf, r - 1, r, false)[1] or ""
-    local from = 1
-    while true do
-      local ls, le, dest = line:find("%[[^%]]+%]%(([%l, ]+)%)", from)
-      if not ls then
-        break
+  local lines = api.nvim_buf_get_lines(buf, rows[1] - 1, rows[2], false)
+  local text = table.concat(lines, "\n")
+  -- The row and the column of byte `i` (1-based) of `text`.
+  local function at(i)
+    local row, start = rows[1] - 1, 1
+    for _, line in ipairs(lines) do
+      if i <= start + #line then
+        return row, i - start
       end
-      local refs = {}
-      for l in dest:gmatch("%l") do
-        refs[#refs + 1] = l
-      end
-      out[#out + 1] = { row = r - 1, s = ls - 1, e = le, refs = refs }
-      from = le + 1
+      row, start = row + 1, start + #line + 1
     end
+    return row - 1, #lines[#lines]
+  end
+  local from = 1
+  while true do
+    local ls, le, _, dest = part.find_link(text, from)
+    if not ls then
+      break
+    end
+    local refs = {}
+    for l in dest:gmatch("%l") do
+      refs[#refs + 1] = l
+    end
+    local row, col = at(ls)
+    local end_row, end_col = at(le + 1)
+    out[#out + 1] = { row = row, s = col, end_row = end_row, e = end_col, refs = refs }
+    from = le + 1
   end
   return out
+end
+
+--- True when the cursor `pos` ({ row 1-based, col }) is on the link `l` of part.card_links.
+function part.on_link(l, pos)
+  local r, c = pos[1] - 1, pos[2]
+  return (r > l.row or (r == l.row and c >= l.s)) and (r < l.end_row or (r == l.end_row and c < l.e))
 end
 
 --- Draw the links of the card again: the words dotted, "(a)" after them, a background on the links
@@ -2895,8 +2954,8 @@ function part.card_marks()
   for _, l in ipairs(part.card_links()) do
     local on = part.link_hl({ ref = l.refs }, step) == "NvtourPartRefOn"
     local hl = on and { "NvtourPartLink", "NvtourPartFocus" } or "NvtourPartLink" -- markdown keeps its colours
-    api.nvim_buf_set_extmark(buf, part.NS, l.row, l.s, { end_col = l.e, hl_group = hl, priority = 160 })
-    api.nvim_buf_set_extmark(buf, part.NS, l.row, l.e, {
+    api.nvim_buf_set_extmark(buf, part.NS, l.row, l.s, { end_row = l.end_row, end_col = l.e, hl_group = hl, priority = 160 })
+    api.nvim_buf_set_extmark(buf, part.NS, l.end_row, l.e, {
       virt_text = { { " (" .. table.concat(l.refs, ", ") .. ")", part.link_hl({ ref = l.refs }, step) } },
       virt_text_pos = "inline",
     })
@@ -2913,7 +2972,7 @@ function part.card_cursor()
   local pos = api.nvim_win_get_cursor(S.card.win)
   local ks
   for _, l in ipairs(part.card_links()) do
-    if l.row == pos[1] - 1 and pos[2] >= l.s and pos[2] < l.e then
+    if part.on_link(l, pos) then
       ks = part.numbers(step, l.refs)
     end
   end
@@ -2926,6 +2985,8 @@ function part.card_cursor()
     part.redraw(step)
   end
 end
+
+M.card_cursor = part.card_cursor
 
 --- Put the lights of side.flash (S.card.lit, a list of { spot = "chapter" | "file", group }) on the
 --- card as it is drawn now: a redraw of the card (the panel redraws it after a jump) keeps them.
@@ -5102,7 +5163,7 @@ H.card_go = function()
   local pos = api.nvim_win_get_cursor(S.card.win)
   for _, l in ipairs(part.card_links()) do
     local ks = part.numbers(step, l.refs)
-    if l.row == pos[1] - 1 and pos[2] >= l.s and pos[2] < l.e and #ks > 0 then
+    if part.on_link(l, pos) and #ks > 0 then
       if part.focus_is(step, ks) then
         part.set_focus(step, nil)
         part.redraw(step)
@@ -5222,13 +5283,11 @@ function part.resolve(specs, note, buf, l1, l2, lines)
   if #out > 26 then
     fail(("%d parts: a step has at most 26 (a-z)"):format(#out), 6)
   end
-  for _, para in ipairs(split_lines(note or "")) do
-    for _, seg in ipairs(parse_inline(para, true)) do
-      for _, l in ipairs(type(seg[2]) == "table" and seg[2].ref or {}) do
-        if l:byte() - 96 > #out then
-          fail(("the note links to part %s, but the step has %s"):format(l,
-            #out == 0 and "no parts" or #out == 1 and "only part a" or ("parts a-" .. part.letter(#out))), 6)
-        end
+  for _, seg in ipairs(parse_inline(table.concat(split_lines(note or ""), "\n"), true)) do
+    for _, l in ipairs(type(seg[2]) == "table" and seg[2].ref or {}) do
+      if l:byte() - 96 > #out then
+        fail(("the note links to part %s, but the step has %s"):format(l,
+          #out == 0 and "no parts" or #out == 1 and "only part a" or ("parts a-" .. part.letter(#out))), 6)
       end
     end
   end

@@ -218,3 +218,35 @@ def test_a_click_on_a_link_of_the_card_goes_to_its_part(cli, nv, side):  # noqa:
     nv.api.win_set_cursor(win, [lines.index("Next  ]w") + 2, 0])  # the block of the next step
     nv.feedkeys(nv.replace_termcodes("<CR>", True, False, True), "x", False)
     assert nv.exec_lua("return _G.nvtour.state.tour.current") == 2
+
+
+def test_a_link_can_go_over_a_line_break(cli, nv, side):  # noqa: F811
+    ok(cli("start", "Wrapped"))
+    note = "Lead.\n1. Under the lock, [refuse a shutdown and\n   start the connect](a).\n\n[not\n\nacross a blank line](a)"
+    ok(cli("step", "a.txt:5-7", "--part", "6", "--note", note))
+    assert cli("step", "a.txt:5-7", "--part", "6", "--note", "[x\ny](b)").returncode == 6  # checked too
+    words = next(m[3] for m in step_marks(nv, "a.txt") if m[3].get("virt_lines_above"))
+    lines = ["".join(c[0] for c in content(line)) for line in words["virt_lines"]]
+    assert "1. Under the lock, refuse a shutdown and" in lines and f"start the connect{NBSP}(a)." in lines
+    assert "[not" in lines  # over a blank line it is no link
+    linked = [c[0] for line in words["virt_lines"] for c in line if isinstance(c[1], list) and "NvtourPartLink" in c[1]]
+    assert linked == ["refuse a shutdown and", "start the connect"]
+    dispatch(nv, "view", mode="side")
+    win, card_lines = card(nv)
+    row = card_lines.index("1. Under the lock, [refuse a shutdown and")
+    buf = nv.exec_lua("return _G.nvtour.state.card.buf")
+    marks = nv.api.buf_get_extmarks(buf, nv.api.create_namespace("nvtour_parts"), 0, -1, {"details": True})
+    assert [(m[1], m[2], m[3].get("end_row"), m[3].get("end_col")) for m in marks if m[3].get("hl_group")] == [
+        (row, 19, row + 1, 24)]
+    assert [(m[1], m[2]) for m in marks if m[3].get("virt_text")] == [(row + 1, 24)]
+    nv.api.set_current_win(win)
+    nv.api.win_set_cursor(win, [row + 2, 5])  # the cursor on the second row of the link focuses it
+    nv.api.exec_autocmds("CursorMoved", {"buffer": buf})
+    assert hl(nv, "NvtourDim") == [(4, 0, 11), (6, 0, 11)]
+    nv.api.win_set_cursor(win, [1, 0])
+    nv.api.exec_autocmds("CursorMoved", {"buffer": buf})
+    assert hl(nv, "NvtourDim") == []
+    nv.api.win_set_cursor(win, [row + 2, 5])  # and a click there goes to it
+    nv.feedkeys(nv.replace_termcodes("<LeftRelease>", True, False, True), "x", False)
+    assert hl(nv, "NvtourDim") == [(4, 0, 11), (6, 0, 11)]
+    assert len(nv.api.get_autocmds({"event": "CursorMoved", "buffer": buf})) == 1

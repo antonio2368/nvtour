@@ -279,7 +279,8 @@ nvtour step src/a.cpp:/erase/~120                  # the line with "erase" that 
 A note often explains several places of its range: a lookup, a call, a read. Parts let the note say which
 words are about which place, without quoting the code. Give the places with `--part`, in order: the first
 one is part `a`, then `b`, `c`, ... (at most 26). Then link any words of the note to them with
-`[words](a)`. The words can be one word, a sentence or a whole line of the note.
+`[words](a)`. The words can be one word, a sentence or a whole line of the note, and they can go over a
+line break of the note (not over a blank line).
 
 ```sh
 nvtour step src/cache.cpp:/std::string get(/+8 --role fault \

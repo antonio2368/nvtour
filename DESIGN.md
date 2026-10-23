@@ -597,8 +597,11 @@ range. The functions are in one table `part` (with `part.expect_list`): the main
   `{query}` is resolved with `resolve_query` in the lines of the step only; `{l1, l2}` must be inside
   the range; `text` must be in the lines of the part; at most 26 parts; every link of the note must
   name a part. All failures are exit 6 and name the part (`part b (/nope/): ...`).
-- **Links** in notes: `parse_inline(s, links)` reads `[words](a)` and `[words](a,c)` (the target is
-  single letters joined by commas; anything else stays as typed). Without `links` (collapsed notes,
+- **Links** in notes: `parse_inline(s, links)` reads `[words](a)` and `[words](a,c)` (`part.find_link`:
+  the target is single letters joined by commas; anything else stays as typed). The words can go over
+  a line break but not over a blank line, so `note_lines` parses the whole note at once and then
+  wraps each line of it; `` `code` `` and `**bold**` still end on their line. In the card,
+  `part.card_links` searches the note rows joined, so a link can have `end_row > row`. Without `links` (collapsed notes,
   peek, titles, `--via`) a link is its words. With `links` (the note of the current step) the words
   get the kind `{ base, refs }` and a segment `"\u00a0(a,\u00a0c)"` with kind `{ ref }` follows (no-break
   spaces: it stays on the line of the last word). `part.link_hl` maps them: the words
