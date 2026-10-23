@@ -1,0 +1,70 @@
+# A demo of parts: run `nvtour apply docs/demo/parts.toml` from the root of the repository.
+# ]r and [r focus the parts of the current step; in the side view (<leader>wv) the cursor on a
+# link in the card does the same.
+title = "Parts"
+panel = """
+**Cause**: `get()` reads through `it` after `refresh()` moved the node.
+**Fix**: copy the value before `refresh(key)`.
+
+`]r` / `[r`: focus the parts of a step.
+"""
+
+[[step]]
+at = "docs/demo/cache.cpp:/std::string get(/+8"
+role = "fault"
+label = "read after refresh"
+expect = ["refresh(key)"]
+parts = [
+    { at = "/entries.find/", text = "entries.find(key)" },
+    { at = "/entries.find/", text = "it" },
+    "/refresh(key)/",
+    { at = "/return it/", text = "it->second" },
+]
+note = """
+`get()` reads the entry through an iterator that is no longer valid.
+
+[It finds the entry](a) and keeps [the iterator `it`](b).
+[Then `refresh(key)` moves the node out of the map and back in](c),
+so [this read goes through an invalid iterator](d).
+
+[All of it runs under the lock](a,c,d), so `get()` breaks its own iterator.
+"""
+
+[[step]]
+at = "docs/demo/cache.cpp:/void refresh(/+5"
+role = "flow"
+label = "the node moves"
+via = "`refresh(key)` gives the entry a new expiry"
+parts = [
+    { at = "/entries.extract/", text = "entries.extract(key)" },
+    "/expires_at +=/",
+    "/entries.insert/",
+]
+note = """
+`refresh()` gives the entry a new expiry by moving its [node](a).
+
+[Extract](a) unlinks it from the map, [the new expiry](b) is set
+while it is outside, and [insert](c) links it in again.
+
+The value stays in the same memory, but the iterator of `get()`
+pointed into the old place in the tree.
+"""
+
+[[step]]
+at = "docs/demo/cache.cpp:/refresh(key);/+1"
+role = "fix"
+label = "copy first"
+from = 1
+via = "back to the read"
+parts = ["/return it/", "/refresh(key);/"]
+note = """
+Copy the value before the node moves.
+
+[Read `it->second.value` first](a), [then call `refresh(key)`](b),
+and return the copy.
+"""
+suggest = """
+        std::string value = it->second.value;
+        refresh(key);
+        return value;
+"""

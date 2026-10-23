@@ -84,6 +84,8 @@ local DEFAULT_KEYS = {
   card = "<leader>ws",
   range_style = "<leader>wr",
   animate = "<leader>wa",
+  part_next = "]r",
+  part_prev = "[r",
   mark = "<leader>wm",
   mark_note = "<leader>wM",
 }
@@ -158,6 +160,13 @@ local function define_highlights(force)
   set("NvtourSuggest", { fg = fg }) -- suggested code without a syntax group
   set("NvtourStrike", { strikethrough = true }) -- the lines that a suggestion replaces (no fg: syntax stays)
   set("NvtourDim", { fg = blend(fg, bg, 0.35) })
+  -- Parts: the linked words of a note and the expression of a part are dotted, the "(a)" after them
+  -- and at the end of the code lines are dim; the focused part (]r) is bright and its words get a background.
+  set("NvtourPartLink", { underdotted = true, sp = blend(fg, bg, 0.60) })
+  set("NvtourPartText", { underdotted = true, sp = blend(fg, bg, 0.60) })
+  set("NvtourPartRef", { fg = blend(fg, bg, 0.50) })
+  set("NvtourPartRefOn", { fg = fg, bold = true })
+  set("NvtourPartFocus", { bg = blend(fg, bg, 0.16) })
   set("NvtourFlash", { bg = blend(fg, bg, 0.25) })
   set("NvtourPanelCurrent", { bg = blend(fg, bg, 0.12), bold = true })
   set("NvtourDiagramLine", { fg = blend(fg, bg, 0.55) }) -- the box and arrow characters of a diagram
@@ -439,8 +448,10 @@ local function split_lines(text)
 end
 
 --- Split `s` into { text, kind } segments (kind nil, "code" or "bold"), without the markers.
---- A marker without a closing partner is plain text.
-local function parse_inline(s)
+--- A marker without a closing partner is plain text. A link to parts, [words](a,c), is its words;
+--- with `links`, their kind is { base = kind, refs = { "a", "c" } } and a segment { " (a, c)",
+--- { ref = refs } } follows them.
+local function parse_inline(s, links)
   local segs, plain, i = {}, {}, 1
   local function flush()
     if #plain > 0 then
@@ -450,18 +461,39 @@ local function parse_inline(s)
   end
   while i <= #s do
     local close, kind, len
-    if s:sub(i, i) == "`" then
-      close, kind, len = s:find("`", i + 1, true), "code", 1
-    elseif s:sub(i, i + 1) == "**" then
-      close, kind, len = s:find("**", i + 2, true), "bold", 2
+    -- A link to parts: the target is single letters, joined with commas ("(a)", "(a, c)").
+    local ls, le, words, dest = s:find("^%[([^%]]+)%]%(([%l, ]+)%)", i)
+    if ls and (dest:find("%l%s*%l") or not dest:find("^%s*%l[%l, ]*$") or dest:find(",%s*$")) then
+      ls = nil
     end
-    if close and close > i + len then
+    if ls then
       flush()
-      segs[#segs + 1] = { s:sub(i + len, close - 1), kind }
-      i = close + len
+      local refs = {}
+      for l in dest:gmatch("%l") do
+        refs[#refs + 1] = l
+      end
+      for _, seg in ipairs(parse_inline(words)) do
+        segs[#segs + 1] = links and { seg[1], { base = seg[2], refs = refs } } or seg
+      end
+      if links then
+        -- No-break spaces: the marker stays on the line of the last word ("\194\160" is U+00A0).
+        segs[#segs + 1] = { "\194\160(" .. table.concat(refs, ",\194\160") .. ")", { ref = refs } }
+      end
+      i = le + 1
     else
-      plain[#plain + 1] = s:sub(i, i)
-      i = i + 1
+      if s:sub(i, i) == "`" then
+        close, kind, len = s:find("`", i + 1, true), "code", 1
+      elseif s:sub(i, i + 1) == "**" then
+        close, kind, len = s:find("**", i + 2, true), "bold", 2
+      end
+      if close and close > i + len then
+        flush()
+        segs[#segs + 1] = { s:sub(i + len, close - 1), kind }
+        i = close + len
+      else
+        plain[#plain + 1] = s:sub(i, i)
+        i = i + 1
+      end
     end
   end
   flush()
@@ -553,9 +585,18 @@ local function explicit_from(step)
   return f ~= nil and f ~= step and S.tour.steps[f.n] == f
 end
 
+-- The parts of a step (see "Parts"): the places in its range that its note links to. Part i has the
+-- letter "a", "b", ... and is { o1, o2, text, spec }: its lines as offsets from l1 (so they follow
+-- the step when it moves), an optional expression in those lines, and the range as the agent gave it.
+-- The note links words, a sentence or a paragraph to a part with [words](a), or to several with
+-- [words](a,c). The table also has the --expect texts: a Lua chunk has at most 200 local variables.
+local part = {
+  NS = api.nvim_create_namespace("nvtour_parts"), -- the links in the card
+}
+
 --- The --expect texts as a list without empty texts, or nil when there are none. Takes a list (from
 --- the CLI) or one string (a step made by an older runtime).
-local function expect_list(v)
+function part.expect_list(v)
   if v == nil then
     return nil
   end
@@ -566,6 +607,35 @@ local function expect_list(v)
     end
   end
   return #out > 0 and out or nil
+end
+
+--- The letter of part `i`: "a", "b", ...
+function part.letter(i)
+  return string.char(96 + i)
+end
+
+--- The lines (l1, l2) of part `p` of `step`, in the range of the step.
+function part.lines(step, p)
+  local p1 = math.min(step.l1 + p.o1, step.l2)
+  return p1, math.min(math.max(step.l1 + p.o2, p1), step.l2)
+end
+
+--- The parts of `step` for `status`: "a: /text/ (lines 16-18) `it->second`", or nil.
+function part.specs(step)
+  local out = {}
+  for i, p in ipairs(step.parts or {}) do
+    local p1, p2 = part.lines(step, p)
+    out[i] = ("%s: %s (lines %d-%d)%s"):format(part.letter(i), p.spec or "?", p1, p2, p.text and (" `" .. p.text .. "`") or "")
+  end
+  return #out > 0 and out or nil
+end
+
+--- The number of the focused part of `step` (]r, or the cursor on a link in the card), or nil.
+function part.focused(step)
+  local f = S.part_focus
+  if f and f.step == step and S.tour.current == step.n and step.parts and step.parts[f.k] then
+    return f.k
+  end
 end
 
 local render_step -- forward declaration
@@ -642,7 +712,7 @@ local function range_problem(buf, l1, l2, expect)
     return ("range %d-%d is beyond the end of the file (%d lines)"):format(l1, l2, count)
   end
   local lines = api.nvim_buf_get_lines(buf, l1 - 1, l2, false)
-  for _, text in ipairs(expect_list(expect) or {}) do
+  for _, text in ipairs(part.expect_list(expect) or {}) do
     local found = false
     for _, line in ipairs(lines) do
       if line:find(text, 1, true) then
@@ -1209,7 +1279,7 @@ local side = {
 -- (KEYS.tour) are installed when a tour starts and removed by clear. The keys of the marks
 -- (KEYS.always) stay while the runtime is loaded (see "Marks").
 local KEYS = {
-  tour = { "next", "prev", "first", "last", "panel", "clear", "next_chapter", "prev_chapter", "peek", "view", "card", "range_style", "animate" },
+  tour = { "next", "prev", "first", "last", "panel", "clear", "next_chapter", "prev_chapter", "peek", "view", "card", "range_style", "animate", "part_next", "part_prev" },
   always = { "mark", "mark_note" },
 }
 
@@ -1639,15 +1709,16 @@ local function wrap_segs(segs, width)
   return out
 end
 
-local function wrap_text(s, width)
-  return wrap_segs(parse_inline(s), width)
+local function wrap_text(s, width, links)
+  return wrap_segs(parse_inline(s, links), width)
 end
 
---- Lines of `note` wrapped to `width`, without leading and trailing blank lines.
-local function note_lines(note, width)
+--- Lines of `note` wrapped to `width`, without leading and trailing blank lines (`links`: see
+--- parse_inline).
+local function note_lines(note, width, links)
   local lines = {}
   for _, para in ipairs(split_lines((note or ""):gsub("\t", "  "))) do
-    for _, l in ipairs(wrap_text(para, width)) do
+    for _, l in ipairs(wrap_text(para, width, links)) do
       lines[#lines + 1] = l
     end
   end
@@ -1660,10 +1731,30 @@ local function note_lines(note, width)
   return lines
 end
 
+--- The group of a chunk of the note of `step` with the { base, refs } or { ref } kind of a link to
+--- parts (parse_inline): the words get a dotted underline, the "(a)" after them is dim; a link to
+--- the focused part has a background.
+function part.link_hl(kind, step)
+  local k = step and part.focused(step)
+  local on = false
+  for _, l in ipairs(kind.refs or kind.ref) do
+    on = on or (k ~= nil and l == part.letter(k))
+  end
+  if kind.ref then
+    return on and "NvtourPartRefOn" or "NvtourPartRef"
+  end
+  local g = { INLINE_HL[kind.base] or "NvtourNote", "NvtourPartLink" }
+  if on then
+    g[3] = "NvtourPartFocus"
+  end
+  return g
+end
+
 --- virt_lines for the note of the current step: a bordered block (`plain`: no border prefixes,
---- for the frame style, which draws its own border).
-local function note_chunks(note, width, plain)
-  local texts = note_lines(note, width)
+--- for the frame style, which draws its own border). With `step`, the links to its parts are shown
+--- (part.link_hl); without, only their words.
+local function note_chunks(note, width, plain, step)
+  local texts = note_lines(note, width, step ~= nil)
   local lines = {}
   for i, t in ipairs(texts) do
     local prefix
@@ -1683,7 +1774,8 @@ local function note_chunks(note, width, plain)
     else
       local line = { { prefix, "NvtourNoteBorder" } }
       for _, c in ipairs(t) do
-        line[#line + 1] = { c[1], INLINE_HL[c[2]] or "NvtourNote" }
+        local hl = type(c[2]) == "table" and part.link_hl(c[2], step) or INLINE_HL[c[2]] or "NvtourNote"
+        line[#line + 1] = { c[1], hl }
       end
       lines[#lines + 1] = line
     end
@@ -2080,7 +2172,7 @@ local function band(lines, win, role, current)
     -- Drawn again in the window when the buffer is shown (BufWinEnter).
     for _, line in ipairs(lines) do
       for _, c in ipairs(line) do
-        c[2] = { "NvtourNoteBg", c[2] }
+        c[2] = vim.list_extend({ "NvtourNoteBg" }, type(c[2]) == "table" and c[2] or { c[2] })
       end
     end
     return opts
@@ -2092,7 +2184,7 @@ local function band(lines, win, role, current)
   for i, line in ipairs(lines) do
     local w = off
     for _, c in ipairs(line) do
-      c[2] = { "NvtourNoteBg", c[2] }
+      c[2] = vim.list_extend({ "NvtourNoteBg" }, type(c[2]) == "table" and c[2] or { c[2] })
       w = w + vim.fn.strdisplaywidth(c[1])
     end
     if w < full then
@@ -2152,7 +2244,7 @@ render_step = function(step, win)
   -- Every text of --expect in the range is underlined in the role colour (the current step only).
   local function marks()
     local lines = api.nvim_buf_get_lines(buf, step.l1 - 1, step.l2, false)
-    for _, text in ipairs(expect_list(step.expect) or {}) do
+    for _, text in ipairs(part.expect_list(step.expect) or {}) do
       for i, line in ipairs(lines) do
         local from = 1
         while true do
@@ -2166,6 +2258,64 @@ render_step = function(step, win)
       end
     end
   end
+  -- The parts of the current step: the expression of a part is dotted, the first line of a part
+  -- gets "(a)" at its end, one tag for all parts that start there: "(a, b)" (returned: row ->
+  -- chunks; on l1 the step marker comes first). When a part is focused, the rest of the range is
+  -- dimmed: the other lines, and on its own lines all but its expression (a part without one keeps
+  -- its whole lines).
+  local function parts()
+    local tags, k = {}, part.focused(step)
+    if not current then
+      if S.part_focus and S.part_focus.step == step then
+        S.part_focus = nil -- the focus ends when the step is not the current one any more
+      end
+      return tags
+    end
+    local function dim(row, c1, c2)
+      if c2 > c1 then
+        add(row, { end_col = c2, hl_group = "NvtourDim", priority = 200 }, c1)
+      end
+    end
+    for i, p in ipairs(step.parts or {}) do
+      local p1, p2 = part.lines(step, p)
+      local row = p1 - 1
+      local tag = tags[row]
+      if tag then
+        tag[#tag] = { ", ", "NvtourPartRef" } -- the ")" of the tag goes after this letter
+      else
+        tag = { { "  (", "NvtourPartRef" } }
+        tags[row] = tag
+      end
+      tag[#tag + 1] = { part.letter(i), k == i and "NvtourPartRefOn" or "NvtourPartRef" }
+      tag[#tag + 1] = { ")", "NvtourPartRef" }
+      for l, line in ipairs(api.nvim_buf_get_lines(buf, p1 - 1, p2, false)) do
+        local from, lit = 1, 0 -- lit: the end of the last expression, for the dim between them
+        while p.text do
+          local s, e = line:find(p.text, from, true)
+          if not s then
+            break
+          end
+          add(p1 + l - 2, { end_col = e, hl_group = "NvtourPartText", priority = 140 }, s - 1)
+          if k == i then
+            dim(p1 + l - 2, lit, s - 1)
+          end
+          from, lit = e + 1, e
+        end
+        if k == i and p.text then
+          dim(p1 + l - 2, lit, #line)
+        end
+      end
+    end
+    if k then
+      local p1, p2 = part.lines(step, step.parts[k])
+      for l = step.l1, step.l2 do
+        if l < p1 or l > p2 then
+          dim(l - 1, 0, #(api.nvim_buf_get_lines(buf, l - 1, l, false)[1] or ""))
+        end
+      end
+    end
+    return tags
+  end
   if sided then
     side.draw(step, win, add, current)
     if current then
@@ -2173,6 +2323,9 @@ render_step = function(step, win)
         strike()
       end
       marks()
+    end
+    for row, chunks in pairs(parts()) do
+      add(row, { virt_text = chunks, virt_text_pos = "eol" })
     end
     return
   end
@@ -2189,7 +2342,7 @@ render_step = function(step, win)
   local framed = note_style() == "frame"
   local above = arrival_lines(step, width, not current)
   if step.note and step.note ~= "" then
-    vim.list_extend(above, current and note_chunks(step.note, width, framed) or collapsed_chunks(step.note, width))
+    vim.list_extend(above, current and note_chunks(step.note, width, framed, step) or collapsed_chunks(step.note, width))
   end
   if #above > 0 then
     local opts = framed and frame(above, win, step.role, current, current and "block" or "collapsed")
@@ -2228,11 +2381,15 @@ render_step = function(step, win)
   if current then
     marks()
   end
+  local tags = parts()
   local label = (step.label and step.label ~= "") and (" " .. step.label) or ""
-  add(step.l1 - 1, {
-    virt_text = { { "  ← ", "NvtourLabel" .. R }, { tostring(step.n), "NvtourSign" .. R }, { label, "NvtourLabel" .. R } },
-    virt_text_pos = "eol",
-  })
+  local head = { { "  ← ", "NvtourLabel" .. R }, { tostring(step.n), "NvtourSign" .. R }, { label, "NvtourLabel" .. R } }
+  add(step.l1 - 1, { virt_text = vim.list_extend(head, tags[step.l1 - 1] or {}), virt_text_pos = "eol" })
+  for row, chunks in pairs(tags) do
+    if row ~= step.l1 - 1 then
+      add(row, { virt_text = chunks, virt_text_pos = "eol" })
+    end
+  end
 end
 
 ---------------------------------------------------------------------------
@@ -2457,6 +2614,9 @@ function side.buf()
     pcall(vim.treesitter.start, buf, "markdown") -- `code` in the note, conceal of the markers
   end
   side.map_keys(buf)
+  api.nvim_create_autocmd("CursorMoved", { buffer = buf, callback = function()
+    pcall(part.card_cursor)
+  end })
   S.card.buf = buf
   return buf
 end
@@ -2585,13 +2745,15 @@ function side.render()
   end
   put({})
   rules[#rules + 1] = #lines
+  local note_rows = { #lines + 1, #lines } -- the rows of the note (1-based; empty without a note)
   if step.note and step.note ~= "" then
     put({})
     for _, l in ipairs(split_lines(step.note)) do
       put({ { l } })
     end
+    note_rows = { note_rows[1] + 1, #lines }
   end
-  local expects = expect_list(step.expect) or {}
+  local expects = part.expect_list(step.expect) or {}
   if #expects > 0 then
     -- One item per line: a long text wraps under its own item (breakindentopt "list").
     put({})
@@ -2626,7 +2788,7 @@ function side.render()
   link(S.keys.next, "Next", nxt, "last step", nxt and nxt.via and nxt.via ~= "" and oneline(nxt.via) or nil)
   put({})
   link(S.keys.prev, "Previous", prv, "first step")
-  S.card.line_map, S.card.spots = map, spots
+  S.card.line_map, S.card.spots, S.card.note_rows = map, spots, note_rows
   vim.bo[buf].modifiable = true
   api.nvim_buf_set_lines(buf, 0, -1, false, lines)
   vim.bo[buf].modifiable = false
@@ -2640,6 +2802,80 @@ function side.render()
   end
   side.light()
   pcall(api.nvim_win_set_cursor, S.card.win, { 1, 0 })
+  part.card_marks()
+end
+
+--- The links to parts in the note rows of the card: { row (0-based), s, e (byte columns, e after the
+--- link), refs } for each [words](a,c).
+function part.card_links()
+  local buf, rows, out = S.card.buf, S.card.note_rows, {}
+  if not valid_buf(buf) or not rows then
+    return out
+  end
+  for r = rows[1], rows[2] do
+    local line = api.nvim_buf_get_lines(buf, r - 1, r, false)[1] or ""
+    local from = 1
+    while true do
+      local ls, le, dest = line:find("%[[^%]]+%]%(([%l, ]+)%)", from)
+      if not ls then
+        break
+      end
+      local refs = {}
+      for l in dest:gmatch("%l") do
+        refs[#refs + 1] = l
+      end
+      out[#out + 1] = { row = r - 1, s = ls - 1, e = le, refs = refs }
+      from = le + 1
+    end
+  end
+  return out
+end
+
+--- Draw the links of the card again: the words dotted, "(a)" after them, a background on the links
+--- to the focused part.
+function part.card_marks()
+  local buf = S.card.buf
+  if not valid_buf(buf) then
+    return
+  end
+  api.nvim_buf_clear_namespace(buf, part.NS, 0, -1)
+  local step = S.tour.steps[S.tour.current]
+  if not step or not side.shown() then
+    return
+  end
+  for _, l in ipairs(part.card_links()) do
+    local on = part.link_hl({ ref = l.refs }, step) == "NvtourPartRefOn"
+    local hl = on and { "NvtourPartLink", "NvtourPartFocus" } or "NvtourPartLink" -- markdown keeps its colours
+    api.nvim_buf_set_extmark(buf, part.NS, l.row, l.s, { end_col = l.e, hl_group = hl, priority = 160 })
+    api.nvim_buf_set_extmark(buf, part.NS, l.row, l.e, {
+      virt_text = { { " (" .. table.concat(l.refs, ", ") .. ")", part.link_hl({ ref = l.refs }, step) } },
+      virt_text_pos = "inline",
+    })
+  end
+end
+
+--- The cursor in the card: on a link it focuses the (first) part of the link; off the links it ends
+--- a focus that the cursor started.
+function part.card_cursor()
+  local step = S.tour.steps[S.tour.current]
+  if not step or not step.parts or not side.shown() or api.nvim_get_current_win() ~= S.card.win then
+    return
+  end
+  local pos = api.nvim_win_get_cursor(S.card.win)
+  local k
+  for _, l in ipairs(part.card_links()) do
+    if l.row == pos[1] - 1 and pos[2] >= l.s and pos[2] < l.e then
+      k = l.refs[1]:byte() - 96
+    end
+  end
+  local f = S.part_focus
+  if k and step.parts[k] and not (f and f.step == step and f.k == k) then
+    S.part_focus = { step = step, k = k, card = true }
+    part.redraw(step)
+  elseif not k and f and f.card then
+    S.part_focus = nil
+    part.redraw(step)
+  end
 end
 
 --- Put the lights of side.flash (S.card.lit, a list of { spot = "chapter" | "file", group }) on the
@@ -3903,6 +4139,12 @@ local function key_actions()
     animate = function()
       run("animate")
     end,
+    part_next = function()
+      run("part", { dir = 1 })
+    end,
+    part_prev = function()
+      run("part", { dir = -1 })
+    end,
     clear = function()
       run("clear")
     end,
@@ -4738,6 +4980,43 @@ H.range_style = function(a)
   return { ok = true, range_style = style, view = "side", message = "nvtour: range style " .. style }
 end
 
+--- Draw the current step again with its focused part: the code, and the links of the card.
+function part.redraw(step)
+  if valid_buf(step.buf) and api.nvim_buf_is_loaded(step.buf) then
+    render_step(step, tour_win(step.buf))
+  end
+  part.card_marks()
+end
+
+--- Focus a part of the current step: `a.k` (a number, 0 ends the focus), or the next one (`a.dir`
+--- 1) or the one before it (-1). After the last part (or before the first) the focus ends.
+H.part = function(a)
+  local step = S.tour.steps[S.tour.current]
+  if not step then
+    fail("no current step", 6)
+  end
+  local n = #(step.parts or {})
+  if n == 0 then
+    return { ok = true, part = nil, message = "nvtour: this step has no parts" }
+  end
+  local k = part.focused(step)
+  if a.k then
+    k = a.k
+  elseif (a.dir or 1) > 0 then
+    k = (k or 0) + 1
+  else
+    k = (k or n + 1) - 1
+  end
+  if k < 1 or k > n then
+    k = nil
+  end
+  S.part_focus = k and { step = step, k = k } or nil
+  part.redraw(step)
+  local msg = k and ("nvtour: part %s (%d/%d)%s"):format(part.letter(k), k, n,
+    step.parts[k].spec and (" · " .. step.parts[k].spec) or "") or "nvtour: no part"
+  return { ok = true, part = k and part.letter(k) or nil, message = msg }
+end
+
 --- Turn the animation of jumps on or off (`a.mode`: "on", "off" or "toggle", the default).
 H.animate = function(a)
   local mode, on = a.mode, nil
@@ -4807,6 +5086,53 @@ local function resolve_query(lines, q, name)
 end
 M._resolve_query = resolve_query
 
+--- The parts `specs` of the step on lines l1-l2 of `buf` (or of the list `lines`), checked. A spec is
+--- { l1, l2 } or { query } (a text range, found in the lines of the step only), with `text` (an
+--- expression in its lines) and `spec` (as the agent wrote it). Each link of `note` must name a part.
+--- Returns the parts { o1, o2, text, spec, src = the spec } (nil when there are none).
+function part.resolve(specs, note, buf, l1, l2, lines)
+  local range = lines and vim.list_slice(lines, l1, l2) or api.nvim_buf_get_lines(buf, l1 - 1, l2, false)
+  local out = {}
+  for i, sp in ipairs(specs or {}) do
+    local where = ("part %s (%s)"):format(part.letter(i), sp.spec or "?")
+    local p1, p2 = sp.l1, sp.l2 or sp.l1
+    if sp.query then
+      local ok, r1, r2 = pcall(resolve_query, range, sp.query, ("the step (lines %d-%d)"):format(l1, l2))
+      if not ok then
+        fail(where .. ": " .. (type(r1) == "table" and r1.msg or tostring(r1)), 6)
+      end
+      p1, p2 = l1 + r1 - 1, l1 + r2 - 1
+    end
+    if not p1 or p1 < l1 or p2 > l2 or p2 < p1 then
+      fail(("%s: lines %s-%s are not in the step (lines %d-%d)"):format(where, tostring(p1), tostring(p2), l1, l2), 6)
+    end
+    if sp.text and sp.text ~= "" then
+      local found = false
+      for n = p1, p2 do
+        found = found or range[n - l1 + 1]:find(sp.text, 1, true) ~= nil
+      end
+      if not found then
+        fail(("%s: text %q is not in its lines %d-%d"):format(where, sp.text, p1, p2), 6)
+      end
+    end
+    out[i] = { o1 = p1 - l1, o2 = p2 - l1, text = (sp.text ~= "" and sp.text) or nil, spec = sp.spec, src = sp }
+  end
+  if #out > 26 then
+    fail(("%d parts: a step has at most 26 (a-z)"):format(#out), 6)
+  end
+  for _, para in ipairs(split_lines(note or "")) do
+    for _, seg in ipairs(parse_inline(para, true)) do
+      for _, l in ipairs(type(seg[2]) == "table" and seg[2].ref or {}) do
+        if l:byte() - 96 > #out then
+          fail(("the note links to part %s, but the step has %s"):format(l,
+            #out == 0 and "no parts" or #out == 1 and "only part a" or ("parts a-" .. part.letter(#out))), 6)
+        end
+      end
+    end
+  end
+  return #out > 0 and out or nil
+end
+
 --- Load the buffer of location `a` and check that l1-l2 exists and (with `expect`, a list) contains
 --- each expected text. A text range `a.query` gives l1 and l2 (the arguments are not used then).
 --- With `lines` (a list), those lines are checked and no buffer is loaded (`apply` checks the lines
@@ -4860,7 +5186,7 @@ local function checked_range(a, l1, l2, expect, lines)
     fail(("range %d-%d is beyond end of file (%d lines): %s"):format(l1, l2, count, doc_name(a)), 6)
   end
   local checked = get(l1, l2)
-  for _, expect in ipairs(expect_list(expect) or {}) do
+  for _, expect in ipairs(part.expect_list(expect) or {}) do
     local found = false
     for _, line in ipairs(checked) do
       if line:find(expect, 1, true) then
@@ -4898,7 +5224,7 @@ local function make_step(a, n, buf, l1, l2, link, from)
     suggest = (a.suggest and a.suggest ~= "") and split_lines(a.suggest) or nil,
     from = from,
     sheet = link,
-    expect = expect_list(a.expect),
+    expect = part.expect_list(a.expect),
     query = a.query, -- the text range the lines came from (nil: the agent gave line numbers)
     resolved_from = a.resolved_from,
     orig_l1 = l1, -- the range given by the agent, for the report when the step moves
@@ -4950,6 +5276,7 @@ H.step = function(a)
     fail("unknown role: " .. tostring(role), 2)
   end
   local buf, l1, l2 = checked_range(a, a.l1 or 0, a.l2 or a.l1 or 0, a.expect)
+  local parts = part.resolve(a.parts, a.note, buf, l1, l2, a.lines)
   local link = resolve_sheet(a.sheet, a.sheet_env)
   local steps = S.tour.steps
   local at = a.at or (#steps + 1)
@@ -4970,6 +5297,7 @@ H.step = function(a)
     panel_open() -- before rendering, so the first note is wrapped to the final window width
   end
   local step = make_step(a, at, buf, l1, l2, link, from)
+  step.parts = parts
   add_step(step, { jump = do_jump })
   rerender_all() -- the steps next to the new one show links to it
   if do_jump then
@@ -5011,8 +5339,22 @@ H.edit = function(a)
     or { file = step.file, ref = step.ref, sha = step.sha, diagram = step.diagram }
   local l1, l2 = a.l1 or step.l1, a.l2 or a.l1 or step.l2
   local buf = step.buf
+  local parts = step.parts
   if moved or not step.lost then -- a lost step has no lines to check; only a new location gives it some
     buf, l1, l2 = checked_range(loc, l1, l2, a.expect)
+    -- New parts replace the old ones ({} removes them); the old ones are checked again on the lines.
+    local specs = a.parts
+    if specs == nil then
+      specs = {}
+      for i, p in ipairs(step.parts or {}) do
+        specs[i] = p.src
+      end
+    end
+    local note = a.note
+    if note == nil then
+      note = step.note
+    end
+    parts = part.resolve(specs, note, buf, l1, l2, loc.lines)
   end
   if moved then
     step.query, step.resolved_from = a.query, a.resolved_from
@@ -5035,8 +5377,9 @@ H.edit = function(a)
     step.note = a.note ~= "" and a.note or nil
   end
   if a.expect ~= nil then
-    step.expect = expect_list(a.expect) -- the new list replaces the old one; '' removes it
+    step.expect = part.expect_list(a.expect) -- the new list replaces the old one; '' removes it
   end
+  step.parts = parts
   if a.via ~= nil then
     step.via = a.via ~= "" and a.via or nil
   end
@@ -5702,6 +6045,7 @@ local function apply_tour(a)
           end
         end
         local buf, l1, l2 = checked_range(st, st.l1 or 0, st.l2 or st.l1 or 0, st.expect, lines)
+        local parts = part.resolve(st.parts, st.note, buf, l1, l2, lines)
         if st.from and (st.from < 1 or st.from > base + i - 1) then
           fail(("from %d: no such step before this one (%d step(s) come before it)"):format(st.from, base + i - 1), 6)
         end
@@ -5717,7 +6061,7 @@ local function apply_tour(a)
           running = pending_name
         end
         running = chapter or running
-        plan[i] = { st = st, l1 = l1, l2 = l2, link = link, chapter = chapter, in_chapter = running, text = first_text(buf, lines, l1) }
+        plan[i] = { st = st, l1 = l1, l2 = l2, parts = parts, link = link, chapter = chapter, in_chapter = running, text = first_text(buf, lines, l1) }
       end)
     end
   end
@@ -5798,6 +6142,7 @@ local function apply_tour(a)
       local buf = loc_buf(st)
       local from = st.from and S.tour.steps[st.from] or nil
       local step = make_step(st, #S.tour.steps + 1, buf, p.l1, p.l2, p.link, from)
+      step.parts = p.parts
       add_step(step, { jump = false, render = false })
       if p.chapter then
         set_chapter(p.chapter, step)
@@ -5875,7 +6220,8 @@ H.status = function()
       note = s.note,
       via = s.via,
       from = explicit_from(s) and s.from.n or nil,
-      expect = expect_list(s.expect),
+      expect = part.expect_list(s.expect),
+      parts = part.specs(s),
       suggest = s.suggest,
       sheet = s.sheet and sheet_label(s.sheet) or nil,
     }

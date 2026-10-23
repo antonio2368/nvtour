@@ -28,6 +28,7 @@ Neovim in parallel. You step through the tour with `]w` / `[w`.
 |---|---|
 | 🎯 **Jump and highlight** | Moves to a range and marks it, without changing the colours of the code. |
 | 📝 **Inline notes** | Attaches a note as virtual text, with `` `code` `` and `**bold**`. |
+| 🧷 **Parts** | `[words](a)` in a note links a word, a sentence or a paragraph to a part of the range. `]r` / `[r` focus one part at a time. |
 | 🔗 **Links between steps** | `--via` tells why the tour goes to a step. Each step shows where you came from, a change of file or version, and where `]w` goes next. |
 | 🚦 **Roles** | Each step is a `fault`, `flow`, `fix`, `context` or `info`, each in its own colour. |
 | 📋 **Step panel** | A side panel lists the steps by file, with a markdown summary. |
@@ -139,6 +140,8 @@ An agent makes the same tour in one call with [`nvtour apply`](#tour-files-apply
   (`--expect 'refresh(key)' --expect 'it->second'`); each text must be in the range.
 - **Notes are wrapped** to the window width. Two inline markdown forms are shown: `` `code` `` and
   `**bold**` (the markers are hidden).
+- **`--part SPEC`** names a part of the range (`a`, then `b`, ...) that the note links to with `[words](a)`.
+  See [Parts](#parts).
 - **A jump scrolls** so that the note and the range are in view: centred when they fit, else the note at the
   top, and never past the end of the file. The range flashes briefly after a jump.
 
@@ -175,8 +178,9 @@ split = "above"
 at = "src/a.cpp:/it->second/"        # FILE:L1[-L2] or any text range
 role = "fault"
 label = "dangling iterator"
-note = "The iterator is used after `erase()` invalidated it."
+note = "[The iterator](a) is used after `erase()` invalidated it."
 expect = ["it->second"]              # list or one string
+parts = [{ at = "/it->second/", text = "it" }]  # list of L1[-L2], /TEXT/... or { at, text }
 suggest = """
         it->second.expires_at += ttl;
 """                                  # string with new lines, or a list of lines
@@ -204,7 +208,8 @@ EOF
 - **The keys** of `[[focus]]`, `[[diagram]]` and `[[step]]` are the options of `focus`, `diagram` and `step`.
   `[[diagram]]` also takes `ascii`, `header` and `show` (`show = false` is `--no-show`), and needs one of
   `source` and `file`. A step must have `at`; a focus must have `file` and `ranges`. `ref` and `diagram` do
-  not go together on one step. `suggest` and `expect` take a string or a list. A chapter is a key of the
+  not go together on one step. `suggest` and `expect` take a string or a list. `parts` is a list of
+  ranges, each `L1[-L2]`, a text range or `{ at = "...", text = "..." }` (`--part AT --part-text TEXT`). A chapter is a key of the
   step (`chapter = "Name"`): there is no `[[chapter]]` table. The steps are added in the order of the file, so `at` is a location, not a number.
 - **Unknown keys** and wrong types are exit 2, and the message names the entry. The entries are numbered
   from 1 in the order of the file: `step[3]: unknown key "lable" (did you mean "label"?)`.
@@ -268,6 +273,52 @@ nvtour step src/a.cpp:/erase/~120                  # the line with "erase" that 
   first line. With `--json` the field `resolved_from` has the text range (`/Cache::get/`).
 - The text is searched once, when the command runs. After that the step follows your edits like any step
   (see [Steps follow your edits](#steps-follow-your-edits)). `--expect` still checks the exact expression in the found lines.
+
+### Parts
+
+A note often explains several places of its range: a lookup, a call, a read. Parts let the note say which
+words are about which place, without quoting the code. Give the places with `--part`, in order: the first
+one is part `a`, then `b`, `c`, ... (at most 26). Then link any words of the note to them with
+`[words](a)`. The words can be one word, a sentence or a whole line of the note.
+
+```sh
+nvtour step src/cache.cpp:/std::string get(/+8 --role fault \
+    --part /entries.find/ --part-text 'entries.find(key)' \
+    --part /entries.find/ --part-text it \
+    --part '/refresh(key)/' \
+    --note - <<'EOF'
+[It finds the entry](a) and keeps [the iterator](b).
+[Then `refresh(key)` moves the node out and back in](c), so the read is invalid.
+EOF
+```
+
+```
+╭ It finds the entry (a) and keeps the iterator (b).          the words are dotted, "(a)" is dim
+╰ Then refresh(key) moves the node out and back in (c), so the read is invalid.
+16      auto it = entries.find(key);        (a, b)
+19      refresh(key);                       (c)
+```
+
+- **A part** is lines of the range: `L1[-L2]` (lines of the file) or a text range (`/TEXT/`, `/A/../B/`,
+  `/TEXT/+2`, ...), which is searched in the lines of the step only. `--part-text TEXT` (in a tour file
+  `{ at = "...", text = "..." }`) narrows it to an expression in those lines: it gets a dotted underline.
+- **In the code,** the first line of each part ends with its letter: `(a)`. The parts that start on the
+  same line share one tag: `(a, b)`. Nothing goes between the characters of the code.
+- **In the note,** the linked words get a dotted underline and a dim `(a)` after them. `[words](a,c)` links
+  to two parts: `(a, c)`. Put the punctuation after the link (`[It finds the entry](a).`).
+- **Focus:** `]r` focuses part `a`, then `b`, ...; after the last part the focus ends (`[r` goes back). The
+  rest of the range is dimmed: the other lines, and on the lines of the part all but its expression (a part
+  without one keeps its whole lines). Its letter in the code is bright, and the words linked to it get a
+  light background. The focus ends when the step is not the current step any more.
+- **In the step card** (side view), the links look the same. The cursor on a link focuses its part; moving
+  off the links ends that focus.
+- **Checks** (exit 6): a part that is not in the range, a text range that is not found in the lines of the
+  step, a `--part-text` that is not in the lines of its part, and a link to a part that the step does not
+  have (`the note links to part c, but the step has parts a-b`). A link whose target is not single letters
+  (`[see](note)`) stays as typed.
+- `edit N --part ...` replaces the parts (`--part ''` removes them). An `edit` without `--part` checks the
+  old parts again on the new lines and the new note. `status --json` lists the parts of each step
+  (`a: /entries.find/ (lines 16-16) ...`).
 
 ### Chapters
 
@@ -688,8 +739,8 @@ nvtour step src/cache.cpp:31-38 --label "load from the store" --via 'a miss call
 | command | what it does |
 |---|---|
 | `start [TITLE] [--sheet SHEET]` | start a new tour (keeps an open panel); `--sheet`: the sheet of the tour |
-| `step FILE:L1[-L2]\|FILE:/TEXT/ [--ref GITREF] [--note TEXT\|-] [--label] [--role] [--expect TEXT]... [--via TEXT] [--from N] [--suggest TEXT\|-] [--at N] [--sheet SHEET#STEP] [--jump\|--no-jump]` | add a step (`--ref`: on the file at that git ref; `--via`: why the tour goes there from the step before, or from step `--from N`; `--suggest`: the code that would replace the range; `--sheet`: show that step of a [sheet](#sheets) when the step becomes current) |
-| `edit N [FILE:L1[-L2]\|FILE:/TEXT/ [--ref GITREF]] [--note] [--label] [--role] [--expect] [--via] [--from N] [--suggest] [--sheet SHEET#STEP] [--jump]` | change a step (`''` removes a label, note, link text, suggestion, sheet link or the `--expect` texts; a new `--expect` list replaces the old one; `--from 0` links from the step before again; a new location without `--ref` is on the working tree) |
+| `step FILE:L1[-L2]\|FILE:/TEXT/ [--ref GITREF] [--note TEXT\|-] [--label] [--role] [--expect TEXT]... [--part AT [--part-text TEXT]]... [--via TEXT] [--from N] [--suggest TEXT\|-] [--at N] [--sheet SHEET#STEP] [--jump\|--no-jump]` | add a step (`--ref`: on the file at that git ref; `--via`: why the tour goes there from the step before, or from step `--from N`; `--suggest`: the code that would replace the range; `--sheet`: show that step of a [sheet](#sheets) when the step becomes current) |
+| `edit N [FILE:L1[-L2]\|FILE:/TEXT/ [--ref GITREF]] [--note] [--label] [--role] [--expect] [--part [--part-text]] [--via] [--from N] [--suggest] [--sheet SHEET#STEP] [--jump]` | change a step (`''` removes a label, note, link text, suggestion, sheet link or the `--expect` texts; a new `--expect` list replaces the old one; `--from 0` links from the step before again; a new location without `--ref` is on the working tree) |
 | `step L1[-L2] --diagram NAME [...]`, `edit N L1[-L2] --diagram NAME` | a step on lines of a diagram |
 | `remove N` | remove a step |
 | `apply [FILE\|-] [--append] [--check] [--no-jump]` | a whole tour from a TOML or JSON file: a new tour by default; `--append` adds to the current tour; `--check` only checks (see [Tour files](#tour-files-apply)) |
@@ -741,13 +792,15 @@ is skipped. The tour keys are set when a tour starts and removed by `clear`. The
 | `<leader>ws` | hide / show the step card of the side view (turns the side view on) |
 | `<leader>wr` | next range style of the side view (turns the side view on) |
 | `<leader>wa` | turn the [animation](#animation) of jumps on or off |
+| `]r` / `[r` | focus the next / previous [part](#parts) of the current step (after the last one: no focus) |
 | `<leader>wm` / `<leader>wM` | mark the cursor line or the selection for the agent / the same, then ask for a comment (see [Marks](#marks)); normal and visual mode; always installed, also without a tour |
 | `<leader>wc` | clear everything |
 
 **In the panel:** `<CR>` jumps to the step under the cursor (on a chapter line, a file name or a link line: the
 step after it), `K` peeks at that step, `q` closes the panel.
 
-**In the step card:** `<CR>` on the Next or Previous block goes to that step, `q` hides the card.
+**In the step card:** `<CR>` on the Next or Previous block goes to that step, `q` hides the card. The cursor
+on a link of the note focuses its [part](#parts).
 
 **In a diagram:** `<CR>` on an underlined link text opens its code; elsewhere it moves down as usual.
 
@@ -810,6 +863,8 @@ In the names below, `{...}` is one of `Fault`, `Flow`, `Fix`, `Context`, `Info`.
 | `NvtourSign{...}` | the bar, the step number in the end-of-line marker, the panel and the winbar |
 | `NvtourLabel{...}` | end-of-line label |
 | `NvtourMark{...}` | the `--expect` texts |
+| `NvtourPartLink`, `NvtourPartText` | the linked words of a note, the expression of a [part](#parts) (dotted) |
+| `NvtourPartRef`, `NvtourPartRefOn`, `NvtourPartFocus` | the `(a)` tags, the letter of the focused part, the words linked to it |
 | `NvtourStrike`, `NvtourSuggest` | the lines that a suggestion replaces, suggested code without a syntax group |
 | `NvtourNote`, `NvtourNoteCode`, `NvtourNoteBold` | the note of the current step |
 | `NvtourNoteCollapsed` | one-line note of the other steps |

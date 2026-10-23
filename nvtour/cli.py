@@ -44,6 +44,19 @@ class Parser(argparse.ArgumentParser):
         raise NvtourError(EXIT_USAGE, f"{self.prog}: {message}\n{self.format_usage().strip()}")
 
 
+class PartText(argparse.Action):
+    """``--part-text TEXT``: the expression of the ``--part`` just before it."""
+
+    def __call__(self, parser: argparse.ArgumentParser, namespace: argparse.Namespace, values: Any,
+                 option_string: str | None = None) -> None:
+        parts = namespace.part
+        if not parts:
+            parser.error("--part-text needs a --part before it")
+        if isinstance(parts[-1], dict):
+            parser.error(f"--part {parts[-1]['at']!r} has a text already (one --part-text for each --part)")
+        parts[-1] = {"at": parts[-1], "text": values}
+
+
 def positive_float(text: str) -> float:
     try:
         value = float(text)
@@ -156,6 +169,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--expect", metavar="TEXT", action="append",
                    help="fail (exit 6) unless TEXT occurs in the range; TEXT is underlined in the current step "
                         "(repeat it for more texts)")
+    p.add_argument("--part", metavar="L1[-L2]|/TEXT/", action="append",
+                   help="a part of the range that the note links to with [words](a) (the first part is a, "
+                        "then b, ...); a text range is found in the lines of the step (repeat it for more parts)")
+    p.add_argument("--part-text", metavar="TEXT", action=PartText,
+                   help="an expression in the lines of the --part just before it, dotted in the code")
     p.add_argument("--via", metavar="TEXT", help="why the tour goes to this step from the step before it (or from --from N)")
     p.add_argument("--suggest", metavar="TEXT", help="code that would replace the range, shown below it (read-only), "
                    "or - to read stdin")
@@ -179,6 +197,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--expect", metavar="TEXT", action="append",
                    help="fail (exit 6) unless TEXT occurs in the range; TEXT is underlined in the current step "
                         "(repeat it for more texts; the list replaces the old one; '' removes it)")
+    p.add_argument("--part", metavar="L1[-L2]|/TEXT/", action="append",
+                   help="a part of the range that the note links to with [words](a) (the first part is a, "
+                        "then b, ...); a text range is found in the lines of the step (repeat it for more parts; the list replaces the old one; '' removes it)")
+    p.add_argument("--part-text", metavar="TEXT", action=PartText,
+                   help="an expression in the lines of the --part just before it, dotted in the code")
     p.add_argument("--via", metavar="TEXT", help="new link text, '' to remove")
     p.add_argument("--suggest", metavar="TEXT", help="new suggested code, - to read stdin, '' to remove")
     p.add_argument("--from", dest="from_", type=non_negative_int, metavar="N", help="the link comes from step N (0: the step before it)")
@@ -442,6 +465,40 @@ def _strings(message: str = "must be a list of strings") -> Any:
     return check
 
 
+def _parts(value: Any) -> list[Any]:
+    """A list of parts: each one ``L1[-L2]``, a text range, or a table ``{ at, text }``."""
+    message = 'must be a list of strings and tables { at = "...", text = "..." }'
+    if not isinstance(value, list):
+        raise ValueError(message)
+    for i, item in enumerate(value, 1):
+        if isinstance(item, str):
+            continue
+        if not isinstance(item, dict):
+            raise ValueError(message)
+        for key in item:
+            if key not in ("at", "text"):
+                raise ValueError(f'item {i}: unknown key "{key}" (the keys are: at, text)')
+        if not isinstance(item.get("at"), str):
+            raise ValueError(f'item {i}: "at" must be a string')
+        if not isinstance(item.get("text", ""), str):
+            raise ValueError(f'item {i}: "text" must be a string')
+    return value
+
+
+def part_args(parts: list[Any]) -> list[dict[str, Any]]:
+    """Lua args of the parts of a step: ``{l1, l2}`` or ``{query}``, with ``text`` and ``spec``."""
+    out = []
+    for item in parts:
+        at, text = (item["at"], item.get("text")) if isinstance(item, dict) else (item, None)
+        l1, l2, query = ranges.parse_range_or_query(at)
+        arg: dict[str, Any] = {"query": lua_query(query)} if query else {"l1": l1, "l2": l2}
+        arg["spec"] = at
+        if text:
+            arg["text"] = text
+        out.append(arg)
+    return out
+
+
 def _one_or_more(value: Any) -> list[str]:
     """One string or a list of strings, as a list."""
     return [value] if isinstance(value, str) else _strings("must be a string or a list of strings")(value)
@@ -462,7 +519,7 @@ DIAGRAM_KEYS: dict[str, Any] = {
 }
 STEP_KEYS: dict[str, Any] = {
     "at": _name, "ref": _name, "diagram": _name, "role": _choice(ROLES), "label": _string, "note": _string,
-    "expect": _one_or_more, "via": _string, "from": _integer(1), "suggest": _lines, "sheet": _string,
+    "expect": _one_or_more, "parts": _parts, "via": _string, "from": _integer(1), "suggest": _lines, "sheet": _string,
     "chapter": _name,
 }
 TOUR_TABLES = {"focus": (FOCUS_KEYS, ["file", "ranges"]), "diagram": (DIAGRAM_KEYS, ["name"]),
@@ -623,6 +680,8 @@ def tour_step(st: dict[str, Any], blobs: dict[tuple[str, str], tuple[gitutil.Blo
             req[key] = st[key]
     if st.get("expect"):
         req["expect"] = st["expect"]
+    if st.get("parts"):
+        req["parts"] = part_args(st["parts"])
     link = parse_sheet_link(st["sheet"]) if "sheet" in st else ""
     if link:
         req["sheet"] = link
@@ -688,12 +747,14 @@ def build_request(args: argparse.Namespace, workspace: str) -> tuple[str, dict[s
     if c == "step":
         return "step", {**base, **location(args.spec, args.ref, args.diagram), "note": read_text_arg(args.note, "--note -"),
                         "label": args.label, "role": args.role, "expect": args.expect, "via": args.via,
+                        "parts": part_args(args.part) if args.part else None,
                         "suggest": read_text_arg(args.suggest, "--suggest -"), "from": args.from_, "at": args.at, "jump": args.jump or None, "no_jump": args.no_jump or None,
                         "sheet": parse_sheet_link(args.sheet) if args.sheet is not None else None,
                         "sheet_env": sheet_env() if args.sheet else None}
     if c == "edit":
         req: dict[str, Any] = {**base, "n": args.n, "note": read_text_arg(args.note, "--note -"), "label": args.label,
                                "role": args.role, "expect": args.expect, "via": args.via, "from": args.from_,
+                               "parts": None if args.part is None else part_args([p for p in args.part if p != ""]),
                                "suggest": read_text_arg(args.suggest, "--suggest -"),
                                "jump": args.jump or None,
                                "sheet": parse_sheet_link(args.sheet) if args.sheet is not None else None,

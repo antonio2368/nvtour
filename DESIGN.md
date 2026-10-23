@@ -150,11 +150,12 @@ nvtour where
 nvtour marks [--wait SECONDS] [--clear]
 nvtour start [TITLE] [--sheet SHEET]
 nvtour step FILE:L1[-L2] | FILE:/TEXT/... [--ref GITREF] [--note TEXT | --note -] [--label TEXT] [--role ROLE]
-            [--expect TEXT]... [--via TEXT] [--from N] [--suggest TEXT | --suggest -] [--at N]
+            [--expect TEXT]... [--part AT [--part-text TEXT]]... [--via TEXT] [--from N]
+            [--suggest TEXT | --suggest -] [--at N]
             [--sheet SHEET#STEP] [--jump | --no-jump]
 nvtour step L1[-L2] | /TEXT/... --diagram NAME [the same options]
 nvtour edit N [FILE:L1[-L2] | FILE:/TEXT/... [--ref GITREF] | L1[-L2] | /TEXT/... --diagram NAME] [--note TEXT | --note -]
-            [--label TEXT] [--role ROLE] [--expect TEXT]... [--via TEXT] [--from N]
+            [--label TEXT] [--role ROLE] [--expect TEXT]... [--part AT [--part-text TEXT]]... [--via TEXT] [--from N]
             [--suggest TEXT | --suggest -] [--sheet SHEET#STEP] [--jump]
 nvtour remove N
 nvtour apply [FILE | -] [--append] [--check] [--no-jump]
@@ -252,7 +253,12 @@ msgpack) and `resolved_from` instead of `l1` and `l2`.
   (`  L1| text`). `--expect TEXT` fails with exit 6 unless `TEXT` occurs in the range; it can be
   given more than one time, then each text must occur (the error names the first one that does not,
   and tells where it is in the file: `; it is on lines 231, 400` (at most 3, the nearest first) or
-  `; it is not in the file`; in `edit` the new list replaces the old one, `''` removes it). `--note -`
+  `; it is not in the file`; in `edit` the new list replaces the old one, `''` removes it).
+  `--part AT` (repeated) gives the parts of the step (§6, "Parts"): `L1[-L2]` or a text range, which
+  Python parses (`part_args`: `{l1, l2}` or `{query}`, with `spec` = AT) and Lua resolves in the lines
+  of the step; `--part-text TEXT` (argparse action `PartText`) adds the expression of the `--part`
+  before it (exit 2 without one, or for a second text). In `edit` the new list replaces the old one,
+  `--part ''` removes it. `--note -`
   reads the note from stdin (lets agents pass multi-line text with a heredoc). A step is added only
   after it rendered (and jumped); on an error nothing of it remains. `--ref GITREF` puts the step on
   the file as it is at that git ref, not on the working tree (§6, "Steps at a git ref"); the output
@@ -372,7 +378,7 @@ M.state = {
 }
 ```
 
-Each step: `{ n, file, buf, l1, l2, role, label, note, expect, via, from, suggest, sheet, ref, sha, diagram, extmark_ids = {},
+Each step: `{ n, file, buf, l1, l2, role, label, note, expect, parts, via, from, suggest, sheet, ref, sha, diagram, extmark_ids = {},
 anchor, anchor_buf, lost, lost_reason, orig_l1, orig_l2, query, resolved_from }`.
 `anchor` is the id of the anchor extmark (in `ns_anchor`, in buffer `anchor_buf`); a step on a diagram has none.
 `l1` and `l2` are the lines that the anchor had at the last sync. `lost` is true when the lines of
@@ -529,6 +535,7 @@ For a step at `l1..l2` in buffer `buf` (0-based rows internally):
    `hl_group = NvtourMark<Role>`, `priority = 150`.
 4. **Marker** — on `l1`, for every step: `virt_text = { {"  ← ", NvtourLabel<Role>}, {n,
    NvtourSign<Role>}, {" " .. label, NvtourLabel<Role>} }` (no label: `← n`), `virt_text_pos = "eol"`.
+   The part tag of `l1` (below) follows in the same extmark.
 5. **Jump** (first step of a tour, or `--jump`; never with `--no-jump`) — show the buffer in the
    tour window, then `make_current(step, win, { scroll = true })`: set `tour.current = n`,
    re-render the old and the new current step, set the winbar, and scroll (in that window via
@@ -576,6 +583,41 @@ the numbers before the range checks and the `--expect` check; `checked_range` re
 buffer. `H.step` and `H.edit` store `query` and `resolved_from` in the step; `step_result` returns
 `resolved_from`. The text is searched in the buffer, so unsaved edits count, and once: after that the
 step has an anchor like any other.
+
+### Parts
+
+`step.parts` is a list of `{ o1, o2, text, spec, src }`: the lines of part `i` (letter
+`part.letter(i)`, `a` to `z`) as offsets from `l1`, so a part moves with its step; an optional
+expression `text`; `spec` (the range as the agent gave it, for `status`); `src` (the CLI spec, so
+`edit` can check the part again on new lines). `part.lines(step, p)` gives the lines, clipped to the
+range. The functions are in one table `part` (with `part.expect_list`): the main chunk has at most
+200 local variables.
+
+- **Check** (`part.resolve`, in `step`, `edit` and phase 1 of `apply`, after `checked_range`): a
+  `{query}` is resolved with `resolve_query` in the lines of the step only; `{l1, l2}` must be inside
+  the range; `text` must be in the lines of the part; at most 26 parts; every link of the note must
+  name a part. All failures are exit 6 and name the part (`part b (/nope/): ...`).
+- **Links** in notes: `parse_inline(s, links)` reads `[words](a)` and `[words](a,c)` (the target is
+  single letters joined by commas; anything else stays as typed). Without `links` (collapsed notes,
+  peek, titles, `--via`) a link is its words. With `links` (the note of the current step) the words
+  get the kind `{ base, refs }` and a segment `"\u00a0(a,\u00a0c)"` with kind `{ ref }` follows (no-break
+  spaces: it stays on the line of the last word). `part.link_hl` maps them: the words
+  `{ <base group>, NvtourPartLink }` (+ `NvtourPartFocus` when they link to the focused part), the
+  marker `NvtourPartRef` (or `NvtourPartRefOn`).
+- **Code** (current step, both views): on the first line of each part an eol tag `"  (a)"` in
+  `NvtourPartRef`, one per line for the parts that start there (`"  (a, b)"`); the focused letter in
+  `NvtourPartRefOn`. On `l1` (inline view) the tag follows the marker. Each occurrence of `text` in the
+  lines of its part: `NvtourPartText` (underdotted), `priority = 140`.
+- **Focus** (`S.part_focus = { step, k, card }`, `part.focused(step)`): `]r` / `[r` (`H.part`, with
+  `dir` or `k`; `k = 0` ends it) go to the next / previous part; past the ends the focus ends. The other
+  lines of the range get `NvtourDim` (`priority = 200`); on the lines of the focused part, when it has a
+  `text`, so does everything but its occurrences. A render of the step when it is not current ends
+  the focus. `part.redraw(step)` draws the step and the links of the card again (not the whole card,
+  so its cursor stays).
+- **Card:** the note rows (`S.card.note_rows`) stay raw markdown, whose conceal shows the words of a
+  link. `part.card_marks` (namespace `nvtour_parts`) puts `NvtourPartLink` on each link and an inline
+  `" (a)"` after it. A buffer-local `CursorMoved` (`part.card_cursor`) focuses the first part of the
+  link under the cursor, and ends a focus that it started when the cursor leaves the links.
 
 ### Steps at a git ref
 
@@ -1240,14 +1282,15 @@ visual mode, and are free only when `maparg` is empty in both modes. Global norm
 and skip that key. `vim.g.nvtour_keys` is read (missing entries use the defaults), never written.
 
 The actions are in two sets. `KEYS.tour` is `next`, `prev`, `first`, `last`, `panel`, `clear`, `next_chapter`,
-`prev_chapter`, `peek`, `view`, `card`, `range_style` and `animate`. `KEYS.always` is `mark` and `mark_note`.
+`prev_chapter`, `peek`, `view`, `card`, `range_style`, `animate`, `part_next` and `part_prev`. `KEYS.always` is
+`mark` and `mark_note`.
 
 ```lua
 DEFAULT_KEYS = {
   next = "]w", prev = "[w", first = "[W", last = "]W", panel = "<leader>wp", clear = "<leader>wc",
   next_chapter = "]c", prev_chapter = "[c", peek = "<leader>wk",
   view = "<leader>wv", card = "<leader>ws", range_style = "<leader>wr",
-  animate = "<leader>wa", mark = "<leader>wm", mark_note = "<leader>wM",
+  animate = "<leader>wa", part_next = "]r", part_prev = "[r", mark = "<leader>wm", mark_note = "<leader>wM",
 }
 ```
 
@@ -1378,8 +1421,9 @@ split = "above"
 at = "src/a.cpp:/it->second/"        # FILE:L1[-L2] or any text range
 role = "fault"
 label = "dangling iterator"
-note = "The iterator is used after `erase()` invalidated it."
+note = "[The iterator](a) is used after `erase()` invalidated it."
 expect = ["it->second"]              # list or one string
+parts = [{ at = "/it->second/", text = "it" }]  # list of L1[-L2], /TEXT/... or { at, text }
 suggest = """
         it->second.expires_at += ttl;
 """                                  # string with new lines, or a list of lines
@@ -1407,7 +1451,7 @@ from = 1                             # optional: the link comes from step 1 (an 
 | top level | `title`, `sheet`, `panel` (strings); the tables `focus`, `diagram`, `step` | none |
 | `[[focus]]` | `file` (string), `ranges` (list of `L1[-L2]` or text ranges `/TEXT/...`), `dim` (bool), `context` (int ≥ 0, default 2) | `file`, `ranges` |
 | `[[diagram]]` | `name`, `format` (`mermaid`, `dot`, `easy`, `text`), `source` (string) or `file` (path), `links` (list of `TEXT=FILE:L1[-L2]` or `TEXT=FILE:/TEXT/`), `split` (`above`, `below`, `left`, `right`, `full`), `ascii` (bool), `header` (int ≥ 0), `show` (bool, default true) | `name`, and exactly one of `source` and `file` |
-| `[[step]]` | `at`, `ref`, `diagram`, `role`, `label`, `note`, `expect` (string or list), `via`, `from` (int ≥ 1), `suggest` (string or list of lines), `sheet`, `chapter` | `at` |
+| `[[step]]` | `at`, `ref`, `diagram`, `role`, `label`, `note`, `expect` (string or list), `parts` (list of strings and `{ at, text }` tables), `via`, `from` (int ≥ 1), `suggest` (string or list of lines), `sheet`, `chapter` | `at` |
 
 The keys have the meaning of the options of the commands of the same names (`step`, `focus`,
 `diagram`, `start`): `at` is the location argument of `step` (`FILE:L1[-L2]` or `FILE:/TEXT/...`; with

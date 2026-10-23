@@ -50,7 +50,7 @@ Use this when the user asks about code ("this", "here", "this chunk") but gives 
    EOF
    ```
 
-   - Keys: top level `title`, `sheet`, `panel`, `[[focus]]`, `[[diagram]]`; `[[step]]` `at` (required), `role`, `label`, `note`, `expect`, `via`, `from`, `suggest`, `sheet`, `ref`, `chapter`, `diagram`.
+   - Keys: top level `title`, `sheet`, `panel`, `[[focus]]`, `[[diagram]]`; `[[step]]` `at` (required), `role`, `label`, `note`, `expect`, `parts`, `via`, `from`, `suggest`, `sheet`, `ref`, `chapter`, `diagram`.
    - Check the echoed `step N/T` lines of every step. Run `apply --check` first when the tour is long or uses `ref`: it changes nothing. A failure lists every bad entry at once (`step[4]: ...`, one per line): fix them all in one edit of the tour file, then run it again. Use `step`, `edit` and `remove` only for fixes and for one more step in a tour that is open.
 3. Interleave with your chat explanation: one step per point.
    - Use 3 to 8 steps. One idea per step.
@@ -94,7 +94,9 @@ Use this when the user asks about code ("this", "here", "this chunk") but gives 
 - Note: readable cold. A one-line lead sentence, then short paragraphs split by blank lines; numbered lists for sequences, bullet lists for cases or outcomes. Explain what the names and values in the range mean, in several sentences when needed. Label: at most 6 words.
 - Roles: `fault` = wrong line(s); `flow` = how data or control gets there; `fix` = where or how it should change; `context` = background; `info` = neutral explanation (default).
 - Name identifiers in the note. The highlight already shows the location.
-- Put identifiers in backticks (`` `erase()` ``); `**bold**` also works. Other markdown is shown as typed.
+- Put identifiers in backticks (`` `erase()` ``); `**bold**` also works. Other markdown is shown as typed, except links to parts (below).
+- **Parts:** when a note explains several places of its range, give each place as a part, in the order the note names them: `parts = ["/entries.find/../return {}/", { at = "/return it/", text = "it->second" }]` in a tour file, or `--part AT [--part-text TEXT]` on `step`. The first part is `a`, then `b`, ... A part is lines of the range (`L1[-L2]` or a text range, searched in the lines of the step only); `text` narrows it to one expression in those lines. Then link the words of the note that are about a part: `[It finds the entry](a) and keeps [the iterator](b).` The words can be one word, a sentence or a whole line; `[words](a,c)` links to two parts. Put punctuation after the link, not inside it. Do not link the lead sentence. A link must be on one line of the note.
+- Give a part `text` when it shares a line with another part, so that `]r` can show one of them alone. Use at most 4 parts; split a step that needs more. Do not give parts to a step whose note is about the whole range.
 - Only the current step shows its full note; the others show the first line. Make the first sentence of a note stand alone.
 - Text that starts with `-`: write `--note=TEXT`, `--label=TEXT` or `--via=TEXT`.
 - Multi-line notes: in a tour file, `note = """...` with the lines, and `"""` at the end. On a single `step` (a fix), `--note -` with a heredoc:
