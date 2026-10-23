@@ -150,6 +150,20 @@ def test_panel_enter_jumps_to_step(cli, nv):
     assert nv.current.buffer.name.endswith("a.txt")
 
 
+def test_a_click_in_the_panel_jumps_to_step(cli, nv):
+    ok(cli("start", "Click"))
+    ok(cli("step", "a.txt:3-4", "--label", "one"))
+    ok(cli("step", "b.txt:9", "--label", "two"))
+    ok(cli("goto", "2"))
+    pb = find_buf(nv, "nvtour://panel")
+    win = [w for w in nv.windows if w.buffer.handle == pb.handle][0]
+    nv.current.window = win
+    win.cursor = (3, 0)  # step 1 line; a click has moved the cursor there before the release
+    nv.input("<LeftRelease>")
+    nv.command("sleep 50m")
+    assert nv.exec_lua("return _G.nvtour.state.tour.current") == 1
+
+
 def test_focus_fold_and_unfocus(cli, nv):
     nv.command("edit a.txt")
     win = nv.current.window

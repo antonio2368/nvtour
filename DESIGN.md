@@ -608,16 +608,22 @@ range. The functions are in one table `part` (with `part.expect_list`): the main
   `NvtourPartRef`, one per line for the parts that start there (`"  (a, b)"`); the focused letter in
   `NvtourPartRefOn`. On `l1` (inline view) the tag follows the marker. Each occurrence of `text` in the
   lines of its part: `NvtourPartText` (underdotted), `priority = 140`.
-- **Focus** (`S.part_focus = { step, k, card }`, `part.focused(step)`): `]r` / `[r` (`H.part`, with
-  `dir` or `k`; `k = 0` ends it) go to the next / previous part; past the ends the focus ends. The other
-  lines of the range get `NvtourDim` (`priority = 200`); on the lines of the focused part, when it has a
-  `text`, so does everything but its occurrences. A render of the step when it is not current ends
+- **Focus** (`S.part_focus = { step, ks, card }`: the sorted numbers of the focused parts, set by
+  `part.set_focus`; `part.focused(step)` gives them as a set): `]r` / `[r` (`H.part`, with `dir` or `k`;
+  `k = 0` ends it) focus one part, the next after the last focused one / the one before the first;
+  past the ends the focus ends. A link in the card focuses all its parts. The lines of the range that
+  no focused part has get `NvtourDim` (`priority = 200`); on a line whose focused parts all have a
+  `text`, so does everything but their occurrences (a focused part without one keeps its lines). A render of the step when it is not current ends
   the focus. `part.redraw(step)` draws the step and the links of the card again (not the whole card,
   so its cursor stays).
 - **Card:** the note rows (`S.card.note_rows`) stay raw markdown, whose conceal shows the words of a
   link. `part.card_marks` (namespace `nvtour_parts`) puts `NvtourPartLink` on each link and an inline
   `" (a)"` after it. A buffer-local `CursorMoved` (`part.card_cursor`) focuses the first part of the
-  link under the cursor, and ends a focus that it started when the cursor leaves the links.
+  link under the cursor, and ends a focus that it started when the cursor leaves the links. `<CR>` and
+  `<LeftRelease>` in the card run `card_go` (`H.card_go`): on a link, `part.jump(step, ks)` focuses
+  its parts, makes the code window current and puts the cursor on the expression of the first (or on
+  the first non-blank of its first line), or, when those parts are focused already and not only by
+  the cursor (`S.part_focus.card`, `part.focus_is`), ends the focus; on the Next or Previous block it is `goto`.
 
 ### Steps at a git ref
 
@@ -1029,7 +1035,7 @@ ref: `git ref <ref> · <sha12>`, or `commit <sha12>` when the ref is a prefix of
 diagram: none. The window has `statuscolumn = "  "` (`side.MARGIN`): a left margin, also on wrapped lines;
 the rules end the same 2 cells before the right edge.
 `fillchars = "eob: "`, `breakindentopt = "list:-1"` with a `formatlistpat` for `•`, `-`, `*`, `+` and `1.`
-(a wrapped item goes on under its text). Card keys: `<CR>` on a line of the Next or Previous block (`card.line_map`) goes to that step, `q` runs `card`.
+(a wrapped item goes on under its text). Card keys: `<CR>` and `<LeftRelease>` (a click) run `card_go`: on a line of the Next or Previous block (`card.line_map`) it goes to that step, on a link of the note to its part (§6, "Parts"); `q` runs `card`.
 
 `card` hides the card when the side view shows it (`card.user_closed = true`: `side.render` keeps it closed,
 also on jumps), else shows it and sets the side view. `view side` resets `user_closed`, so the side view comes
@@ -1083,7 +1089,7 @@ quickfix item text uses the same. Before the first jump the progress is `N step(
 lists only the keys that were installed (the chapter keys: only when there are chapters); the keys are inline code so markdown does not read
 `[W first · ]W` as a link. A step with a `--via` or `--from` link gets a line `↓ [from N: ]<via>`
 before it, and before its file name line, so a link to another file shows before the file changes.
-`<CR>` on a chapter line, a file name line or a link line jumps to the step after it. The panel opens in the tab of the tour
+`<CR>` or `<LeftRelease>` (a click: the press has moved the cursor) on a step line goes to that step; on a chapter line, a file name line or a link line it jumps to the step after it. The panel opens in the tab of the tour
 window; a panel window left in another tab is closed first.
 
 Paths shown relative to `W` (passed from Python as `workspace`). The current step line gets an

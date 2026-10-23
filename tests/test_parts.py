@@ -170,3 +170,51 @@ def test_the_card_links_focus_their_part(cli, nv, side):  # noqa: F811
     nv.api.win_set_cursor(win, [1, 0])  # off the links: the focus of the cursor ends
     nv.api.exec_autocmds("CursorMoved", {"buffer": buf})
     assert hl(nv, "NvtourDim") == []
+
+
+def test_a_link_to_several_parts_focuses_them_all(cli, nv, side):  # noqa: F811
+    ok(cli("start", "Several"))
+    ok(cli("step", "a.txt:5-8", "--part", "6", "--part-text", "line 6", "--part", "7", "--part", "8",
+           "--note", "Lead.\n[both](a,c) and [one](b)."))
+    dispatch(nv, "view", mode="side")
+    win, lines = card(nv)
+    nv.api.set_current_win(win)
+    nv.api.win_set_cursor(win, [lines.index("[both](a,c) and [one](b).") + 1, 1])
+    nv.feedkeys(nv.replace_termcodes("<LeftRelease>", True, False, True), "x", False)
+    # a (only "line 6") and c (all of line 8) stay bright; line 5, the rest of line 6 and line 7 are dim.
+    assert hl(nv, "NvtourDim") == [(4, 0, 11), (5, 6, 11), (6, 0, 11)]
+    assert nv.current.window.cursor == (6, 0)  # on the expression of the first of them
+    tags = {m[1]: [c[0] for c in m[3]["virt_text"] if c[1] == "NvtourPartRefOn"]
+            for m in step_marks(nv, "a.txt") if m[3].get("virt_text_pos") == "eol"}
+    assert tags == {5: ["a"], 6: [], 7: ["c"]}
+    # From several parts, [r goes on before the first of them (a): no focus; then ]r starts again.
+    assert dispatch(nv, "part", dir=-1).get("part") is None
+    dispatch(nv, "part", dir=1)
+    assert dispatch(nv, "part", dir=1)["part"] == "b"
+
+
+def test_a_click_on_a_link_of_the_card_goes_to_its_part(cli, nv, side):  # noqa: F811
+    ok(cli("start", "Click"))
+    ok(cli("step", "a.txt:5-7", "--part", "6", "--part-text", "of a", "--note", "Lead.\n[one](a) words."))
+    ok(cli("step", "a.txt:20"))
+    ok(cli("goto", "1"))
+    dispatch(nv, "view", mode="side")
+    win, lines = card(nv)
+    nv.api.set_current_win(win)
+    nv.api.win_set_cursor(win, [lines.index("[one](a) words.") + 1, 1])
+    nv.feedkeys(nv.replace_termcodes("<LeftRelease>", True, False, True), "x", False)
+    # The part is focused, and the cursor is in the code on its expression.
+    assert nv.current.window.handle != win and nv.current.buffer.name.endswith("a.txt")
+    assert nv.current.window.cursor == (6, 7)
+    assert hl(nv, "NvtourDim") == [(4, 0, 11), (5, 0, 7), (6, 0, 11)]
+    nv.api.set_current_win(win)  # a second click on the same link ends the focus; the cursor stays
+    nv.api.win_set_cursor(win, [lines.index("[one](a) words.") + 1, 2])
+    nv.api.exec_autocmds("CursorMoved", {"buffer": nv.exec_lua("return _G.nvtour.state.card.buf")})
+    nv.feedkeys(nv.replace_termcodes("<LeftRelease>", True, False, True), "x", False)
+    assert hl(nv, "NvtourDim") == [] and nv.current.window.handle == win
+    nv.feedkeys(nv.replace_termcodes("<LeftRelease>", True, False, True), "x", False)  # a third: on again
+    assert hl(nv, "NvtourDim") == [(4, 0, 11), (5, 0, 7), (6, 0, 11)]
+    nv.api.set_current_win(win)
+    nv.api.win_set_cursor(win, [lines.index("Next  ]w") + 2, 0])  # the block of the next step
+    nv.feedkeys(nv.replace_termcodes("<CR>", True, False, True), "x", False)
+    assert nv.exec_lua("return _G.nvtour.state.tour.current") == 2

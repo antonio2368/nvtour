@@ -310,8 +310,12 @@ EOF
   rest of the range is dimmed: the other lines, and on the lines of the part all but its expression (a part
   without one keeps its whole lines). Its letter in the code is bright, and the words linked to it get a
   light background. The focus ends when the step is not the current step any more.
-- **In the step card** (side view), the links look the same. The cursor on a link focuses its part; moving
-  off the links ends that focus.
+- **In the step card** (side view), the links look the same. The cursor on a link focuses its parts (all
+  of them for `[words](a,c)`: their lines and expressions stay bright, and their letters light up); moving
+  off the links ends that focus. `<CR>` or a click on a link goes to its parts: they are focused, and the
+  cursor goes into the code, on the expression or the first line of the first of them. A click on a link
+  whose parts are focused already ends the focus. From such a focus, `]r` goes on after the last of them and
+  `[r` before the first.
 - **Checks** (exit 6): a part that is not in the range, a text range that is not found in the lines of the
   step, a `--part-text` that is not in the lines of its part, and a link to a part that the step does not
   have (`the note links to part c, but the step has parts a-b`). A link whose target is not single letters
@@ -490,8 +494,8 @@ first step
 ```
 
 A step at a git ref shows `git ref v1 · <commit>` (or `commit <sha>` when the ref is a hash) instead of the
-working tree. `<CR>` on the Next or Previous block goes to that
-step. `<leader>ws` (or `:NvtourCard`) hides and shows the card, as `<leader>wp` does for the panel; `q` in
+working tree. `<CR>` or a click on the Next or Previous block goes to that
+step, and on a link of the note to its [part](#parts). `<leader>ws` (or `:NvtourCard`) hides and shows the card, as `<leader>wp` does for the panel; `q` in
 the card hides it too. A hidden card keeps the side view, so the code stays clean; `<leader>wv` goes back to
 the inline view.
 
@@ -796,11 +800,15 @@ is skipped. The tour keys are set when a tour starts and removed by `clear`. The
 | `<leader>wm` / `<leader>wM` | mark the cursor line or the selection for the agent / the same, then ask for a comment (see [Marks](#marks)); normal and visual mode; always installed, also without a tour |
 | `<leader>wc` | clear everything |
 
-**In the panel:** `<CR>` jumps to the step under the cursor (on a chapter line, a file name or a link line: the
-step after it), `K` peeks at that step, `q` closes the panel.
+**In the panel:** `<CR>` or a click jumps to the step under the cursor (on a chapter line, a file name or a link
+line: the step after it), `K` peeks at that step, `q` closes the panel.
 
-**In the step card:** `<CR>` on the Next or Previous block goes to that step, `q` hides the card. The cursor
-on a link of the note focuses its [part](#parts).
+**In the step card:** `<CR>` or a click on the Next or Previous block goes to that step, and on a link of the
+note to its [part](#parts) (the cursor goes into the code). The cursor on a link focuses its part. `q` hides
+the card.
+
+A click works with the mouse on (`'mouse'` has `n`, the default). nvtour maps `<LeftRelease>` in the panel and
+the card, so a drag still selects text.
 
 **In a diagram:** `<CR>` on an underlined link text opens its code; elsewhere it moves down as usual.
 

@@ -630,12 +630,46 @@ function part.specs(step)
   return #out > 0 and out or nil
 end
 
---- The number of the focused part of `step` (]r, or the cursor on a link in the card), or nil.
+--- The focused parts of `step` as a set { [k] = true } (]r: one part; a link in the card: all the
+--- parts of the link), or nil. S.part_focus is { step, ks = sorted numbers, card }.
 function part.focused(step)
   local f = S.part_focus
-  if f and f.step == step and S.tour.current == step.n and step.parts and step.parts[f.k] then
-    return f.k
+  if not (f and f.step == step and S.tour.current == step.n and step.parts) then
+    return nil
   end
+  local set = {}
+  for _, k in ipairs(f.ks) do
+    if step.parts[k] then
+      set[k] = true
+    end
+  end
+  return next(set) and set or nil
+end
+
+--- Focus the parts `ks` (a list of numbers; nil or empty: no focus) of `step`; `card`: by the cursor
+--- on a link of the card.
+function part.set_focus(step, ks, card)
+  S.part_focus = (ks and #ks > 0) and { step = step, ks = ks, card = card } or nil
+end
+
+--- The part numbers of the letters `refs` of a link that `step` has, sorted.
+function part.numbers(step, refs)
+  local out = {}
+  for _, l in ipairs(refs) do
+    local k = l:byte() - 96
+    if step.parts and step.parts[k] and not vim.tbl_contains(out, k) then
+      out[#out + 1] = k
+    end
+  end
+  table.sort(out)
+  return out
+end
+
+--- True when the focus of `step` is the parts `ks` (sorted) and not only by the cursor in the card
+--- (`card`: also then).
+function part.focus_is(step, ks, card)
+  local f = S.part_focus
+  return f ~= nil and f.step == step and (card or not f.card) and table.concat(f.ks, ",") == table.concat(ks, ",")
 end
 
 local render_step -- forward declaration
@@ -1551,7 +1585,8 @@ local function map_panel_keys(buf)
   local function map(lhs, fn)
     vim.keymap.set("n", lhs, fn, { buffer = buf, nowait = true, silent = true })
   end
-  map("<CR>", function()
+  -- <CR> or a click (the release: the click has moved the cursor) goes to the step of the line.
+  local function go()
     local n = S.panel.line_map[api.nvim_win_get_cursor(0)[1]]
     if n then
       local res = _G.nvtour.dispatch("goto", { n = n })
@@ -1559,7 +1594,9 @@ local function map_panel_keys(buf)
         notify(res.error, vim.log.levels.WARN)
       end
     end
-  end)
+  end
+  map("<CR>", go)
+  map("<LeftRelease>", go)
   map("q", function()
     _G.nvtour.dispatch("panel", { toggle = true })
   end)
@@ -1735,10 +1772,10 @@ end
 --- parts (parse_inline): the words get a dotted underline, the "(a)" after them is dim; a link to
 --- the focused part has a background.
 function part.link_hl(kind, step)
-  local k = step and part.focused(step)
+  local set = step and part.focused(step) or {}
   local on = false
   for _, l in ipairs(kind.refs or kind.ref) do
-    on = on or (k ~= nil and l == part.letter(k))
+    on = on or set[l:byte() - 96] == true
   end
   if kind.ref then
     return on and "NvtourPartRefOn" or "NvtourPartRef"
@@ -2260,22 +2297,18 @@ render_step = function(step, win)
   end
   -- The parts of the current step: the expression of a part is dotted, the first line of a part
   -- gets "(a)" at its end, one tag for all parts that start there: "(a, b)" (returned: row ->
-  -- chunks; on l1 the step marker comes first). When a part is focused, the rest of the range is
-  -- dimmed: the other lines, and on its own lines all but its expression (a part without one keeps
-  -- its whole lines).
+  -- chunks; on l1 the step marker comes first). When parts are focused, the rest of the range is
+  -- dimmed: the lines of no focused part, and on the lines of focused parts that all have an
+  -- expression, all but those expressions (a part without one keeps its whole lines).
   local function parts()
-    local tags, k = {}, part.focused(step)
+    local tags, set = {}, part.focused(step)
     if not current then
       if S.part_focus and S.part_focus.step == step then
         S.part_focus = nil -- the focus ends when the step is not the current one any more
       end
       return tags
     end
-    local function dim(row, c1, c2)
-      if c2 > c1 then
-        add(row, { end_col = c2, hl_group = "NvtourDim", priority = 200 }, c1)
-      end
-    end
+    local lit = {} -- [line] = true (all of it is bright), or a list of the bright { s, e } (0-based)
     for i, p in ipairs(step.parts or {}) do
       local p1, p2 = part.lines(step, p)
       local row = p1 - 1
@@ -2286,31 +2319,46 @@ render_step = function(step, win)
         tag = { { "  (", "NvtourPartRef" } }
         tags[row] = tag
       end
-      tag[#tag + 1] = { part.letter(i), k == i and "NvtourPartRefOn" or "NvtourPartRef" }
+      tag[#tag + 1] = { part.letter(i), (set and set[i]) and "NvtourPartRefOn" or "NvtourPartRef" }
       tag[#tag + 1] = { ")", "NvtourPartRef" }
       for l, line in ipairs(api.nvim_buf_get_lines(buf, p1 - 1, p2, false)) do
-        local from, lit = 1, 0 -- lit: the end of the last expression, for the dim between them
+        local n = p1 + l - 1
+        if set and set[i] and not p.text then
+          lit[n] = true
+        elseif set and set[i] and lit[n] ~= true then
+          lit[n] = lit[n] or {}
+        end
+        local from = 1
         while p.text do
           local s, e = line:find(p.text, from, true)
           if not s then
             break
           end
-          add(p1 + l - 2, { end_col = e, hl_group = "NvtourPartText", priority = 140 }, s - 1)
-          if k == i then
-            dim(p1 + l - 2, lit, s - 1)
+          add(n - 1, { end_col = e, hl_group = "NvtourPartText", priority = 140 }, s - 1)
+          if set and set[i] and type(lit[n]) == "table" then
+            table.insert(lit[n], { s - 1, e })
           end
-          from, lit = e + 1, e
-        end
-        if k == i and p.text then
-          dim(p1 + l - 2, lit, #line)
+          from = e + 1
         end
       end
     end
-    if k then
-      local p1, p2 = part.lines(step, step.parts[k])
-      for l = step.l1, step.l2 do
-        if l < p1 or l > p2 then
-          dim(l - 1, 0, #(api.nvim_buf_get_lines(buf, l - 1, l, false)[1] or ""))
+    if set then
+      for n = step.l1, step.l2 do
+        local len = #(api.nvim_buf_get_lines(buf, n - 1, n, false)[1] or "")
+        if lit[n] ~= true then
+          local spans, col = lit[n] or {}, 0
+          table.sort(spans, function(x, y)
+            return x[1] < y[1]
+          end)
+          for _, sp in ipairs(spans) do
+            if sp[1] > col then
+              add(n - 1, { end_col = sp[1], hl_group = "NvtourDim", priority = 200 }, col)
+            end
+            col = math.max(col, sp[2])
+          end
+          if len > col then
+            add(n - 1, { end_col = len, hl_group = "NvtourDim", priority = 200 }, col)
+          end
         end
       end
     end
@@ -2585,15 +2633,16 @@ function side.map_keys(buf)
   local function map(lhs, fn)
     vim.keymap.set("n", lhs, fn, { buffer = buf, nowait = true, silent = true })
   end
-  map("<CR>", function()
-    local n = S.card.line_map[api.nvim_win_get_cursor(0)[1]]
-    if n then
-      local res = _G.nvtour.dispatch("goto", { n = n })
-      if not res.ok then
-        notify(res.error, vim.log.levels.WARN)
-      end
+  -- <CR> or a click (the release: the click has moved the cursor): on a link of the note, go to its
+  -- part; on the Next or Previous block, go to that step.
+  local function go()
+    local res = _G.nvtour.dispatch("card_go", {})
+    if not res.ok then
+      notify(res.error, vim.log.levels.WARN)
     end
-  end)
+  end
+  map("<CR>", go)
+  map("<LeftRelease>", go)
   map("q", function()
     _G.nvtour.dispatch("card", {}) -- hides the card; the view stays the side view
   end)
@@ -2854,26 +2903,26 @@ function part.card_marks()
   end
 end
 
---- The cursor in the card: on a link it focuses the (first) part of the link; off the links it ends
---- a focus that the cursor started.
+--- The cursor in the card: on a link it focuses the parts of the link; off the links it ends a focus
+--- that the cursor started.
 function part.card_cursor()
   local step = S.tour.steps[S.tour.current]
   if not step or not step.parts or not side.shown() or api.nvim_get_current_win() ~= S.card.win then
     return
   end
   local pos = api.nvim_win_get_cursor(S.card.win)
-  local k
+  local ks
   for _, l in ipairs(part.card_links()) do
     if l.row == pos[1] - 1 and pos[2] >= l.s and pos[2] < l.e then
-      k = l.refs[1]:byte() - 96
+      ks = part.numbers(step, l.refs)
     end
   end
   local f = S.part_focus
-  if k and step.parts[k] and not (f and f.step == step and f.k == k) then
-    S.part_focus = { step = step, k = k, card = true }
+  if ks and #ks > 0 and not part.focus_is(step, ks, true) then
+    part.set_focus(step, ks, true)
     part.redraw(step)
-  elseif not k and f and f.card then
-    S.part_focus = nil
+  elseif not ks and f and f.card then
+    part.set_focus(step, nil)
     part.redraw(step)
   end
 end
@@ -4999,22 +5048,75 @@ H.part = function(a)
   if n == 0 then
     return { ok = true, part = nil, message = "nvtour: this step has no parts" }
   end
-  local k = part.focused(step)
+  -- From a focus of several parts (a link in the card), ]r goes on after the last of them, [r
+  -- before the first.
+  local set, k, first, last = part.focused(step), nil, nil, nil
+  for i = 1, n do
+    if set and set[i] then
+      first, last = first or i, i
+    end
+  end
   if a.k then
     k = a.k
   elseif (a.dir or 1) > 0 then
-    k = (k or 0) + 1
+    k = (last or 0) + 1
   else
-    k = (k or n + 1) - 1
+    k = (first or n + 1) - 1
   end
   if k < 1 or k > n then
     k = nil
   end
-  S.part_focus = k and { step = step, k = k } or nil
+  part.set_focus(step, k and { k } or nil)
   part.redraw(step)
   local msg = k and ("nvtour: part %s (%d/%d)%s"):format(part.letter(k), k, n,
     step.parts[k].spec and (" · " .. step.parts[k].spec) or "") or "nvtour: no part"
   return { ok = true, part = k and part.letter(k) or nil, message = msg }
+end
+
+--- Go to the parts `ks` (sorted numbers) of the current step: focus them, and put the cursor in the
+--- code on the expression of the first (else on the first character of its first line). The code
+--- window becomes the current window.
+function part.jump(step, ks)
+  part.set_focus(step, ks)
+  part.redraw(step)
+  local win = tour_win(step.buf)
+  if not (win and api.nvim_win_get_buf(win) == step.buf) then
+    return
+  end
+  local p = step.parts[ks[1]]
+  local p1 = part.lines(step, p)
+  local line = api.nvim_buf_get_lines(step.buf, p1 - 1, p1, false)[1] or ""
+  local col = (p.text and line:find(p.text, 1, true)) or line:find("%S") or 1
+  api.nvim_set_current_win(win)
+  api.nvim_win_set_cursor(win, { p1, col - 1 })
+end
+
+--- <CR> or a click in the step card, at its cursor: a link of the note goes to its parts, the Next or
+--- Previous block goes to that step. Elsewhere nothing happens. A link to the parts that are focused
+--- already (by a jump or ]r, not only by the cursor on the link) ends the focus: a toggle.
+H.card_go = function()
+  local step = S.tour.steps[S.tour.current]
+  if not step or not side.shown() then
+    return { ok = true }
+  end
+  local pos = api.nvim_win_get_cursor(S.card.win)
+  for _, l in ipairs(part.card_links()) do
+    local ks = part.numbers(step, l.refs)
+    if l.row == pos[1] - 1 and pos[2] >= l.s and pos[2] < l.e and #ks > 0 then
+      if part.focus_is(step, ks) then
+        part.set_focus(step, nil)
+        part.redraw(step)
+        return { ok = true }
+      end
+      part.jump(step, ks)
+      return { ok = true, part = table.concat(vim.tbl_map(part.letter, ks), ",") }
+    end
+  end
+  local n = S.card.line_map[pos[1]]
+  if n then
+    return H["goto"]({ n = n })
+  end
+  return { ok = true }
 end
 
 --- Turn the animation of jumps on or off (`a.mode`: "on", "off" or "toggle", the default).
