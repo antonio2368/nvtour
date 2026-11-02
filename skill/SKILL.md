@@ -46,9 +46,15 @@ Use this when the user asks about code ("this", "here", "this chunk") but gives 
    at = "src/b.cpp:/void evict(/-2+6"         # 2 lines before the text (a comment) to 6 after it
    role = "flow"
    via = "the cleanup thread runs `evict()`"
-   note = "The cleanup thread erases the entry while the reader holds `it`."
+   parts = ["/auto it = entries.find/", { at = "/entries.erase(it)/", text = "entries.erase(it)" }]
+   note = """
+   The cleanup thread erases the entry while the reader holds `it`.
+
+   [It finds the entry](a), then [erases it](b) without the reader's lock."""
    EOF
    ```
+
+   - **Parts check (mandatory before every `apply`).** Read each note: when it names two or more places of its range (a list of conditions, a sequence of calls, several values, a branch and its body), give `parts` and link the words to them (see "Parts" under "Writing notes"). `expect` only underlines; it is not a replacement for parts. Leave parts out only when the note is about the whole range (one declaration, one call, one getter).
 
    - Keys: top level `title`, `sheet`, `panel`, `[[focus]]`, `[[diagram]]`; `[[step]]` `at` (required), `role`, `label`, `note`, `expect`, `parts`, `via`, `from`, `suggest`, `sheet`, `ref`, `chapter`, `diagram`.
    - Check the echoed `step N/T` lines of every step. Run `apply --check` first when the tour is long or uses `ref`: it changes nothing. A failure lists every bad entry at once (`step[4]: ...`, one per line): fix them all in one edit of the tour file, then run it again. Use `step`, `edit` and `remove` only for fixes and for one more step in a tour that is open.
