@@ -149,6 +149,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     cmd("where", "show cursor, selection and visible range")
 
+    p = cmd("open", "open FILE at a line in the user's file window and make it current (for clicked links)")
+    p.add_argument("spec", metavar="FILE[:LINE[:COL]]")
+
     p = cmd("marks", "show the places that the user marked (<leader>wm in nvim)")
     p.add_argument("--wait", type=positive_float, metavar="SECONDS",
                    help="wait until there is a mark; exit 6 after SECONDS without one")
@@ -1129,6 +1132,31 @@ def run_marks(args: argparse.Namespace, workspace: str, env: Mapping[str, str]) 
     return run_remote(args, workspace, env, sock)
 
 
+OPEN_SPEC_RE = re.compile(r"^(.*?)(?::(\d+))?(?::(\d+))?$")
+
+
+def parse_open_spec(spec: str) -> tuple[str, int | None, int | None]:
+    """``FILE[:LINE[:COL]]`` -> (realpath, line, col); a FILE that exists as given wins over the split."""
+    if os.path.isfile(spec):
+        return os.path.realpath(spec), None, None
+    m = OPEN_SPEC_RE.match(spec)
+    path, line, col = m.group(1), m.group(2), m.group(3)
+    return os.path.realpath(path), int(line) if line else None, int(col) if col else None
+
+
+def run_open(args: argparse.Namespace, env: Mapping[str, str]) -> int:
+    """``open``: the workspace is the one of FILE (not of the cwd), so a link opens in the nvim of its
+    project; the pin is used but never written."""
+    path, line, col = parse_open_spec(args.spec)
+    if not os.path.isfile(path):
+        raise NvtourError(EXIT_BAD_FILE, f"file not found: {path}")
+    workspace = resolve_workspace(args.workspace, os.path.dirname(path))
+    sock = pick_socket(args, workspace, env, save_pin=False)[0]
+    res = rpc(sock, args.timeout, "open", {"workspace": workspace, "file": path, "line": line, "col": col})
+    emit(args, res, f"opened {display_path(path, workspace)}:{res['line']}:{res['col']} (pid {res.get('pid')})", sock)
+    return 0
+
+
 def run_instances(args: argparse.Namespace, workspace: str, env: Mapping[str, str]) -> int:
     insts = discover.inspect_all(workspace, env)
     pruned = skipped = 0
@@ -1309,6 +1337,8 @@ def run(args: argparse.Namespace, env: Mapping[str, str]) -> int:
         return run_attach(args, workspace, env)
     if args.command == "marks":
         return run_marks(args, workspace, env)
+    if args.command == "open":
+        return run_open(args, env)
     return run_remote(args, workspace, env)
 
 

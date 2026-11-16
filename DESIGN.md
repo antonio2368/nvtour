@@ -148,6 +148,7 @@ nvtour instances [--prune]
 nvtour attach [PID|SOCKET] [--clear]
 nvtour where
 nvtour marks [--wait SECONDS] [--clear]
+nvtour open FILE[:LINE[:COL]]
 nvtour start [TITLE] [--sheet SHEET]
 nvtour step FILE:L1[-L2] | FILE:/TEXT/... [--ref GITREF] [--note TEXT | --note -] [--label TEXT] [--role ROLE]
             [--expect TEXT]... [--part AT [--part-text TEXT]]... [--via TEXT] [--from N]
@@ -243,6 +244,15 @@ msgpack) and `resolved_from` instead of `l1` and `l2`.
   and goes on when the count is more than 0; after S seconds it is exit 6 with `no marks after S s`. This is
   `run_marks` in `cli.py`; the call itself is the normal `run_remote`. While a `vim.ui.input` prompt of
   `<leader>wM` is open, nvim waits for input and every call fails with exit 5 (as for any prompt).
+- **open** `FILE[:LINE[:COL]]` — for a link that the user clicked outside nvim (for example a terminal
+  hyperlink): opens FILE at LINE and COL (1-based; clamped to the file) as a normal listed buffer in the
+  user's file window (the current window when it shows FILE, else the window that `tour_win` picks),
+  sets the jumplist mark first (`<C-o>` goes back), makes that window current and opens folds at the
+  cursor. A FILE that exists as given wins over the `:LINE:COL` split. The workspace is the one of FILE,
+  not of the cwd (`--workspace` overrides it); the pin is read but never written. Prints `opened
+  FILE:LINE:COL (pid P)`; a missing file is exit 6. This is `run_open` in `cli.py` and `H.open` in the
+  runtime. It is the only command that moves the user's focus on purpose: it does not follow
+  `nvtour_steal_focus`.
 - **start** — resets any existing tour (same as `clear` but keeps the panel if open), sets the
   title, creates a fresh quickfix list, installs keymaps. `step` without a prior `start` implicitly
   starts an untitled tour. `--sheet SHEET` sets the sheet of the tour (§6, "Sheet link"); the id is

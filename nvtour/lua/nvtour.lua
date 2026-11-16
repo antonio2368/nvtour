@@ -6503,6 +6503,38 @@ local function selection_of(win, buf, mode)
   end)
 end
 
+--- Open `a.file` at line `a.line` (column `a.col`, 1-based) in the user's file window and make it
+--- current: a link that the user clicked outside nvim. The buffer is a normal listed buffer, not a
+--- tour buffer, so clear does not unlist it.
+H.open = function(a)
+  local st = uv.fs_stat(a.file)
+  if not st or st.type ~= "file" then
+    fail("file not found: " .. a.file, 6)
+  end
+  local buf = vim.fn.bufadd(a.file)
+  local ok, err = pcall(vim.fn.bufload, buf)
+  if not ok and not (tostring(err):match("E325") and api.nvim_buf_is_loaded(buf)) then
+    fail("cannot read " .. a.file .. ": " .. tostring(err), 6)
+  end
+  vim.bo[buf].buflisted = true
+  local cur = api.nvim_get_current_win()
+  local win = cur
+  if api.nvim_win_get_buf(cur) ~= buf then
+    win = tour_win(buf, true)
+  end
+  api.nvim_win_call(win, function()
+    vim.cmd("normal! m'") -- <C-o> goes back to where the window was
+  end)
+  win = show_buf(win, buf)
+  local line = math.max(1, math.min(a.line or 1, api.nvim_buf_line_count(buf)))
+  local text = api.nvim_buf_get_lines(buf, line - 1, line, false)[1] or ""
+  local col = math.max(0, math.min((a.col or 1) - 1, #text))
+  api.nvim_win_set_cursor(win, { line, col })
+  api.nvim_set_current_win(win)
+  vim.cmd("normal! zvzz")
+  return { ok = true, file = a.file, line = line, col = col + 1, winid = win }
+end
+
 H.where = function()
   local cur = api.nvim_get_current_win()
   local win = cur

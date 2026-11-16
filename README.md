@@ -760,6 +760,7 @@ nvtour step src/cache.cpp:31-38 --label "load from the store" --via 'a miss call
 | `status` | the tour, focus, panel, diff tabs and installed keys; chapters; steps that moved `(was L1-L2)` or are lost `(lost)`; `modified:` files; `follow: on` and `marks: N` when they apply |
 | `where` | cursor, live or previous selection (exact text), visible range of the user's file window |
 | `marks [--wait SECONDS] [--clear]` | the places that the user marked with `<leader>wm`; `--wait`: wait for a mark (exit 6 after the time); `--clear`: remove what is printed (see [Marks](#marks)) |
+| `open FILE[:LINE[:COL]]` | open FILE at a line in your file window and make it current; for clickable links, for example from an agent's terminal (the workspace is the one of FILE) |
 
 **View**
 
